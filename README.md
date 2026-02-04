@@ -15,7 +15,7 @@
 
 ```bash
 # Clone and install
-git clone https://github.com/YOUR_USERNAME/strategos.git
+git clone https://github.com/drewrad8/strategos.git
 cd strategos
 ./install.sh
 
