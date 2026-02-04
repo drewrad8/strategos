@@ -30,7 +30,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/YOUR_USERNAME/strategos"
+    "url": "https://github.com/drewrad8/strategos"
   },
   "engines": {
     "node": ">=18.0.0"
