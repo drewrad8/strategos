@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Strategos launchd plist for macOS
+  Install to: ~/Library/LaunchAgents/com.strategos.plist
+  Load with: launchctl load ~/Library/LaunchAgents/com.strategos.plist
+  Start with: launchctl start com.strategos
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.strategos</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/node</string>
+        <string>server/index.js</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <!-- Update this path to your installation directory -->
+    <string>/Users/YOUR_USERNAME/.strategos</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>NODE_ENV</key>
+        <string>production</string>
+        <key>STRATEGOS_CONFIG</key>
+        <!-- Update this path to your config directory -->
+        <string>/Users/YOUR_USERNAME/.strategos/config/strategos.json</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <!-- Update this path to your logs directory -->
+    <string>/Users/YOUR_USERNAME/.strategos/data/logs/strategos.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USERNAME/.strategos/data/logs/strategos.log</string>
+</dict>
+</plist>

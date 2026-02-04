@@ -1,0 +1,31 @@
+# Strategos systemd user service
+# Install to: ~/.config/systemd/user/strategos.service
+# Enable with: systemctl --user enable strategos.service
+# Start with: systemctl --user start strategos.service
+
+[Unit]
+Description=Strategos AI Orchestrator
+Documentation=https://github.com/YOUR_USERNAME/strategos
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.strategos
+ExecStart=/usr/bin/node server/index.js
+Restart=on-failure
+RestartSec=10
+
+# Environment
+Environment=NODE_ENV=production
+Environment=STRATEGOS_CONFIG=%h/.strategos/config/strategos.json
+
+# Load secrets from .env file
+EnvironmentFile=-%h/.strategos/.env
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=strategos
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,262 @@
+#!/bin/bash
+#
+# Strategos - Main CLI wrapper
+#
+# Usage:
+#   strategos start        - Start the server
+#   strategos stop         - Stop the server
+#   strategos restart      - Restart the server
+#   strategos status       - Show server status
+#   strategos logs         - Show server logs
+#   strategos config       - Show configuration
+#   strategos providers    - List configured providers
+#   strategos version      - Show version
+
+set -e
+
+# Determine installation directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_DIR="$(dirname "$SCRIPT_DIR")"
+
+# Configuration
+STRATEGOS_CONFIG_DIR="${STRATEGOS_CONFIG_DIR:-$HOME/.strategos/config}"
+STRATEGOS_DATA_DIR="${STRATEGOS_DATA_DIR:-$HOME/.strategos/data}"
+STRATEGOS_PORT="${PORT:-38007}"
+PID_FILE="$STRATEGOS_DATA_DIR/strategos.pid"
+LOG_FILE="$STRATEGOS_DATA_DIR/logs/strategos.log"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Ensure directories exist
+mkdir -p "$STRATEGOS_CONFIG_DIR"
+mkdir -p "$STRATEGOS_DATA_DIR/logs"
+
+version() {
+    echo "Strategos v1.0.0"
+    echo "Multi-provider AI Orchestrator"
+}
+
+get_pid() {
+    if [ -f "$PID_FILE" ]; then
+        cat "$PID_FILE"
+    fi
+}
+
+is_running() {
+    local pid=$(get_pid)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+start() {
+    if is_running; then
+        echo -e "${YELLOW}Strategos is already running (PID: $(get_pid))${NC}"
+        exit 0
+    fi
+
+    echo -e "${BLUE}Starting Strategos...${NC}"
+
+    # Check Node.js version
+    NODE_VERSION=$(node --version | cut -d'v' -f2 | cut -d'.' -f1)
+    if [ "$NODE_VERSION" -lt 18 ]; then
+        echo -e "${RED}Error: Node.js 18+ is required (found: $(node --version))${NC}"
+        exit 1
+    fi
+
+    # Check tmux
+    if ! command -v tmux &> /dev/null; then
+        echo -e "${RED}Error: tmux is required but not installed${NC}"
+        exit 1
+    fi
+
+    # Start server
+    cd "$INSTALL_DIR"
+    nohup node server/index.js >> "$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+
+    # Wait a moment and check if it started
+    sleep 2
+    if is_running; then
+        echo -e "${GREEN}Strategos started successfully${NC}"
+        echo -e "  PID: $(get_pid)"
+        echo -e "  URL: http://localhost:$STRATEGOS_PORT"
+        echo -e "  Logs: $LOG_FILE"
+    else
+        echo -e "${RED}Failed to start Strategos. Check logs: $LOG_FILE${NC}"
+        exit 1
+    fi
+}
+
+stop() {
+    if ! is_running; then
+        echo -e "${YELLOW}Strategos is not running${NC}"
+        rm -f "$PID_FILE"
+        exit 0
+    fi
+
+    local pid=$(get_pid)
+    echo -e "${BLUE}Stopping Strategos (PID: $pid)...${NC}"
+
+    # Send SIGTERM for graceful shutdown
+    kill "$pid"
+
+    # Wait up to 10 seconds for graceful shutdown
+    for i in {1..10}; do
+        if ! is_running; then
+            echo -e "${GREEN}Strategos stopped${NC}"
+            rm -f "$PID_FILE"
+            exit 0
+        fi
+        sleep 1
+    done
+
+    # Force kill if still running
+    echo -e "${YELLOW}Force stopping...${NC}"
+    kill -9 "$pid" 2>/dev/null
+    rm -f "$PID_FILE"
+    echo -e "${GREEN}Strategos stopped${NC}"
+}
+
+restart() {
+    stop
+    sleep 1
+    start
+}
+
+status() {
+    echo "Strategos Status"
+    echo "================"
+
+    if is_running; then
+        echo -e "Server: ${GREEN}Running${NC} (PID: $(get_pid))"
+
+        # Try to get API status
+        if command -v curl &> /dev/null; then
+            local health=$(curl -s "http://localhost:$STRATEGOS_PORT/api/health" 2>/dev/null)
+            if [ -n "$health" ]; then
+                echo -e "API: ${GREEN}Healthy${NC}"
+            fi
+
+            local workers=$(curl -s "http://localhost:$STRATEGOS_PORT/api/workers" 2>/dev/null | grep -o '"id"' | wc -l)
+            echo -e "Workers: $workers active"
+        fi
+    else
+        echo -e "Server: ${RED}Stopped${NC}"
+    fi
+
+    echo ""
+    echo "Configuration:"
+    echo "  Port: $STRATEGOS_PORT"
+    echo "  Config: $STRATEGOS_CONFIG_DIR"
+    echo "  Data: $STRATEGOS_DATA_DIR"
+}
+
+logs() {
+    if [ -f "$LOG_FILE" ]; then
+        tail -f "$LOG_FILE"
+    else
+        echo -e "${YELLOW}No log file found at $LOG_FILE${NC}"
+    fi
+}
+
+config() {
+    local config_file="$STRATEGOS_CONFIG_DIR/strategos.json"
+
+    echo "Strategos Configuration"
+    echo "======================="
+    echo ""
+
+    if [ -f "$config_file" ]; then
+        cat "$config_file"
+    else
+        echo -e "${YELLOW}No config file found. Using defaults.${NC}"
+        echo ""
+        echo "Default configuration:"
+        echo "  Port: 38007"
+        echo "  Projects: ~/strategos-projects"
+        echo "  Data: ~/.strategos/data"
+        echo ""
+        echo "Create $config_file to customize."
+    fi
+}
+
+providers() {
+    echo "Configured Providers"
+    echo "===================="
+
+    if is_running && command -v curl &> /dev/null; then
+        curl -s "http://localhost:$STRATEGOS_PORT/api/providers" | python3 -m json.tool 2>/dev/null || \
+        curl -s "http://localhost:$STRATEGOS_PORT/api/providers"
+    else
+        echo -e "${YELLOW}Server not running. Start with 'strategos start' first.${NC}"
+    fi
+}
+
+help() {
+    echo "Strategos - Multi-provider AI Orchestrator"
+    echo ""
+    echo "Usage: strategos <command>"
+    echo ""
+    echo "Commands:"
+    echo "  start       Start the Strategos server"
+    echo "  stop        Stop the Strategos server"
+    echo "  restart     Restart the Strategos server"
+    echo "  status      Show server status and statistics"
+    echo "  logs        Tail the server logs"
+    echo "  config      Show current configuration"
+    echo "  providers   List configured AI providers"
+    echo "  version     Show version information"
+    echo "  help        Show this help message"
+    echo ""
+    echo "Environment Variables:"
+    echo "  PORT                    Server port (default: 38007)"
+    echo "  STRATEGOS_CONFIG_DIR    Config directory (default: ~/.strategos/config)"
+    echo "  STRATEGOS_DATA_DIR      Data directory (default: ~/.strategos/data)"
+    echo "  STRATEGOS_PROJECTS_ROOT Projects directory (default: ~/strategos-projects)"
+    echo ""
+    echo "For more information, see: https://github.com/YOUR_USERNAME/strategos"
+}
+
+# Main command dispatch
+case "${1:-help}" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    restart)
+        restart
+        ;;
+    status)
+        status
+        ;;
+    logs)
+        logs
+        ;;
+    config)
+        config
+        ;;
+    providers)
+        providers
+        ;;
+    version|-v|--version)
+        version
+        ;;
+    help|-h|--help)
+        help
+        ;;
+    *)
+        echo -e "${RED}Unknown command: $1${NC}"
+        echo ""
+        help
+        exit 1
+        ;;
+esac
