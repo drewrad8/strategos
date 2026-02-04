@@ -1,0 +1,45 @@
+{
+  "version": "1.0.0",
+  "port": 38007,
+  "projectsRoot": "~/strategos-projects",
+  "dataDir": "~/.strategos/data",
+
+  "providers": {
+    "workers": {
+      "default": "claude",
+      "available": ["claude", "openai", "gemini"],
+      "openai": {
+        "model": "gpt-4o",
+        "maxTokens": 8192
+      },
+      "gemini": {
+        "model": "gemini-2.0-flash",
+        "maxTokens": 8192
+      }
+    },
+    "api": {
+      "default": "ollama",
+      "ollama": {
+        "url": "http://localhost:11434",
+        "model": "qwen3:8b"
+      },
+      "openai": {
+        "model": "gpt-4o-mini"
+      },
+      "gemini": {
+        "model": "gemini-1.5-flash"
+      },
+      "anthropic": {
+        "model": "claude-3-haiku-20240307"
+      }
+    }
+  },
+
+  "features": {
+    "summaries": false,
+    "autoAcceptDefault": false,
+    "ralphModeDefault": false,
+    "maxConcurrentWorkers": 100,
+    "workerTimeout": 1800000
+  }
+}
