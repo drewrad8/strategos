@@ -25,7 +25,9 @@ import {
   getWorkflow,
   getWorkflows,
   getDependencyStats,
-  getResourceStats
+  getResourceStats,
+  getChildWorkers,
+  getSiblingWorkers
 } from './workerManager.js';
 import {
   scanProjects,
@@ -158,6 +160,80 @@ export function createRoutes(theaRoot, io) {
     }
   });
 
+  /**
+   * GET /api/workers/tree
+   * Get hierarchical view of all workers showing parent-child relationships
+   */
+  router.get('/workers/tree', (req, res) => {
+    try {
+      const allWorkers = getWorkers();
+
+      // Build a map for quick lookup
+      const workerMap = new Map(allWorkers.map(w => [w.id, w]));
+
+      // Find root workers (no parent)
+      const roots = allWorkers.filter(w => !w.parentWorkerId);
+
+      // Recursive function to build tree
+      function buildTree(worker) {
+        const children = (worker.childWorkerIds || [])
+          .map(id => workerMap.get(id))
+          .filter(Boolean)
+          .map(buildTree);
+
+        return {
+          id: worker.id,
+          label: worker.label,
+          status: worker.status,
+          ralphStatus: worker.ralphStatus,
+          ralphProgress: worker.ralphProgress,
+          health: worker.health,
+          createdAt: worker.createdAt,
+          childCount: children.length,
+          children: children.length > 0 ? children : undefined
+        };
+      }
+
+      const tree = roots.map(buildTree);
+
+      // Calculate stats
+      const stats = {
+        total: allWorkers.length,
+        roots: roots.length,
+        withChildren: allWorkers.filter(w => (w.childWorkerIds || []).length > 0).length,
+        byStatus: {
+          running: allWorkers.filter(w => w.status === 'running').length,
+          completed: allWorkers.filter(w => w.status === 'completed').length
+        },
+        byRalphStatus: {
+          pending: allWorkers.filter(w => w.ralphStatus === 'pending').length,
+          inProgress: allWorkers.filter(w => w.ralphStatus === 'in_progress').length,
+          done: allWorkers.filter(w => w.ralphStatus === 'done').length,
+          blocked: allWorkers.filter(w => w.ralphStatus === 'blocked').length
+        }
+      };
+
+      res.json({ tree, stats });
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  /**
+   * GET /api/workers/templates
+   * List available spawn templates
+   */
+  router.get('/workers/templates', (req, res) => {
+    const templates = Object.entries(SPAWN_TEMPLATES).map(([name, config]) => ({
+      name,
+      prefix: config.prefix,
+      autoAccept: config.autoAccept,
+      ralphMode: config.ralphMode,
+      taskType: config.taskDefaults.type
+    }));
+    res.json({ templates });
+  });
+
   // GET /api/workers/:id - Get single worker
   router.get('/workers/:id', (req, res) => {
     try {
@@ -231,6 +307,245 @@ export function createRoutes(theaRoot, io) {
       }
 
       res.status(201).json(worker);
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  // =============================================
+  // SPAWN TEMPLATES - Simplified worker spawning
+  // =============================================
+
+  const SPAWN_TEMPLATES = {
+    research: {
+      prefix: 'RESEARCH',
+      autoAccept: true,
+      ralphMode: true,
+      taskDefaults: { type: 'research' }
+    },
+    impl: {
+      prefix: 'IMPL',
+      autoAccept: true,
+      ralphMode: true,
+      taskDefaults: { type: 'implementation' }
+    },
+    test: {
+      prefix: 'TEST',
+      autoAccept: true,
+      ralphMode: true,
+      taskDefaults: { type: 'testing' }
+    },
+    review: {
+      prefix: 'REVIEW',
+      autoAccept: true,
+      ralphMode: true,
+      taskDefaults: { type: 'review' }
+    },
+    fix: {
+      prefix: 'FIX',
+      autoAccept: true,
+      ralphMode: true,
+      taskDefaults: { type: 'bugfix' }
+    },
+    general: {
+      prefix: 'GENERAL',
+      autoAccept: true,
+      ralphMode: true,
+      taskDefaults: { type: 'strategic' }
+    },
+    colonel: {
+      prefix: 'COLONEL',
+      autoAccept: true,
+      ralphMode: true,
+      taskDefaults: { type: 'coordination' }
+    }
+  };
+
+  /**
+   * POST /api/workers/spawn-from-template
+   * Spawn a worker using a predefined template
+   *
+   * Body:
+   *   - template: string (required) - Template name (research, impl, test, etc.)
+   *   - label: string (required) - Descriptive label (without prefix)
+   *   - projectPath: string (optional) - Defaults to parent's project or theaRoot
+   *   - task: string | object (required) - Task description or full task object
+   *   - parentWorkerId: string (optional) - Parent worker ID
+   */
+  router.post('/workers/spawn-from-template', async (req, res) => {
+    try {
+      const { template, label, projectPath, task, parentWorkerId } = req.body;
+
+      if (!template) {
+        return res.status(400).json({ error: 'template is required' });
+      }
+
+      const tmpl = SPAWN_TEMPLATES[template.toLowerCase()];
+      if (!tmpl) {
+        return res.status(400).json({
+          error: `Unknown template: ${template}`,
+          availableTemplates: Object.keys(SPAWN_TEMPLATES)
+        });
+      }
+
+      if (!label) {
+        return res.status(400).json({ error: 'label is required' });
+      }
+
+      if (!task) {
+        return res.status(400).json({ error: 'task is required' });
+      }
+
+      // Get parent worker for context inheritance
+      const parent = parentWorkerId ? getWorker(parentWorkerId) : null;
+
+      // Determine project path: explicit > parent's > theaRoot
+      let resolvedPath = projectPath;
+      if (!resolvedPath && parent) {
+        resolvedPath = parent.workingDir;
+      }
+      if (!resolvedPath) {
+        resolvedPath = theaRoot;
+      }
+      resolvedPath = safeResolvePath(resolvedPath, theaRoot);
+
+      if (!resolvedPath) {
+        return res.status(400).json({ error: 'Invalid project path' });
+      }
+
+      // Construct full label with prefix
+      const fullLabel = `${tmpl.prefix}: ${label}`;
+
+      // Construct task object
+      const taskObj = typeof task === 'string'
+        ? { description: task, ...tmpl.taskDefaults }
+        : { ...tmpl.taskDefaults, ...task };
+
+      // Spawn with template settings
+      const options = {
+        autoAccept: tmpl.autoAccept,
+        ralphMode: tmpl.ralphMode,
+        task: taskObj,
+        parentWorkerId,
+        parentLabel: parent?.label
+      };
+
+      const worker = await spawnWorker(resolvedPath, fullLabel, io, options);
+
+      // Register with Ralph if enabled
+      if (tmpl.ralphMode && worker.ralphToken) {
+        const ralphService = req.app.locals.ralphService;
+        if (ralphService) {
+          ralphService.registerStandaloneWorker(worker.ralphToken, worker.id);
+        }
+      }
+
+      res.status(201).json(worker);
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  /**
+   * POST /api/workers/batch-spawn
+   * Spawn multiple workers in parallel
+   *
+   * STATUS: DISABLED - Risk of cascade spawning. Code preserved for future use.
+   * To re-enable: Remove the early return below.
+   *
+   * Body:
+   *   - workers: array of spawn configs (each can have template, label, task, etc.)
+   *   - projectPath: string (optional) - Default project path for all workers
+   *   - parentWorkerId: string (optional) - Parent worker ID for all workers
+   */
+  router.post('/workers/batch-spawn', async (req, res) => {
+    // DISABLED: Risk of cascade spawning - use spawn-from-template sequentially instead
+    return res.status(403).json({
+      error: 'Batch spawn is disabled',
+      reason: 'Risk of cascade spawning. Use /api/workers/spawn-from-template sequentially.',
+      hint: 'To re-enable, edit server/routes.js and remove the early return in batch-spawn handler'
+    });
+
+    try {
+      const { workers: workerConfigs, projectPath: defaultPath, parentWorkerId } = req.body;
+
+      if (!workerConfigs || !Array.isArray(workerConfigs) || workerConfigs.length === 0) {
+        return res.status(400).json({ error: 'workers array is required and must not be empty' });
+      }
+
+      if (workerConfigs.length > 10) {
+        return res.status(400).json({ error: 'Maximum 10 workers per batch' });
+      }
+
+      const parent = parentWorkerId ? getWorker(parentWorkerId) : null;
+      const basePath = safeResolvePath(defaultPath || parent?.workingDir || theaRoot, theaRoot);
+
+      const results = await Promise.allSettled(
+        workerConfigs.map(async (config) => {
+          const { template, label, task, projectPath } = config;
+
+          // Use template if provided, otherwise default settings
+          let prefix = config.prefix || 'WORKER';
+          let autoAccept = config.autoAccept ?? true;
+          let ralphMode = config.ralphMode ?? true;
+          let taskDefaults = {};
+
+          if (template && SPAWN_TEMPLATES[template.toLowerCase()]) {
+            const tmpl = SPAWN_TEMPLATES[template.toLowerCase()];
+            prefix = tmpl.prefix;
+            autoAccept = tmpl.autoAccept;
+            ralphMode = tmpl.ralphMode;
+            taskDefaults = tmpl.taskDefaults;
+          }
+
+          const fullLabel = label.includes(':') ? label : `${prefix}: ${label}`;
+          const resolvedPath = safeResolvePath(projectPath || basePath, theaRoot);
+
+          if (!resolvedPath) {
+            throw new Error(`Invalid project path for worker: ${label}`);
+          }
+
+          const taskObj = typeof task === 'string'
+            ? { description: task, ...taskDefaults }
+            : { ...taskDefaults, ...task };
+
+          const worker = await spawnWorker(resolvedPath, fullLabel, io, {
+            autoAccept,
+            ralphMode,
+            task: taskObj,
+            parentWorkerId,
+            parentLabel: parent?.label
+          });
+
+          // Register with Ralph if enabled
+          if (ralphMode && worker.ralphToken) {
+            const ralphService = req.app.locals.ralphService;
+            if (ralphService) {
+              ralphService.registerStandaloneWorker(worker.ralphToken, worker.id);
+            }
+          }
+
+          return worker;
+        })
+      );
+
+      const spawned = results
+        .filter(r => r.status === 'fulfilled')
+        .map(r => r.value);
+
+      const failed = results
+        .filter(r => r.status === 'rejected')
+        .map((r, i) => ({ index: i, error: r.reason.message }));
+
+      res.status(201).json({
+        spawned,
+        failed,
+        summary: {
+          total: workerConfigs.length,
+          succeeded: spawned.length,
+          failed: failed.length
+        }
+      });
     } catch (error) {
       res.status(500).json({ error: error.message });
     }
@@ -544,6 +859,73 @@ curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Co
       }
 
       res.json(deps);
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  /**
+   * GET /api/workers/:id/children
+   * Get all child workers spawned by this worker with their Ralph status
+   * Useful for parent workers (especially GENERALs) to monitor progress without reading output
+   */
+  router.get('/workers/:id/children', (req, res) => {
+    try {
+      const worker = getWorker(req.params.id);
+      if (!worker) {
+        return res.status(404).json({ error: 'Worker not found' });
+      }
+
+      const children = getChildWorkers(req.params.id);
+
+      // Calculate summary stats
+      const summary = {
+        total: children.length,
+        pending: children.filter(c => c.ralphStatus === 'pending').length,
+        done: children.filter(c => c.ralphStatus === 'done').length,
+        blocked: children.filter(c => c.ralphStatus === 'blocked').length,
+        noRalph: children.filter(c => !c.ralphMode).length,
+      };
+
+      res.json({
+        parentWorkerId: req.params.id,
+        summary,
+        children
+      });
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  /**
+   * GET /api/workers/:id/siblings
+   * Get sibling workers (other workers with same parent)
+   * Useful for workers to coordinate and avoid duplicate work
+   */
+  router.get('/workers/:id/siblings', (req, res) => {
+    try {
+      const worker = getWorker(req.params.id);
+      if (!worker) {
+        return res.status(404).json({ error: 'Worker not found' });
+      }
+
+      const siblings = getSiblingWorkers(req.params.id);
+
+      // Calculate summary stats
+      const summary = {
+        total: siblings.length,
+        pending: siblings.filter(s => s.ralphStatus === 'pending').length,
+        inProgress: siblings.filter(s => s.ralphStatus === 'in_progress').length,
+        done: siblings.filter(s => s.ralphStatus === 'done').length,
+        blocked: siblings.filter(s => s.ralphStatus === 'blocked').length,
+      };
+
+      res.json({
+        workerId: req.params.id,
+        parentWorkerId: worker.parentWorkerId || null,
+        summary,
+        siblings
+      });
     } catch (error) {
       res.status(500).json({ error: error.message });
     }
@@ -1939,8 +2321,7 @@ curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Co
   // GET /api/status - Get service status from status file
   router.get('/status', (req, res) => {
     try {
-      const { getStatusWriter } = await import('./statusWriter.js');
-      const statusPath = getStatusWriter().statusFile;
+      const statusPath = '/home/druzy/thea/shared/status/strategos.json';
       if (fs.existsSync(statusPath)) {
         const status = JSON.parse(fs.readFileSync(statusPath, 'utf8'));
         res.json(status);
@@ -2209,54 +2590,6 @@ curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Co
           createdAt: r.createdAt
         }))
       });
-    } catch (error) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  // ============================================
-  // PROVIDER MANAGEMENT APIs
-  // ============================================
-
-  // GET /api/providers - Get all configured providers
-  router.get('/providers', async (req, res) => {
-    try {
-      const { getProvidersInfo } = await import('./providers/index.js');
-      res.json(getProvidersInfo());
-    } catch (error) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  // GET /api/providers/health - Health check all providers
-  router.get('/providers/health', async (req, res) => {
-    try {
-      const { checkAllProviders } = await import('./providers/index.js');
-      const health = await checkAllProviders();
-      res.json(health);
-    } catch (error) {
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  // POST /api/providers/complete - Make a completion request via API provider
-  router.post('/providers/complete', async (req, res) => {
-    try {
-      const { complete } = await import('./providers/index.js');
-      const { prompt, systemPrompt, maxTokens, temperature, provider: providerId } = req.body;
-
-      if (!prompt) {
-        return res.status(400).json({ error: 'prompt is required' });
-      }
-
-      const result = await complete({
-        prompt,
-        systemPrompt,
-        maxTokens,
-        temperature
-      }, providerId);
-
-      res.json(result);
     } catch (error) {
       res.status(500).json({ error: error.message });
     }
