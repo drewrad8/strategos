@@ -237,30 +237,40 @@ export function createRalphRoutes(ralphService) {
 
   /**
    * POST /api/ralph/signal/:token
-   * Signal completion or blocked status from a worker
-   * Workers call this endpoint to signal they've finished their task
+   * Signal status from a worker (progress, completion, or blocked)
+   * Workers call this endpoint to signal their status
    *
    * Body:
-   *   - status: 'done' | 'blocked'
-   *   - reason: string (for blocked status)
-   *   - learnings: string (optional notes/discoveries)
+   *   - status: 'in_progress' | 'done' | 'blocked' (required)
+   *   - progress: number 0-100 (optional, for in_progress)
+   *   - currentStep: string (optional, describes current activity)
+   *   - reason: string (optional, for blocked status)
+   *   - learnings: string (optional, summary/notes)
+   *   - outputs: object (optional, structured outputs { key: value })
+   *   - artifacts: array (optional, file paths created)
    */
   router.post('/signal/:token', async (req, res) => {
     try {
       const { token } = req.params;
-      const { status = 'done', reason, learnings } = req.body;
+      const { status = 'done', progress, currentStep, reason, learnings, outputs, artifacts } = req.body;
 
-      if (!['done', 'blocked'].includes(status)) {
-        return res.status(400).json({ error: 'status must be "done" or "blocked"' });
+      if (!['in_progress', 'done', 'blocked'].includes(status)) {
+        return res.status(400).json({ error: 'status must be "in_progress", "done", or "blocked"' });
       }
 
-      const result = await ralphService.handleCompletionSignal(token, status, reason, learnings);
+      // Validate progress range if provided
+      if (progress !== undefined && (progress < 0 || progress > 100)) {
+        return res.status(400).json({ error: 'progress must be between 0 and 100' });
+      }
+
+      const signalData = { status, progress, currentStep, reason, learnings, outputs, artifacts };
+      const result = await ralphService.handleCompletionSignal(token, signalData);
 
       if (!result) {
         return res.status(404).json({ error: 'Unknown completion token' });
       }
 
-      res.json({ success: true, message: `Story marked as ${status}` });
+      res.json({ success: true, message: `Status updated to ${status}`, progress });
     } catch (error) {
       res.status(500).json({ error: error.message });
     }

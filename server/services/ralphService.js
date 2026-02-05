@@ -17,7 +17,8 @@ import {
   spawnWorker,
   killWorker,
   getWorkerOutput,
-  getWorker
+  getWorker,
+  updateWorkerRalphStatus
 } from '../workerManager.js';
 
 import {
@@ -486,11 +487,17 @@ export class RalphService {
    * Handle completion signal from API callback
    * @param {string} token - Completion token
    * @param {string} status - 'done' or 'blocked'
-   * @param {string} reason - Reason if blocked
-   * @param {string} learnings - Optional learnings/notes
+   * @param {Object} signalData - Signal data object containing:
+   *   - status: 'in_progress', 'done', or 'blocked'
+   *   - progress: 0-100 percentage (optional)
+   *   - currentStep: Current step description (optional)
+   *   - reason: Reason if blocked (optional)
+   *   - learnings: Summary/notes (optional)
+   *   - outputs: Structured outputs { key: value } (optional)
+   *   - artifacts: Array of file paths created (optional)
    * @returns {boolean} True if token was valid
    */
-  async handleCompletionSignal(token, status, reason, learnings) {
+  async handleCompletionSignal(token, signalData) {
     const context = pendingCompletions.get(token);
     if (!context) {
       console.log(`[RalphService] Unknown completion token: ${token}`);
@@ -498,18 +505,28 @@ export class RalphService {
     }
 
     const { runId, storyIndex, workerId, standalone } = context;
-    console.log(`[RalphService] Completion signal received for worker ${workerId}: ${status} (standalone: ${!!standalone})`);
+    const { status, progress, currentStep, reason, learnings, outputs, artifacts } = signalData;
+    console.log(`[RalphService] Completion signal received for worker ${workerId}: ${status}${progress !== undefined ? ` (${progress}%)` : ''} (standalone: ${!!standalone})`);
 
-    // Clean up
-    pendingCompletions.delete(token);
+    // Don't delete token for in_progress signals - only for terminal states
+    if (status === 'done' || status === 'blocked') {
+      pendingCompletions.delete(token);
+    }
 
     // Handle standalone worker (not part of a PRD run)
     if (standalone) {
+      // Update worker's Ralph status for parent workers to query
+      updateWorkerRalphStatus(workerId, signalData, this.io);
+
       this.io?.emit('ralph:worker:signaled', {
         workerId,
         status,
+        progress,
+        currentStep,
         reason,
-        learnings
+        learnings,
+        outputs,
+        artifacts
       });
       console.log(`[RalphService] Standalone worker ${workerId} signaled: ${status}`);
       return true;

@@ -29,7 +29,6 @@ import {
   getWorkerForTask,
   getDependencyStats
 } from './dependencyGraph.js';
-import { getConfig, getProjectsRoot } from './config.js';
 
 const execAsync = promisify(exec);
 
@@ -102,7 +101,7 @@ const activityLog = [];
 const MAX_ACTIVITY_LOG = 100;
 
 // Session name prefix for tmux discovery
-const SESSION_PREFIX = 'strategos-worker-';
+const SESSION_PREFIX = 'thea-worker-';
 
 // Resource limits
 const MAX_CONCURRENT_WORKERS = 100;
@@ -235,12 +234,8 @@ async function sessionExists(sessionName) {
 const DEFAULT_COLS = 120;
 const DEFAULT_ROWS = 40;
 
-// Strategos API configuration (uses config port)
-function getStrategosApi() {
-  const config = getConfig();
-  const port = config.port || 38007;
-  return `http://localhost:${port}`;
-}
+// Strategos API configuration
+const STRATEGOS_API = 'http://localhost:38007';
 
 // ============================================
 // STRATEGOS CONTEXT FILE GENERATION
@@ -262,18 +257,36 @@ function generateStrategosContext(workerId, workerLabel, projectPath, ralphToken
 - **Ralph Mode:** ENABLED
 - **Ralph Token:** ${ralphToken}
 
-### Task Completion Signaling
-When your task is complete, signal via the Ralph API:
-\`\`\`bash
-# Signal task completed successfully
-curl -s -X POST ${getStrategosApi()}/api/ralph/signal/${ralphToken} \\
-  -H "Content-Type: application/json" \\
-  -d '{"status": "done", "learnings": "Brief summary of what was accomplished"}'
+### Task Status Signaling (Ralph API)
 
-# Or signal blocked if you cannot proceed
-curl -s -X POST ${getStrategosApi()}/api/ralph/signal/${ralphToken} \\
+**Report progress** (optional, helps parent track your work):
+\`\`\`bash
+curl -s -X POST ${STRATEGOS_API}/api/ralph/signal/${ralphToken} \\
   -H "Content-Type: application/json" \\
-  -d '{"status": "blocked", "reason": "Description of what is blocking progress"}'
+  -d '{
+    "status": "in_progress",
+    "progress": 50,
+    "currentStep": "Implementing feature X"
+  }'
+\`\`\`
+
+**Signal completion** with learnings and optional structured outputs:
+\`\`\`bash
+curl -s -X POST ${STRATEGOS_API}/api/ralph/signal/${ralphToken} \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "status": "done",
+    "learnings": "Brief summary of what was accomplished",
+    "outputs": {"key": "value for dependent workers"},
+    "artifacts": ["/path/to/created/file.js"]
+  }'
+\`\`\`
+
+**Signal blocked** if you cannot proceed:
+\`\`\`bash
+curl -s -X POST ${STRATEGOS_API}/api/ralph/signal/${ralphToken} \\
+  -H "Content-Type: application/json" \\
+  -d '{"status": "blocked", "reason": "Description of what is blocking"}'
 \`\`\`
 ` : '';
 
@@ -289,7 +302,7 @@ Why? The Task tool:
 - Breaks dependency management
 - Isolates you from the Strategos orchestration system
 
-Instead, use the **Strategos API** at ${getStrategosApi()}
+Instead, use the **Strategos API** at ${STRATEGOS_API}
 
 ---
 
@@ -309,18 +322,38 @@ ${ralphSection}
 
 ### List all workers
 \`\`\`bash
-curl -s ${getStrategosApi()}/api/workers | jq '.'
+curl -s ${STRATEGOS_API}/api/workers | jq '.'
 \`\`\`
 
-### Spawn a new worker
+### Check your sibling workers (avoid duplicate work)
 \`\`\`bash
-curl -s -X POST ${getStrategosApi()}/api/workers \\
+curl -s ${STRATEGOS_API}/api/workers/${workerId}/siblings | jq '.'
+\`\`\`
+
+### Spawn a worker using templates (RECOMMENDED)
+\`\`\`bash
+curl -s -X POST ${STRATEGOS_API}/api/workers/spawn-from-template \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "template": "research|impl|test|review|fix|colonel",
+    "name": "Descriptive Task Name",
+    "projectPath": "${projectPath}",
+    "parentWorkerId": "${workerId}",
+    "task": { "description": "What to do and why" }
+  }'
+\`\`\`
+
+Templates: research, impl, test, review, fix, general, colonel
+All templates auto-enable autoAccept and ralphMode.
+
+### Spawn with full options (when templates aren't enough)
+\`\`\`bash
+curl -s -X POST ${STRATEGOS_API}/api/workers \\
   -H "Content-Type: application/json" \\
   -d '{
     "projectPath": "${projectPath}",
     "label": "ROLE: Task Description",
     "parentWorkerId": "${workerId}",
-    "parentLabel": "${workerLabel}",
     "autoAccept": true,
     "ralphMode": true,
     "task": {
@@ -331,45 +364,56 @@ curl -s -X POST ${getStrategosApi()}/api/workers \\
   }'
 \`\`\`
 
-**autoAccept**: When \`true\`, the worker automatically accepts permission prompts (y/n).
-Recommended for child workers to avoid blocking on prompts.
-
-**ralphMode**: When \`true\`, enables autonomous completion signaling. The spawned worker
-receives a unique \`ralphToken\` and can signal task completion via the API. **Always enable
-for spawned workers.**
-
 ### Signal Task Completion (Ralph Mode)
 When your task is complete, signal it via the Ralph API. Get your token from worker info:
 \`\`\`bash
 # Get your worker's ralphToken
-curl -s ${getStrategosApi()}/api/workers/{your-worker-id} | jq -r '.ralphToken'
+curl -s ${STRATEGOS_API}/api/workers/{your-worker-id} | jq -r '.ralphToken'
 
 # Signal completion (replace TOKEN with your ralphToken)
-curl -s -X POST ${getStrategosApi()}/api/ralph/signal/TOKEN \\
+curl -s -X POST ${STRATEGOS_API}/api/ralph/signal/TOKEN \\
   -H "Content-Type: application/json" \\
   -d '{"status": "done", "learnings": "Brief summary of what was accomplished"}'
 
 # Or signal blocked if you cannot proceed
-curl -s -X POST ${getStrategosApi()}/api/ralph/signal/TOKEN \\
+curl -s -X POST ${STRATEGOS_API}/api/ralph/signal/TOKEN \\
   -H "Content-Type: application/json" \\
   -d '{"status": "blocked", "reason": "Description of what is blocking progress"}'
 \`\`\`
 
-### Get worker output
+### Check your spawned workers' status (context-efficient)
 \`\`\`bash
-curl -s ${getStrategosApi()}/api/workers/{id}/output
+# Get Ralph status of your children - use INSTEAD of reading output!
+curl -s ${STRATEGOS_API}/api/workers/${workerId}/children | jq '.'
+\`\`\`
+
+Response includes:
+- \`summary\`: { total, pending, inProgress, done, blocked }
+- \`children\`: Array with:
+  - \`ralphStatus\`: "pending" | "in_progress" | "done" | "blocked"
+  - \`ralphProgress\`: 0-100 percentage (if reported)
+  - \`ralphCurrentStep\`: What worker is doing now
+  - \`ralphLearnings\`: Summary when done
+  - \`ralphOutputs\`: { key: value } structured data for you to use
+  - \`ralphArtifacts\`: File paths created
+
+**Tip:** Check children status FIRST before reading terminal output to save context.
+
+### Get worker output (use sparingly)
+\`\`\`bash
+curl -s ${STRATEGOS_API}/api/workers/{id}/output
 \`\`\`
 
 ### Send input to a worker
 \`\`\`bash
-curl -s -X POST ${getStrategosApi()}/api/workers/{id}/input \\
+curl -s -X POST ${STRATEGOS_API}/api/workers/{id}/input \\
   -H "Content-Type: application/json" \\
   -d '{"input": "your instructions"}'
 \`\`\`
 
 ### Terminate a worker
 \`\`\`bash
-curl -s -X DELETE ${getStrategosApi()}/api/workers/{id}
+curl -s -X DELETE ${STRATEGOS_API}/api/workers/{id}
 \`\`\`
 
 ---
@@ -579,8 +623,11 @@ You are part of a coordinated multi-agent system. Your role is to:
 Working Directory: ${worker.workingDir}
 Project: ${worker.project}
 Platform: linux
-Strategos API: ${getStrategosApi()}
-Projects Root: ${getProjectsRoot()}
+Strategos API: ${STRATEGOS_API}
+
+Important Paths:
+- Research docs: /home/druzy/thea/strategos/research/
+- Shared specs: /home/druzy/thea/shared/
 </environment>
 
 <naming_schema>
@@ -616,80 +663,84 @@ Always use TEST: prefix for temporary or test workers.
 <tools>
 STRATEGOS API - Use curl to coordinate with the system:
 
-List all workers (check siblings before starting):
-  curl -s ${getStrategosApi()}/api/workers | jq '.'
+## SIBLING COORDINATION (Check Before Starting)
+Check what your sibling workers are doing to avoid duplicate work:
+  curl -s ${STRATEGOS_API}/api/workers/${worker.id}/siblings | jq '.'
+
+Response shows siblings' tasks and Ralph status so you can coordinate.
+
+## WORKER QUERIES
+List all workers:
+  curl -s ${STRATEGOS_API}/api/workers | jq '.'
 
 Get worker details:
-  curl -s ${getStrategosApi()}/api/workers/{id} | jq '.'
+  curl -s ${STRATEGOS_API}/api/workers/{id} | jq '.'
 
-Get worker output (see what another worker is doing):
-  curl -s ${getStrategosApi()}/api/workers/{id}/output
+Get worker output (use sparingly):
+  curl -s ${STRATEGOS_API}/api/workers/{id}/output
 
+## COMMUNICATION
 Send input to another worker:
-  curl -s -X POST ${getStrategosApi()}/api/workers/{id}/input \\
+  curl -s -X POST ${STRATEGOS_API}/api/workers/{id}/input \\
     -H "Content-Type: application/json" \\
     -d '{"input":"your message"}'
 
-Spawn a specialized worker (use naming schema):
-  curl -s -X POST ${getStrategosApi()}/api/workers \\
+## SPAWN WORKERS (Use Templates for Common Types)
+Quick spawn using templates (recommended):
+  curl -s -X POST ${STRATEGOS_API}/api/workers/spawn-from-template \\
     -H "Content-Type: application/json" \\
-    -d '{"projectPath":"project-name","label":"PREFIX: Descriptive Name"}'
+    -d '{
+      "template": "research|impl|test|review|fix",
+      "name": "Descriptive Task Name",
+      "projectPath": "project-name",
+      "parentWorkerId": "${worker.id}",
+      "task": { "description": "What to do" }
+    }'
 
-Spawn a worker with task context (for delegation):
-  curl -s -X POST ${getStrategosApi()}/api/workers \\
+Available templates: research, impl, test, review, fix, general, colonel
+All templates have autoAccept and ralphMode enabled by default.
+
+Full spawn (when you need custom options):
+  curl -s -X POST ${STRATEGOS_API}/api/workers \\
     -H "Content-Type: application/json" \\
     -d '{
       "projectPath": "project-name",
       "label": "PREFIX: Task Description",
       "parentWorkerId": "${worker.id}",
       "parentLabel": "${worker.label}",
+      "autoAccept": true,
+      "ralphMode": true,
       "task": {
         "description": "Clear description of what to do",
         "type": "implementation|research|testing|review",
         "context": "Background info the worker needs",
         "constraints": ["constraint 1", "constraint 2"]
-      },
-      "initialInput": "Optional first instruction after prompt"
+      }
     }'
 
 Kill a worker:
-  curl -s -X DELETE ${getStrategosApi()}/api/workers/{id}
+  curl -s -X DELETE ${STRATEGOS_API}/api/workers/{id}
 
-VERIFICATION & SELF-CORRECTION (CRITIC Framework):
-Register task context before starting work:
-  curl -s -X POST ${getStrategosApi()}/api/workers/${worker.id}/task-context \\
+## VERIFICATION & SELF-CORRECTION
+Register task context:
+  curl -s -X POST ${STRATEGOS_API}/api/workers/${worker.id}/task-context \\
     -H "Content-Type: application/json" \\
-    -d '{
-      "taskType": "code|factual|reasoning|format",
-      "testCommand": "npm test",
-      "requiredFields": ["field1", "field2"]
-    }'
+    -d '{"taskType": "code|factual|reasoning|format", "testCommand": "npm test"}'
 
-Verify your output with external tools (not self-evaluation):
-  curl -s -X POST ${getStrategosApi()}/api/workers/${worker.id}/verify \\
+Verify your output:
+  curl -s -X POST ${STRATEGOS_API}/api/workers/${worker.id}/verify \\
     -H "Content-Type: application/json" \\
     -d '{"output": "your output to verify"}'
 
-Run correction loop if verification fails:
-  curl -s -X POST ${getStrategosApi()}/api/workers/${worker.id}/correct \\
-    -H "Content-Type: application/json" \\
-    -d '{"output": "output to correct"}'
-
-Complete with verification (recommended):
-  curl -s -X POST ${getStrategosApi()}/api/workers/${worker.id}/complete \\
+Complete with verification:
+  curl -s -X POST ${STRATEGOS_API}/api/workers/${worker.id}/complete \\
     -H "Content-Type: application/json" \\
     -d '{"requireVerification": true}'
 
-Start automated test-fix cycle:
-  curl -s -X POST ${getStrategosApi()}/api/optimize/start \\
-    -H "Content-Type: application/json" \\
-    -d '{"projectPath": "/path/to/project", "testCommand": "npm test"}'
-
-Tool Usage Guidelines:
-- Check sibling workers before starting large tasks
-- Use the naming schema when spawning workers
-- Register task context, then verify outputs before completing
-- Use correction loop when verification fails
+## GUIDELINES
+- ALWAYS check siblings before starting large tasks
+- Use templates for spawning workers (simpler, safer defaults)
+- Verify outputs before completing
 </tools>
 
 <behavioral_guidelines>
@@ -741,7 +792,7 @@ You CAN:
 - Coordinate with sibling workers via API
 
 You CANNOT:
-- Modify files outside the projects root (${getProjectsRoot()})
+- Modify files outside /home/druzy/thea/
 - Make claims without verification
 - Skip verification steps
 - Proceed with ambiguous destructive operations
@@ -755,7 +806,7 @@ When Uncertain:
 
 <safety>
 NEVER:
-- Modify system files or files outside your project
+- Modify system files or files outside project scope
 - Execute commands that could affect system stability
 - Proceed with destructive operations without confirmation
 - Fabricate information or outputs
@@ -779,7 +830,7 @@ ${parentWorkerId ? `
 <delegation_context>
 You were spawned by worker ${parentWorkerId}${parentLabel ? ` (${parentLabel})` : ''}.
 Report progress and results back to your parent worker using the Strategos API.
-Use: curl -s -X POST ${getStrategosApi()}/api/workers/${parentWorkerId}/input -H "Content-Type: application/json" -d '{"input":"your message"}'
+Use: curl -s -X POST ${STRATEGOS_API}/api/workers/${parentWorkerId}/input -H "Content-Type: application/json" -d '{"input":"your message"}'
 </delegation_context>
 ` : ''}
 You are now initialized and ready to receive instructions.`;
@@ -884,64 +935,109 @@ EXAMPLES:
 Working Directory: ${worker.workingDir}
 Project: ${worker.project}
 Platform: linux
-Strategos API: ${getStrategosApi()}
-Projects Root: ${getProjectsRoot()}
+Strategos API: ${STRATEGOS_API}
+
+Important Paths:
+- Research docs: /home/druzy/thea/strategos/research/
+- Shared specs: /home/druzy/thea/shared/
 </environment>
+
+<critical_warning>
+## NEVER USE CLAUDE CODE'S TASK TOOL
+
+You MUST use the Strategos API to spawn workers. NEVER use Claude Code's native Task tool.
+
+The Task tool:
+- Breaks multi-agent coordination (you can't monitor spawned agents)
+- Wastes resources (spawns isolated processes outside Strategos)
+- Prevents Ralph completion signaling
+- Isolates agents from the orchestration system
+
+ALWAYS use: curl -X POST ${STRATEGOS_API}/api/workers
+NEVER use: the Task tool or any subagent spawning outside Strategos
+</critical_warning>
 
 <tools>
 STRATEGOS API - Your command interface:
 
-List all workers (your subordinates):
-  curl -s ${getStrategosApi()}/api/workers | jq '.'
+## WORKER SPAWNING (Use Templates - Most Efficient)
 
-Spawn a specialized worker with task context:
-  curl -s -X POST ${getStrategosApi()}/api/workers \\
+Quick spawn using templates (RECOMMENDED):
+  curl -s -X POST ${STRATEGOS_API}/api/workers/spawn-from-template \\
+    -H "Content-Type: application/json" \\
+    -d '{
+      "template": "research|impl|test|review|fix|colonel",
+      "name": "Descriptive Task Name",
+      "projectPath": "project-name",
+      "parentWorkerId": "${worker.id}",
+      "task": { "description": "Commander Intent: What and why" }
+    }'
+
+Templates auto-enable: autoAccept, ralphMode, proper prefix.
+Available: research, impl, test, review, fix, general, colonel
+
+Full spawn (custom options):
+  curl -s -X POST ${STRATEGOS_API}/api/workers \\
     -H "Content-Type: application/json" \\
     -d '{
       "projectPath": "project-name",
       "label": "PREFIX: Task Description",
       "parentWorkerId": "${worker.id}",
-      "parentLabel": "${worker.label}",
-      "task": {
-        "description": "Commander Intent: What and why",
-        "type": "implementation|research|testing",
-        "context": "Background info",
-        "constraints": ["constraint 1"]
-      }
+      "autoAccept": true,
+      "ralphMode": true,
+      "task": { "description": "...", "type": "...", "context": "..." }
     }'
 
-Get worker output (monitor progress):
-  curl -s ${getStrategosApi()}/api/workers/{id}/output
+## MONITORING (Use Ralph Status - Saves Context)
+
+Check your spawned workers' status (MOST EFFICIENT):
+  curl -s ${STRATEGOS_API}/api/workers/${worker.id}/children | jq '.'
+
+Response:
+  summary: { total, pending, inProgress, done, blocked }
+  children: [{
+    id, label, ralphStatus, ralphProgress, ralphCurrentStep,
+    ralphLearnings, ralphOutputs, ralphArtifacts, taskDescription
+  }]
+
+ralphStatus values:
+  - "pending" - Worker active, no signal yet
+  - "in_progress" - Worker signaled progress (check ralphProgress %)
+  - "done" - Worker completed (check ralphLearnings for summary)
+  - "blocked" - Worker blocked (needs help)
+
+Get full worker tree (hierarchy view):
+  curl -s ${STRATEGOS_API}/api/workers/tree | jq '.'
+
+Shows parent-child relationships and aggregated stats.
+
+## OTHER COMMANDS
+
+List all workers:
+  curl -s ${STRATEGOS_API}/api/workers | jq '.'
+
+Get worker output (USE SPARINGLY - prefer Ralph status):
+  curl -s ${STRATEGOS_API}/api/workers/{id}/output
 
 Send orders to a worker:
-  curl -s -X POST ${getStrategosApi()}/api/workers/{id}/input \\
+  curl -s -X POST ${STRATEGOS_API}/api/workers/{id}/input \\
     -H "Content-Type: application/json" \\
     -d '{"input":"your instructions"}'
 
 Terminate a worker:
-  curl -s -X DELETE ${getStrategosApi()}/api/workers/{id}
+  curl -s -X DELETE ${STRATEGOS_API}/api/workers/{id}
 
-VERIFICATION & QUALITY ASSURANCE (CRITIC Framework):
-Verify subordinate output before accepting:
-  curl -s -X POST ${getStrategosApi()}/api/workers/{id}/verify \\
+## VERIFICATION
+
+Verify subordinate output:
+  curl -s -X POST ${STRATEGOS_API}/api/workers/{id}/verify \\
     -H "Content-Type: application/json" \\
-    -d '{"output": "subordinate output to verify"}'
+    -d '{"output": "output to verify"}'
 
-Trigger correction loop if verification fails:
-  curl -s -X POST ${getStrategosApi()}/api/workers/{id}/correct
-
-Complete worker with mandatory verification:
-  curl -s -X POST ${getStrategosApi()}/api/workers/{id}/complete \\
+Complete worker with verification:
+  curl -s -X POST ${STRATEGOS_API}/api/workers/{id}/complete \\
     -H "Content-Type: application/json" \\
     -d '{"requireVerification": true}'
-
-Start automated test-fix optimization cycle:
-  curl -s -X POST ${getStrategosApi()}/api/optimize/start \\
-    -H "Content-Type: application/json" \\
-    -d '{"projectPath": "/path/to/project"}'
-
-Get verification metrics:
-  curl -s ${getStrategosApi()}/api/verification/metrics
 </tools>
 
 <task_decomposition>
@@ -1027,7 +1123,7 @@ You CAN:
 - Access all project files and documentation
 
 You CANNOT:
-- Modify files outside the projects root (${getProjectsRoot()})
+- Modify files outside /home/druzy/thea/
 - Make claims without verification
 - Skip verification of subordinate work
 - Proceed with high-risk operations without human approval
@@ -1059,7 +1155,7 @@ ${parentWorkerId ? `
 <delegation_context>
 You were spawned by worker ${parentWorkerId}${parentLabel ? ` (${parentLabel})` : ''}.
 Report strategic progress and final results back to your parent worker.
-Use: curl -s -X POST ${getStrategosApi()}/api/workers/${parentWorkerId}/input -H "Content-Type: application/json" -d '{"input":"your message"}'
+Use: curl -s -X POST ${STRATEGOS_API}/api/workers/${parentWorkerId}/input -H "Content-Type: application/json" -d '{"input":"your message"}'
 </delegation_context>
 ` : ''}
 You are now initialized as Strategic Commander. Analyze incoming tasks,
@@ -1245,6 +1341,15 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
       // Ralph mode - autonomous completion signaling
       ralphMode,
       ralphToken, // Use pre-generated token (already in context file)
+      ralphStatus: ralphMode ? 'pending' : null, // 'pending', 'in_progress', 'done', 'blocked'
+      ralphSignaledAt: null,
+      ralphLearnings: null,
+      // Progressive status (new)
+      ralphProgress: null,      // 0-100 percentage
+      ralphCurrentStep: null,   // Current step description
+      // Structured outputs (new)
+      ralphOutputs: null,       // { key: value } for passing to dependent workers
+      ralphArtifacts: null,     // Array of file paths created
     };
 
     workers.set(id, worker);
@@ -2017,6 +2122,162 @@ export function getWorkerOutput(workerId) {
   return outputBuffers.get(workerId) || '';
 }
 
+/**
+ * Get all child workers spawned by a parent worker
+ * Includes Ralph status for easy progress monitoring without reading output
+ * @param {string} parentWorkerId - Parent worker ID
+ * @returns {Array} Array of child workers with Ralph status
+ */
+export function getChildWorkers(parentWorkerId) {
+  const parent = workers.get(parentWorkerId);
+  if (!parent) {
+    return [];
+  }
+
+  const childIds = parent.childWorkerIds || [];
+  return childIds.map(childId => {
+    const child = workers.get(childId);
+    if (!child) return null;
+    return {
+      id: child.id,
+      label: child.label,
+      status: child.status,
+      ralphMode: child.ralphMode,
+      ralphStatus: child.ralphStatus, // 'pending', 'in_progress', 'done', 'blocked', or null
+      ralphSignaledAt: child.ralphSignaledAt,
+      ralphLearnings: child.ralphLearnings,
+      // New progressive fields
+      ralphProgress: child.ralphProgress,
+      ralphCurrentStep: child.ralphCurrentStep,
+      // Structured outputs
+      ralphOutputs: child.ralphOutputs,
+      ralphArtifacts: child.ralphArtifacts,
+      // Task info for context
+      taskDescription: child.task?.description?.substring(0, 200) || null,
+      // Timing info
+      createdAt: child.createdAt,
+      lastActivity: child.lastActivity,
+      durationMs: Date.now() - new Date(child.createdAt).getTime(),
+      health: child.health,
+    };
+  }).filter(Boolean);
+}
+
+/**
+ * Get sibling workers (other workers with the same parent)
+ * Used to help workers coordinate and avoid duplicate work
+ * @param {string} workerId - Worker ID to get siblings for
+ * @returns {Array} Array of sibling workers (excluding self)
+ */
+export function getSiblingWorkers(workerId) {
+  const worker = workers.get(workerId);
+  if (!worker || !worker.parentWorkerId) {
+    return [];
+  }
+
+  const parent = workers.get(worker.parentWorkerId);
+  if (!parent) {
+    return [];
+  }
+
+  const siblingIds = (parent.childWorkerIds || []).filter(id => id !== workerId);
+  return siblingIds.map(siblingId => {
+    const sibling = workers.get(siblingId);
+    if (!sibling) return null;
+    return {
+      id: sibling.id,
+      label: sibling.label,
+      status: sibling.status,
+      ralphStatus: sibling.ralphStatus,
+      ralphProgress: sibling.ralphProgress,
+      ralphCurrentStep: sibling.ralphCurrentStep,
+      taskDescription: sibling.task?.description?.substring(0, 100) || null,
+    };
+  }).filter(Boolean);
+}
+
+/**
+ * Update a worker's Ralph status (called when worker signals)
+ * @param {string} workerId - Worker ID
+ * @param {Object} signalData - Signal data containing:
+ *   - status: 'in_progress', 'done', or 'blocked'
+ *   - progress: 0-100 percentage (optional)
+ *   - currentStep: Current step description (optional)
+ *   - learnings: Summary/notes (optional)
+ *   - outputs: Structured outputs { key: value } (optional)
+ *   - artifacts: Array of file paths created (optional)
+ *   - reason: Reason if blocked (optional)
+ * @param {Object} io - Socket.io instance for events
+ * @returns {boolean} True if update succeeded
+ */
+export function updateWorkerRalphStatus(workerId, signalData, io = null) {
+  const worker = workers.get(workerId);
+  if (!worker) {
+    console.log(`[RalphStatus] Worker ${workerId} not found`);
+    return false;
+  }
+
+  // Handle both old format (status, learnings) and new format (signalData object)
+  const data = typeof signalData === 'string'
+    ? { status: signalData }
+    : signalData;
+
+  const { status, progress, currentStep, learnings, outputs, artifacts, reason } = data;
+
+  worker.ralphStatus = status;
+  worker.lastActivity = new Date();
+
+  // Only set signaled timestamp on terminal states
+  if (status === 'done' || status === 'blocked') {
+    worker.ralphSignaledAt = new Date();
+  }
+
+  // Update optional fields if provided
+  if (progress !== undefined) worker.ralphProgress = progress;
+  if (currentStep !== undefined) worker.ralphCurrentStep = currentStep;
+  if (learnings !== undefined) worker.ralphLearnings = learnings;
+  if (outputs !== undefined) worker.ralphOutputs = outputs;
+  if (artifacts !== undefined) worker.ralphArtifacts = artifacts;
+
+  console.log(`[RalphStatus] Worker ${workerId} signaled: ${status}${progress !== undefined ? ` (${progress}%)` : ''}`);
+
+  // Emit update event
+  if (io) {
+    io.emit('worker:ralph:signaled', {
+      workerId,
+      status,
+      progress,
+      currentStep,
+      learnings,
+      outputs,
+      artifacts,
+      reason,
+      signaledAt: worker.ralphSignaledAt
+    });
+    io.emit('worker:updated', normalizeWorker(worker));
+  }
+
+  // Also notify parent worker if exists
+  if (worker.parentWorkerId) {
+    const parent = workers.get(worker.parentWorkerId);
+    if (parent && io) {
+      io.emit('worker:child:signaled', {
+        parentWorkerId: worker.parentWorkerId,
+        childWorkerId: workerId,
+        childLabel: worker.label,
+        status,
+        progress,
+        currentStep,
+        learnings,
+        outputs
+      });
+    }
+  }
+
+  saveWorkerState();
+  return true;
+}
+
 // ============================================
 // UPDATE OPERATIONS
 // ============================================
@@ -2120,7 +2381,7 @@ export async function discoverExistingWorkers(io = null) {
 
       // Get working directory
       // SECURITY: Using spawn instead of exec prevents shell injection
-      let workingDir = process.cwd();
+      let workingDir = '/thea';
       try {
         const { stdout: cwd } = await spawnTmux([
           'display-message', '-t', sessionName, '-p', '#{pane_current_path}'
