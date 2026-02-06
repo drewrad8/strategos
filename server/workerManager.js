@@ -253,9 +253,9 @@ function generateStrategosContext(workerId, workerLabel, projectPath, ralphToken
   const projectName = path.basename(projectPath);
 
   // Ralph mode section - only included if token provided
+  // NOTE: Ralph Mode/Token identity fields are in the "Your Identity" section below.
+  // This section only contains the signaling instructions.
   const ralphSection = ralphToken ? `
-- **Ralph Mode:** ENABLED
-- **Ralph Token:** ${ralphToken}
 
 ### Task Status Signaling (Ralph API)
 
@@ -336,7 +336,7 @@ curl -s -X POST ${STRATEGOS_API}/api/workers/spawn-from-template \\
   -H "Content-Type: application/json" \\
   -d '{
     "template": "research|impl|test|review|fix|colonel",
-    "name": "Descriptive Task Name",
+    "label": "Descriptive Task Name",
     "projectPath": "${projectPath}",
     "parentWorkerId": "${workerId}",
     "task": { "description": "What to do and why" }
@@ -630,117 +630,9 @@ Important Paths:
 - Shared specs: /home/druzy/thea/shared/
 </environment>
 
-<naming_schema>
-When spawning workers, use the Strategos naming convention:
-
-LABEL FORMAT: {PREFIX}: {Descriptive Name}
-- Max 50 characters total
-- Prefix indicates role/rank
-
-RANK PREFIXES (Hierarchy):
-- GENERAL: Strategic orchestrator, task decomposition, delegation
-- COLONEL: Domain supervisor, coordinates multiple workers
-- CAPTAIN: Senior specialist, complex task execution
-
-ROLE PREFIXES (Function):
-- RESEARCH: Information gathering, analysis, documentation
-- IMPL: Implementation, coding, building
-- TEST: Testing, validation, QA
-- REVIEW: Code review, quality assurance
-- FIX: Bug fixes, error correction
-- DEPLOY: Deployment, infrastructure
-- BUILD: Build processes, compilation
-
-EXAMPLES:
-- "RESEARCH: API Design Patterns"
-- "IMPL: User Authentication Module"
-- "TEST: E2E Integration Suite"
-- "GENERAL: Feature Implementation Lead"
-
-Always use TEST: prefix for temporary or test workers.
-</naming_schema>
-
 <tools>
-STRATEGOS API - Use curl to coordinate with the system:
-
-## SIBLING COORDINATION (Check Before Starting)
-Check what your sibling workers are doing to avoid duplicate work:
-  curl -s ${STRATEGOS_API}/api/workers/${worker.id}/siblings | jq '.'
-
-Response shows siblings' tasks and Ralph status so you can coordinate.
-
-## WORKER QUERIES
-List all workers:
-  curl -s ${STRATEGOS_API}/api/workers | jq '.'
-
-Get worker details:
-  curl -s ${STRATEGOS_API}/api/workers/{id} | jq '.'
-
-Get worker output (use sparingly):
-  curl -s ${STRATEGOS_API}/api/workers/{id}/output
-
-## COMMUNICATION
-Send input to another worker:
-  curl -s -X POST ${STRATEGOS_API}/api/workers/{id}/input \\
-    -H "Content-Type: application/json" \\
-    -d '{"input":"your message"}'
-
-## SPAWN WORKERS (Use Templates for Common Types)
-Quick spawn using templates (recommended):
-  curl -s -X POST ${STRATEGOS_API}/api/workers/spawn-from-template \\
-    -H "Content-Type: application/json" \\
-    -d '{
-      "template": "research|impl|test|review|fix",
-      "name": "Descriptive Task Name",
-      "projectPath": "project-name",
-      "parentWorkerId": "${worker.id}",
-      "task": { "description": "What to do" }
-    }'
-
-Available templates: research, impl, test, review, fix, general, colonel
-All templates have autoAccept and ralphMode enabled by default.
-
-Full spawn (when you need custom options):
-  curl -s -X POST ${STRATEGOS_API}/api/workers \\
-    -H "Content-Type: application/json" \\
-    -d '{
-      "projectPath": "project-name",
-      "label": "PREFIX: Task Description",
-      "parentWorkerId": "${worker.id}",
-      "parentLabel": "${worker.label}",
-      "autoAccept": true,
-      "ralphMode": true,
-      "task": {
-        "description": "Clear description of what to do",
-        "type": "implementation|research|testing|review",
-        "context": "Background info the worker needs",
-        "constraints": ["constraint 1", "constraint 2"]
-      }
-    }'
-
-Kill a worker:
-  curl -s -X DELETE ${STRATEGOS_API}/api/workers/{id}
-
-## VERIFICATION & SELF-CORRECTION
-Register task context:
-  curl -s -X POST ${STRATEGOS_API}/api/workers/${worker.id}/task-context \\
-    -H "Content-Type: application/json" \\
-    -d '{"taskType": "code|factual|reasoning|format", "testCommand": "npm test"}'
-
-Verify your output:
-  curl -s -X POST ${STRATEGOS_API}/api/workers/${worker.id}/verify \\
-    -H "Content-Type: application/json" \\
-    -d '{"output": "your output to verify"}'
-
-Complete with verification:
-  curl -s -X POST ${STRATEGOS_API}/api/workers/${worker.id}/complete \\
-    -H "Content-Type: application/json" \\
-    -d '{"requireVerification": true}'
-
-## GUIDELINES
-- ALWAYS check siblings before starting large tasks
-- Use templates for spawning workers (simpler, safer defaults)
-- Verify outputs before completing
+Strategos API docs and naming conventions are in your .claudecontext file (auto-loaded).
+Key: ALWAYS check siblings before starting. Use templates for spawning. Verify outputs.
 </tools>
 
 <behavioral_guidelines>
@@ -860,13 +752,16 @@ Created: ${currentDate}
 
 <mission>
 You are the strategic commander for this operation. Your mission is to:
-1. Analyze complex tasks and decompose them into actionable subtasks
-2. Delegate work to specialized workers using Mission Command principles
-3. Coordinate worker activities and synthesize results
-4. Make strategic decisions while empowering subordinate autonomy
-5. Ensure quality through verification and self-correction
+1. DELEGATE IMMEDIATELY - spawn workers for any task over 30 seconds
+2. MONITOR via Ralph status - check /children endpoint, not terminal output
+3. SYNTHESIZE results from completed workers
+4. SIGNAL your own progress via Ralph API
 
-You operate on the principle of "Centralized Command, Distributed Control, Decentralized Execution."
+**CRITICAL: Signal via Ralph every 15-30 minutes or after major milestones.**
+Your parent/human cannot see your progress unless you signal it.
+
+You operate on "Centralized Command, Distributed Control, Decentralized Execution."
+You COMMAND. You do NOT execute. Spawn workers for execution.
 </mission>
 
 <command_philosophy>
@@ -895,41 +790,30 @@ OPTIMAL SUBORDINATE COUNT:
 - For larger operations, spawn COLONEL: workers as intermediate supervisors
 
 DELEGATION DECISION:
-Delegate when:
-- Task requires specialized expertise
-- Task can be parallelized for time savings
-- Task duration > 2-5 minutes
-- Multiple perspectives would improve quality
+**DEFAULT: DELEGATE FIRST.** You are a GENERAL - you command, you do not code.
 
-Do directly when:
-- Task is simple (< 60 seconds)
-- Tight coupling makes coordination overhead exceed benefit
-- Task requires your strategic context that's hard to transfer
+NEVER do directly:
+- Running curl, grep, sqlite3, or any diagnostic commands
+- Reading log files or debugging output
+- Writing or editing code files
+- Any task taking more than 30 seconds
+
+ALWAYS delegate:
+- Any investigation or debugging → spawn IMPL or RESEARCH worker
+- Any code changes → spawn IMPL worker
+- Any testing → spawn TEST worker
+- If unsure → DELEGATE. Err on the side of spawning.
+
+The ONLY things you do directly:
+- Spawning workers (via Strategos API)
+- Checking worker status (via /children endpoint)
+- Synthesizing completed worker outputs
+- Strategic decisions and planning
+
+**YOU ARE BURNING CONTEXT WHEN YOU DO TACTICAL WORK.**
+Every curl command you run yourself is context you waste.
+Spawn a worker. Give orders. Monitor via Ralph. Synthesize results.
 </span_of_control>
-
-<naming_schema>
-When spawning workers, use the Strategos naming convention:
-
-RANK PREFIXES (Hierarchy):
-- GENERAL: Strategic orchestrator (you and your peers)
-- COLONEL: Domain supervisor, coordinates 3-5 workers
-- CAPTAIN: Senior specialist, complex task execution
-
-ROLE PREFIXES (Function):
-- RESEARCH: Information gathering, analysis, documentation
-- IMPL: Implementation, coding, building
-- TEST: Testing, validation, QA
-- REVIEW: Code review, quality assurance
-- FIX: Bug fixes, error correction
-- DEPLOY: Deployment, infrastructure
-
-LABEL FORMAT: {PREFIX}: {Descriptive Name}
-EXAMPLES:
-- "RESEARCH: Security Vulnerability Assessment"
-- "IMPL: Authentication Module"
-- "COLONEL: Backend API Coordination"
-- "TEST: E2E Integration Suite"
-</naming_schema>
 
 <environment>
 Working Directory: ${worker.workingDir}
@@ -958,86 +842,11 @@ NEVER use: the Task tool or any subagent spawning outside Strategos
 </critical_warning>
 
 <tools>
-STRATEGOS API - Your command interface:
-
-## WORKER SPAWNING (Use Templates - Most Efficient)
-
-Quick spawn using templates (RECOMMENDED):
-  curl -s -X POST ${STRATEGOS_API}/api/workers/spawn-from-template \\
-    -H "Content-Type: application/json" \\
-    -d '{
-      "template": "research|impl|test|review|fix|colonel",
-      "name": "Descriptive Task Name",
-      "projectPath": "project-name",
-      "parentWorkerId": "${worker.id}",
-      "task": { "description": "Commander Intent: What and why" }
-    }'
-
-Templates auto-enable: autoAccept, ralphMode, proper prefix.
-Available: research, impl, test, review, fix, general, colonel
-
-Full spawn (custom options):
-  curl -s -X POST ${STRATEGOS_API}/api/workers \\
-    -H "Content-Type: application/json" \\
-    -d '{
-      "projectPath": "project-name",
-      "label": "PREFIX: Task Description",
-      "parentWorkerId": "${worker.id}",
-      "autoAccept": true,
-      "ralphMode": true,
-      "task": { "description": "...", "type": "...", "context": "..." }
-    }'
-
-## MONITORING (Use Ralph Status - Saves Context)
-
-Check your spawned workers' status (MOST EFFICIENT):
-  curl -s ${STRATEGOS_API}/api/workers/${worker.id}/children | jq '.'
-
-Response:
-  summary: { total, pending, inProgress, done, blocked }
-  children: [{
-    id, label, ralphStatus, ralphProgress, ralphCurrentStep,
-    ralphLearnings, ralphOutputs, ralphArtifacts, taskDescription
-  }]
-
-ralphStatus values:
-  - "pending" - Worker active, no signal yet
-  - "in_progress" - Worker signaled progress (check ralphProgress %)
-  - "done" - Worker completed (check ralphLearnings for summary)
-  - "blocked" - Worker blocked (needs help)
-
-Get full worker tree (hierarchy view):
-  curl -s ${STRATEGOS_API}/api/workers/tree | jq '.'
-
-Shows parent-child relationships and aggregated stats.
-
-## OTHER COMMANDS
-
-List all workers:
-  curl -s ${STRATEGOS_API}/api/workers | jq '.'
-
-Get worker output (USE SPARINGLY - prefer Ralph status):
-  curl -s ${STRATEGOS_API}/api/workers/{id}/output
-
-Send orders to a worker:
-  curl -s -X POST ${STRATEGOS_API}/api/workers/{id}/input \\
-    -H "Content-Type: application/json" \\
-    -d '{"input":"your instructions"}'
-
-Terminate a worker:
-  curl -s -X DELETE ${STRATEGOS_API}/api/workers/{id}
-
-## VERIFICATION
-
-Verify subordinate output:
-  curl -s -X POST ${STRATEGOS_API}/api/workers/{id}/verify \\
-    -H "Content-Type: application/json" \\
-    -d '{"output": "output to verify"}'
-
-Complete worker with verification:
-  curl -s -X POST ${STRATEGOS_API}/api/workers/{id}/complete \\
-    -H "Content-Type: application/json" \\
-    -d '{"requireVerification": true}'
+Strategos API documentation is in your .claudecontext file (auto-loaded).
+Key commands for Generals:
+- Check children: curl -s ${STRATEGOS_API}/api/workers/${worker.id}/children | jq '.'
+- Worker tree: curl -s ${STRATEGOS_API}/api/workers/tree | jq '.'
+- Use Ralph status checks INSTEAD of reading output.
 </tools>
 
 <task_decomposition>
@@ -1415,6 +1224,17 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
       }
     }, 3000);
 
+    // Ralph adoption reminder - nudge workers who haven't signaled after 60s
+    if (ralphMode) {
+      setTimeout(() => {
+        const w = workers.get(id);
+        if (w && w.ralphMode && w.status === 'running' && (!w.ralphStatus || w.ralphStatus === 'pending')) {
+          sendInputDirect(id, 'REMINDER: Signal your status via Ralph API. This helps your parent monitor efficiently without reading your full output. Use: curl -s -X POST ' + STRATEGOS_API + '/api/ralph/signal/' + ralphToken + ' -H "Content-Type: application/json" -d \'{"status": "in_progress", "progress": 25, "currentStep": "What you are doing"}\'').catch(() => {});
+          console.log(`[Ralph] Sent 60s reminder to ${workerLabel}`);
+        }
+      }, 60000);
+    }
+
     const activity = addActivity('worker_started', id, workerLabel, projectName,
       `Started worker "${workerLabel}" in ${projectPath}`);
 
@@ -1551,6 +1371,17 @@ async function startPendingWorker(workerId, io = null) {
         console.error(`Failed to send self-awareness prompt to ${pending.label}:`, err.message);
       }
     }, 3000);
+
+    // Ralph adoption reminder - nudge workers who haven't signaled after 60s
+    if (ralphToken) {
+      setTimeout(() => {
+        const w = workers.get(workerId);
+        if (w && w.ralphMode && w.status === 'running' && (!w.ralphStatus || w.ralphStatus === 'pending')) {
+          sendInputDirect(workerId, 'REMINDER: Signal your status via Ralph API. This helps your parent monitor efficiently without reading your full output. Use: curl -s -X POST ' + STRATEGOS_API + '/api/ralph/signal/' + ralphToken + ' -H "Content-Type: application/json" -d \'{"status": "in_progress", "progress": 25, "currentStep": "What you are doing"}\'').catch(() => {});
+          console.log(`[Ralph] Sent 60s reminder to ${pending.label}`);
+        }
+      }, 60000);
+    }
 
     const activity = addActivity('worker_started', workerId, pending.label, projectName,
       `Started worker "${pending.label}" (dependencies satisfied)`);
