@@ -37,7 +37,7 @@ mkdir -p "$STRATEGOS_CONFIG_DIR"
 mkdir -p "$STRATEGOS_DATA_DIR/logs"
 
 version() {
-    echo "Strategos v1.0.0"
+    echo "Strategos v2.0.0"
     echo "Multi-provider AI Orchestrator"
 }
 
@@ -65,8 +65,8 @@ start() {
 
     # Check Node.js version
     NODE_VERSION=$(node --version | cut -d'v' -f2 | cut -d'.' -f1)
-    if [ "$NODE_VERSION" -lt 18 ]; then
-        echo -e "${RED}Error: Node.js 18+ is required (found: $(node --version))${NC}"
+    if [ "$NODE_VERSION" -lt 20 ]; then
+        echo -e "${RED}Error: Node.js 20+ is required (found: $(node --version))${NC}"
         exit 1
     fi
 
@@ -221,7 +221,7 @@ help() {
     echo "  STRATEGOS_DATA_DIR      Data directory (default: ~/.strategos/data)"
     echo "  STRATEGOS_PROJECTS_ROOT Projects directory (default: ~/strategos-projects)"
     echo ""
-    echo "For more information, see: https://github.com/YOUR_USERNAME/strategos"
+    echo "For more information, see: https://github.com/drewrad8/strategos"
 }
 
 # Main command dispatch

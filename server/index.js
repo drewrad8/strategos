@@ -2,102 +2,98 @@ import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import path from 'path';
-import os from 'os';
-import fs from 'fs';
 import { fileURLToPath } from 'url';
 
-// Configuration - load first
-import { loadConfig, getConfig, getProjectsRoot, getDataDir } from './config.js';
-
-// Provider system
-import { initializeProviders, getProvidersInfo, checkAllProviders } from './providers/index.js';
+// IMPORTANT: setup.js must be imported FIRST — it reads config/strategos.env
+// and sets process.env.THEA_ROOT before state.js evaluates.
+import { getConfiguredRoot, mountSetupRoutes } from './setup.js';
 
 import { createRoutes } from './routes.js';
 import { createIntegrationRoutes } from './routes/integration.js';
 import { createADRRoutes } from './routes/adrs.js';
 import { createRalphRoutes } from './routes/ralph.js';
 import { createRalphService } from './services/ralphService.js';
-import { setupSocketHandlers } from './socketHandler.js';
-import { checkTmux, discoverExistingWorkers, restoreWorkerState, saveWorkerState, getWorkers, spawnWorker, killWorker, startPeriodicCleanup, getResourceStats } from './workerManager.js';
+import { setupSocketHandlers, stopMetricsBroadcast } from './socketHandler.js';
+import { checkTmux, discoverExistingWorkers, restoreWorkerState, saveWorkerState, saveWorkerStateSync, getWorkers, getWorkerInternal, spawnWorker, killWorker, startPeriodicCleanup, stopPeriodicCleanup, stopAllHealthMonitors, stopAllPtyCaptures, getResourceStats, closeOutputDb, setWorkerDeathCallback } from './workerManager.js';
+import { THEA_ROOT } from './workers/state.js';
 import { authenticateRequest, authenticateSocket, logAuthStatus } from './middleware/auth.js';
 
 // Logging and status
 import { initLogger, getLogger, LifecycleEvent } from './logger.js';
 import { getStatusWriter } from './statusWriter.js';
+import { resetMetricsService } from './metricsService.js';
+import { startSentinel, stopSentinel, runDiagnostics, getLastDiagnostics, getDiagnosticsHistory, getSentinelStatus } from './sentinel.js';
 
-// Foundation Layer - Enhanced reliability and monitoring
-import { HealthMonitor, HealthStatus } from './foundation/index.js';
-import { CircuitBreaker, getBreaker } from './foundation/index.js';
-import { ErrorRecovery, createErrorRecovery } from './foundation/index.js';
 
-// Intelligence Layer - AI-enhanced verification and correction
-import { VerificationPipeline, TaskTypes } from './intelligence/index.js';
-import { SelfCorrectionLoop, StopReasons } from './intelligence/index.js';
-import { ReflexionLoop, REFLECTION_MEMORY_TYPE } from './intelligence/index.js';
-import { ConfidenceEstimator, ConfidenceLevel } from './intelligence/index.js';
-import { EnhancedVerificationPipeline } from './intelligence/index.js';
-import { TaskDecomposer, createDecomposer } from './intelligence/index.js';
-import { MemoryManager, MemoryTypes, RelationshipTypes } from './intelligence/index.js';
-
-// Coordination Layer - Multi-agent orchestration
-import { MultiAgentReview, createMultiAgentReview } from './coordination/index.js';
-import { DebateProtocol, ConsensusMethod, DebatePhase } from './coordination/index.js';
-import { StateSync, getStateSync } from './coordination/index.js';
-import { EscalationSystem, EscalationReasons, UrgencyLevels } from './coordination/index.js';
-
-// Services - Higher-level integrations
-import { createVerificationService, TaskTypes as VerificationTaskTypes } from './services/verificationService.js';
-import { createSelfOptimizeService, CycleState, StopReasons as OptimizeStopReasons } from './services/selfOptimizeService.js';
-import {
-  createGeneralService,
-  CommandLevel,
-  AutonomyLevel,
-  DomainType,
-  MissionStatus,
-  CommandersIntent,
-  MissionOrder,
-  OODALoop
-} from './services/generalService.js';
-import { createPredictiveScaling, ScalingState } from './services/predictiveScaling.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Global references for graceful shutdown
-let globalMemoryManager = null;
-let globalPredictiveScaling = null;
 let globalRalphService = null;
 let globalLogger = null;
 let globalStatusWriter = null;
+let globalHttpServer = null;
+let globalIo = null;
+
+// Configuration — default port 38007
+// Server: 38007, Client: 38008 (see /docs/PORT_REGISTRY.md)
+const PORT = parseInt(process.env.PORT || '38007', 10);
+if (isNaN(PORT) || PORT < 1 || PORT > 65535) {
+  console.error(`[FATAL] Invalid PORT: ${process.env.PORT} — must be 1-65535`);
+  process.exit(1);
+}
+const HOST = process.env.STRATEGOS_HOST || '127.0.0.1';
+if (!/^[\w.:]+$/.test(HOST)) {
+  console.error(`[FATAL] Invalid STRATEGOS_HOST: "${HOST}" — must be a valid hostname or IP`);
+  process.exit(1);
+}
+// THEA_ROOT imported from ./workers/state.js (auto-derived from project location, or THEA_ROOT env var)
+if (!path.isAbsolute(THEA_ROOT)) {
+  console.error(`[FATAL] THEA_ROOT must be an absolute path, got: "${THEA_ROOT}"`);
+  process.exit(1);
+}
+if (THEA_ROOT === '/' || THEA_ROOT === '/etc' || THEA_ROOT === '/sys' || THEA_ROOT === '/proc') {
+  console.error(`[FATAL] THEA_ROOT points to a dangerous system directory: "${THEA_ROOT}"`);
+  process.exit(1);
+}
+const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || 'http://localhost:38008';
+if (CLIENT_ORIGIN && !/^https?:\/\/.+/.test(CLIENT_ORIGIN)) {
+  console.error(`[FATAL] CLIENT_ORIGIN must be a valid HTTP(S) URL, got: "${CLIENT_ORIGIN}"`);
+  process.exit(1);
+}
+
+// CORS origins: localhost-only by default for security.
+// Override with STRATEGOS_CORS_ORIGINS (comma-separated URLs) for LAN/remote access.
+function buildCorsOrigins() {
+  const origins = [CLIENT_ORIGIN, /^http:\/\/localhost:\d+$/];
+  const extra = process.env.STRATEGOS_CORS_ORIGINS;
+  if (extra) {
+    for (const o of extra.split(',').map(s => s.trim()).filter(Boolean)) {
+      if (/^https?:\/\/.+/.test(o)) {
+        origins.push(o);
+      } else {
+        console.warn(`[WARN] Ignoring invalid STRATEGOS_CORS_ORIGINS entry: "${o}"`);
+      }
+    }
+  }
+  return origins;
+}
+const CORS_ORIGINS = buildCorsOrigins();
+if (process.env.STRATEGOS_API_KEY && process.env.STRATEGOS_API_KEY.trim().length === 0) {
+  console.error('[FATAL] STRATEGOS_API_KEY is set but empty/whitespace — remove it or set a real key');
+  process.exit(1);
+}
+if (process.env.STRATEGOS_API_KEY && process.env.STRATEGOS_API_KEY.length < 16) {
+  console.warn('[WARN] STRATEGOS_API_KEY is shorter than 16 characters — consider using a stronger key');
+}
 
 async function main() {
-  // Load configuration first
-  const config = loadConfig();
-
-  // Initialize providers
-  initializeProviders();
-
-  // Configuration from config file with environment overrides
-  const PORT = config.port;
-  const PROJECTS_ROOT = getProjectsRoot();
-  const DATA_DIR = getDataDir();
-  const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || `http://localhost:${PORT + 1}`;
-
-  // Ensure data directory exists
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-
-  // Ensure projects directory exists
-  if (!fs.existsSync(PROJECTS_ROOT)) {
-    fs.mkdirSync(PROJECTS_ROOT, { recursive: true });
-    console.log(`Created projects directory: ${PROJECTS_ROOT}`);
-  }
-
-  // Initialize logger
+  // Initialize logger first
   globalLogger = initLogger({
-    minLevel: process.env.LOG_LEVEL === 'debug' ? 0 : 1, // DEBUG=0, INFO=1
-    logDir: path.join(DATA_DIR, 'logs')
+    minLevel: process.env.LOG_LEVEL === 'debug' ? 0 : 1 // DEBUG=0, INFO=1
   });
   const log = globalLogger;
 
@@ -105,12 +101,29 @@ async function main() {
   globalStatusWriter = getStatusWriter();
 
   // Log startup lifecycle event
-  log.logLifecycle(LifecycleEvent.STARTUP, 'Strategos server starting', {
+  log.logLifecycle(LifecycleEvent.STARTUP, 'server starting', {
     nodeVersion: process.version,
     port: PORT,
-    projectsRoot: PROJECTS_ROOT,
-    dataDir: DATA_DIR
+    theaRoot: THEA_ROOT
   });
+
+  // First-run setup check: if no projects root is configured, start in setup mode.
+  // This serves a minimal setup page to let the user configure their projects directory.
+  const configuredRoot = getConfiguredRoot();
+  if (!configuredRoot && !process.env.THEA_ROOT) {
+    log.info('No projects root configured — starting in setup mode');
+    const setupApp = express();
+    const setupServer = createServer(setupApp);
+    setupApp.use(express.json());
+    setupApp.use(express.static(path.join(__dirname, '..', 'client', 'dist')));
+    mountSetupRoutes(setupApp);
+    setupServer.listen(PORT, HOST, () => {
+      log.info(`Setup server running at http://${HOST}:${PORT}/setup`);
+      console.log(`\n  Strategos needs initial configuration.`);
+      console.log(`  Open http://localhost:${PORT}/setup in your browser.\n`);
+    });
+    return; // Don't start the full server
+  }
 
   // Check tmux availability
   const hasTmux = await checkTmux();
@@ -121,18 +134,9 @@ async function main() {
     process.exit(1);
   }
 
-  log.info('Strategos Orchestrator Server starting');
-  log.info('Configuration', { projectsRoot: PROJECTS_ROOT, dataDir: DATA_DIR, port: PORT, clientOrigin: CLIENT_ORIGIN });
+  log.info('Strategos Server starting');
+  log.info('Configuration', { THEA_ROOT, PORT, HOST, CLIENT_ORIGIN });
   logAuthStatus();
-
-  // Log provider status
-  const providersInfo = getProvidersInfo();
-  log.info('Providers configured', {
-    defaultWorker: providersInfo.workers.default,
-    workerProviders: providersInfo.workers.available.map(p => p.id),
-    defaultApi: providersInfo.api.default,
-    apiProviders: providersInfo.api.available.map(p => p.id)
-  });
 
   // Create Express app
   const app = express();
@@ -141,7 +145,7 @@ async function main() {
   // Setup Socket.io with stability-focused configuration
   const io = new Server(httpServer, {
     cors: {
-      origin: [CLIENT_ORIGIN, /^http:\/\/192\.168\.\d+\.\d+:\d+$/, /^http:\/\/localhost:\d+$/],
+      origin: CORS_ORIGINS,
       methods: ['GET', 'POST']
     },
     // Heartbeat configuration to detect dead connections
@@ -157,52 +161,143 @@ async function main() {
     perMessageDeflate: false // Disable compression (reduces CPU, improves stability)
   });
 
-  // Middleware
-  app.use(cors({
-    origin: [CLIENT_ORIGIN, /^http:\/\/192\.168\.\d+\.\d+:\d+$/, /^http:\/\/localhost:\d+$/]
+  // Middleware — helmet FIRST so security headers apply to ALL responses (including CORS preflight)
+  app.use(helmet({
+    contentSecurityPolicy: false, // SPA needs inline scripts/styles from Vite build
+    crossOriginEmbedderPolicy: false, // Allow WebSocket cross-origin
   }));
-  app.use(express.json());
+
+  app.use(cors({
+    origin: CORS_ORIGINS
+  }));
+
+  // Rate limiting — generous limits for dashboard polling, strict for spawn endpoints
+  const generalLimiter = rateLimit({
+    windowMs: 60 * 1000, // 1 minute
+    max: 300, // 300 requests per minute (5/sec) — dashboard polls frequently
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many requests, please try again later' },
+  });
+  const spawnLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 30, // 30 spawns per minute — prevents accidental spawn storms
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many spawn requests, please try again later' },
+  });
+  app.use('/api', generalLimiter);
+  // Rate limit only spawn/creation endpoints — NOT worker queries, input, or settings.
+  // app.use('/api/workers', ...) would apply 30/min to ALL worker routes including
+  // GET /api/workers (dashboard polling) and POST /api/workers/:id/input.
+  app.post('/api/workers', spawnLimiter);
+  app.post('/api/workers/spawn-from-template', spawnLimiter);
+
+  app.post('/api/workers/execute', spawnLimiter);
+
+  app.use(express.json({ limit: '2mb' })); // Prevent oversized payloads (workers can send 1MB input)
   app.use(authenticateRequest); // API key authentication (when STRATEGOS_API_KEY is set)
 
   // Initialize Ralph Service (Autonomous AI Agent Loop)
+  // Store for graceful shutdown
+  globalHttpServer = httpServer;
+  globalIo = io;
+
   const ralphService = createRalphService(io);
   app.locals.ralphService = ralphService;
-  globalRalphService = ralphService; // Store for graceful shutdown
+  globalRalphService = ralphService;
+
+  // Wire up worker death callback for Ralph unregistration
+  setWorkerDeathCallback((worker) => {
+    if (worker.ralphToken) {
+      ralphService.unregisterStandaloneWorker(worker.ralphToken);
+    }
+  });
 
   // API routes
-  app.use('/api', createRoutes(PROJECTS_ROOT, io));
-  app.use('/api/integration', createIntegrationRoutes(PROJECTS_ROOT, io));
+  app.use('/api', createRoutes(THEA_ROOT, io));
+  app.use('/api/integration', createIntegrationRoutes(THEA_ROOT, io));
   app.use('/api/adrs', createADRRoutes());
   app.use('/api/ralph', createRalphRoutes(ralphService));
+
+  // Sentinel — toggleable deep diagnostics mode
+  app.get('/api/sentinel/status', (req, res) => {
+    res.json(getSentinelStatus());
+  });
+  app.post('/api/sentinel/start', async (req, res) => {
+    startSentinel();
+    const result = await runDiagnostics();
+    io.emit('sentinel:status', getSentinelStatus());
+    res.json({ success: true, diagnostics: result });
+  });
+  app.post('/api/sentinel/stop', (req, res) => {
+    stopSentinel();
+    io.emit('sentinel:status', getSentinelStatus());
+    res.json({ success: true });
+  });
+  app.get('/api/diagnostics', async (req, res) => {
+    try {
+      const result = req.query.run === 'true' ? await runDiagnostics() : (getLastDiagnostics() || await runDiagnostics());
+      res.json(result);
+    } catch (err) {
+      res.status(500).json({ error: 'Diagnostics failed', message: err.message });
+    }
+  });
+  app.get('/api/diagnostics/history', (req, res) => {
+    res.json(getDiagnosticsHistory());
+  });
 
   // Serve static client files in production
   const clientDist = path.join(__dirname, '..', 'client', 'dist');
   app.use(express.static(clientDist));
 
-  // Fallback to index.html for SPA routing
+  // Fallback to index.html for SPA routing (non-API paths only)
+  // I-1: Reject paths with dots (file extensions) that weren't served by express.static —
+  // these are missing assets, not SPA routes. Also reject paths with encoded traversals.
   app.get('*', (req, res) => {
-    if (!req.path.startsWith('/api')) {
-      res.sendFile(path.join(clientDist, 'index.html'));
+    if (req.path.startsWith('/api')) {
+      // Undefined API endpoint — respond with 404 (was hanging without response)
+      return res.status(404).json({ error: 'Not found' });
     }
+    // Paths with file extensions (e.g., /foo.js, /bar.css) that weren't caught by
+    // express.static are genuinely missing files — return 404, not index.html
+    if (/\.[a-zA-Z0-9]{1,10}$/.test(req.path)) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+    res.sendFile(path.join(clientDist, 'index.html'));
   });
 
-  // Socket.io authentication middleware
-  io.use(authenticateSocket);
+  // Centralized error handler — catches unhandled route/middleware errors (including multer)
+  // Must be AFTER all routes and have 4 parameters for Express to recognize it as error middleware.
+  app.use((err, req, res, _next) => {
+    // Multer-specific errors (file too large, wrong type, etc.)
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({ error: 'File too large' });
+    }
+    if (err.message === 'Only image files are allowed') {
+      return res.status(400).json({ error: err.message });
+    }
+    log.error('Unhandled Express error', { method: req.method, path: req.path, error: err.message });
+    res.status(err.status || 500).json({ error: 'Internal server error' });
+  });
 
-  // Setup Socket.io handlers
-  setupSocketHandlers(io, PROJECTS_ROOT);
-
-  // Restore saved worker state first
+  // Restore saved worker state BEFORE setting up socket handlers
+  // This prevents clients from connecting and seeing empty state during restore
   log.info('Restoring saved worker state...');
   await restoreWorkerState(io);
 
   // Re-register Ralph tokens for restored workers
+  // NOTE: getWorkers() strips ralphToken (security fix dfbc4a3), so we must
+  // use getWorkerInternal() to access the raw token for server-side registration.
   const restoredWorkers = getWorkers();
   let ralphCount = 0;
   for (const worker of restoredWorkers) {
-    if (worker.ralphMode && worker.ralphToken) {
-      ralphService.registerStandaloneWorker(worker.ralphToken, worker.id);
-      ralphCount++;
+    if (worker.ralphMode) {
+      const internal = getWorkerInternal(worker.id);
+      if (internal?.ralphToken) {
+        ralphService.registerStandaloneWorker(internal.ralphToken, worker.id);
+        ralphCount++;
+      }
     }
   }
   if (ralphCount > 0) {
@@ -214,217 +309,24 @@ async function main() {
   const existingWorkers = await discoverExistingWorkers(io);
   log.info('Worker discovery complete', { found: existingWorkers.length });
 
+  // Socket.io authentication middleware
+  io.use(authenticateSocket);
+
+  // Setup Socket.io handlers AFTER state is restored — clients get complete state on connect
+  setupSocketHandlers(io, THEA_ROOT);
+
   // Start periodic cleanup sweep to prevent resource leaks
   startPeriodicCleanup(io);
+
+  // Sentinel is available but NOT auto-started. Enable via:
+  //   POST /api/sentinel/start
+  //   UI toggle in dashboard
+  //   Or tell Claude: "enable sentinel"
   const stats = getResourceStats();
   log.info('Resource limits', {
     running: stats.running,
     max: stats.maxConcurrent,
     available: stats.availableSlots
-  });
-
-  // Initialize Foundation Layer components
-  log.info('Initializing foundation layer...');
-  const errorRecovery = createErrorRecovery();
-  const healthMonitor = new HealthMonitor({
-    checkInterval: 30000,
-    heartbeatTimeout: 60000,
-    unhealthyThreshold: 3,
-    healthyThreshold: 2
-  });
-
-  // Create circuit breakers for critical external services
-  const ollamaBreaker = getBreaker('ollama', { failureThreshold: 3, timeout: 15000 });
-  const anthropicBreaker = getBreaker('anthropic', { failureThreshold: 5, timeout: 30000 });
-
-  // Initialize Intelligence Layer components
-  log.info('Initializing intelligence layer...');
-
-  // Initialize Memory Manager first (needed by ReflexionLoop)
-  const memoryDbPath = path.join(DATA_DIR, 'memory.db');
-  const memoryManager = new MemoryManager(memoryDbPath, {
-    decayRate: 0.995,           // 0.5% decay per hour
-    importanceThreshold: 0.1,   // Prune memories below 10% importance
-    consolidationInterval: 3600000, // Consolidate every hour
-    similarityThreshold: 0.85   // Merge memories >85% similar
-  });
-  memoryManager.startAutoConsolidation();
-  globalMemoryManager = memoryManager; // Store for graceful shutdown
-
-  // Core verification pipeline
-  const verificationPipeline = new VerificationPipeline();
-  const taskDecomposer = createDecomposer();
-
-  // Scientific Enhancement: ReflexionLoop (NeurIPS 2023)
-  // Extends SelfCorrectionLoop with reflection memory for cross-session learning
-  // Research: 91% pass rate on HumanEval vs 80% baseline
-  const reflexionLoop = new ReflexionLoop(verificationPipeline, memoryManager, {
-    maxReflectionsToRetrieve: 3,
-    reflectionMinImportance: 0.3,
-    storeReflections: true
-  });
-
-  // Scientific Enhancement: ConfidenceEstimator (ICLR 2024)
-  // Calibrated uncertainty quantification through consistency sampling
-  const confidenceEstimator = new ConfidenceEstimator({
-    numSamples: 3,
-    highThreshold: 0.8,
-    lowThreshold: 0.4
-  });
-
-  // Scientific Enhancement: EnhancedVerificationPipeline (TACL 2024)
-  // Uses external tools for verification - code execution, symbolic math, schema validation
-  const enhancedVerificationPipeline = new EnhancedVerificationPipeline({
-    enableCodeExecution: true,
-    enableSymbolicMath: true,
-    enableSchemaValidation: true,
-    enableConsistencyCheck: true
-  });
-
-  // Keep base SelfCorrectionLoop available for backwards compatibility
-  const selfCorrectionLoop = new SelfCorrectionLoop(verificationPipeline);
-
-  // Initialize Coordination Layer components
-  log.info('Initializing coordination layer...');
-  const stateSync = getStateSync();
-  const escalationSystem = new EscalationSystem();
-
-  // Scientific Enhancement: DebateProtocol (ICML 2024)
-  // Multi-agent debate for improved factual accuracy - 30% error reduction
-  const debateProtocol = new DebateProtocol({
-    numAgents: 3,
-    numRounds: 3,
-    consensusMethod: ConsensusMethod.MAJORITY_VOTE,
-    consensusThreshold: 0.7,
-    io  // Socket.io for real-time debate updates
-  });
-
-  // Note: MultiAgentReview initialized without workerManager - will be set later when available
-  // const multiAgentReview = createMultiAgentReview(workerManager);
-
-  // Initialize Services Layer (higher-level integrations)
-  log.info('Initializing services...');
-  const verificationService = createVerificationService({
-    verificationPipeline,
-    selfCorrectionLoop: reflexionLoop,  // Use ReflexionLoop (extends SelfCorrectionLoop with memory)
-    io
-  });
-
-  const selfOptimizeService = createSelfOptimizeService({
-    io,
-    maxIterations: 5,
-    testTimeout: 120000
-  });
-
-  // Initialize General Service (CC-DC-DE military command structure)
-  const generalService = createGeneralService({
-    io,
-    verificationService,
-    selfOptimizeService
-  });
-  // Note: workerManager will be set after routes are loaded
-
-  // Initialize Predictive Scaling service
-  const predictiveScaling = createPredictiveScaling({
-    io,
-    // Get worker stats from the workers Map
-    getWorkerStats: async () => {
-      const allWorkers = getWorkers();
-      const running = allWorkers.filter(w => w.status === 'running').length;
-      const idle = allWorkers.filter(w => w.status === 'running' && w.health === 'healthy').length;
-      const busy = allWorkers.filter(w => w.status === 'running' && w.health === 'active').length;
-      return { running, idle, busy, queued: 0 }; // queued can be tracked if we add a task queue
-    },
-    // Spawn a generic worker
-    spawnWorker: async (options) => {
-      log.info('[PredictiveScaling] Auto-spawning worker', { reason: options.reason });
-      // This is a placeholder - actual spawning requires project context
-      // Workers should be spawned through the API with proper project paths
-      return null;
-    },
-    // Terminate an idle worker
-    terminateWorker: async (options) => {
-      const allWorkers = getWorkers();
-      const idleWorker = allWorkers.find(w =>
-        w.status === 'running' &&
-        w.health === 'healthy' &&
-        !w.label.startsWith('GENERAL') // Don't kill generals
-      );
-      if (idleWorker) {
-        log.info('[PredictiveScaling] Terminating idle worker', { workerId: idleWorker.id });
-        await killWorker(idleWorker.id, io);
-        return idleWorker.id;
-      }
-      return null;
-    },
-    // Configuration
-    minWorkers: 0,
-    maxWorkers: 15,
-    targetUtilization: 0.70,
-    checkInterval: 60000 // Check every minute
-  });
-  globalPredictiveScaling = predictiveScaling;
-  // Note: predictiveScaling.start() can be called via API when needed
-
-  // Make all layer services available globally for routes/handlers
-  app.locals.foundation = {
-    errorRecovery,
-    healthMonitor,
-    circuitBreakers: { ollama: ollamaBreaker, anthropic: anthropicBreaker },
-    HealthStatus
-  };
-
-  app.locals.intelligence = {
-    verificationPipeline,
-    enhancedVerificationPipeline,  // Scientific: TACL 2024 external tool verification
-    taskDecomposer,
-    selfCorrectionLoop,
-    reflexionLoop,                  // Scientific: NeurIPS 2023 reflection memory
-    confidenceEstimator,            // Scientific: ICLR 2024 calibrated uncertainty
-    memoryManager,
-    TaskTypes,
-    StopReasons,
-    MemoryTypes,
-    RelationshipTypes,
-    ConfidenceLevel,
-    REFLECTION_MEMORY_TYPE
-  };
-
-  app.locals.coordination = {
-    stateSync,
-    escalationSystem,
-    debateProtocol,                 // Scientific: ICML 2024 multi-agent debate
-    createMultiAgentReview, // Factory function for when workerManager is available
-    EscalationReasons,
-    UrgencyLevels,
-    ConsensusMethod,
-    DebatePhase
-  };
-
-  app.locals.services = {
-    verificationService,
-    selfOptimizeService,
-    generalService,
-    predictiveScaling,
-    TaskTypes: VerificationTaskTypes,
-    CycleState,
-    OptimizeStopReasons,
-    ScalingState,
-    // CC-DC-DE Command Structure exports
-    CommandLevel,
-    AutonomyLevel,
-    DomainType,
-    MissionStatus,
-    CommandersIntent,
-    MissionOrder,
-    OODALoop
-  };
-
-  log.info('All layers initialized', {
-    foundation: ['ErrorRecovery', 'HealthMonitor', 'CircuitBreakers'],
-    intelligence: ['VerificationPipeline', 'EnhancedVerificationPipeline', 'TaskDecomposer', 'ReflexionLoop', 'ConfidenceEstimator', 'MemoryManager'],
-    coordination: ['StateSync', 'EscalationSystem', 'DebateProtocol', 'MultiAgentReview'],
-    services: ['VerificationService', 'SelfOptimizeService', 'GeneralService', 'PredictiveScaling']
   });
 
   // Setup status writer with worker count provider
@@ -440,23 +342,70 @@ async function main() {
   // Make logger available to routes
   app.locals.logger = globalLogger;
 
-  // Start server
-  httpServer.listen(PORT, '0.0.0.0', () => {
-    log.info('Server running', {
-      url: `http://0.0.0.0:${PORT}`,
-      api: `http://localhost:${PORT}/api`
-    });
+  // Start server with EADDRINUSE retry logic.
+  // When restarting (e.g., systemd Restart=always), the old process may still be
+  // releasing the port. Instead of immediately exiting and burning through systemd's
+  // StartLimitBurst, retry a few times with backoff.
+  const MAX_LISTEN_RETRIES = 5;
+  const LISTEN_RETRY_DELAY_MS = 3000; // 3s between retries = 15s total window
+  let listenRetries = 0;
+
+  httpServer.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+      listenRetries++;
+      if (listenRetries > MAX_LISTEN_RETRIES) {
+        log.fatal(`Port ${PORT} still in use after ${MAX_LISTEN_RETRIES} retries — giving up`, { port: PORT });
+        process.exit(1);
+      }
+      log.warn(`Port ${PORT} in use, retrying in ${LISTEN_RETRY_DELAY_MS / 1000}s (attempt ${listenRetries}/${MAX_LISTEN_RETRIES})...`, { port: PORT });
+      setTimeout(() => {
+        httpServer.listen(PORT, HOST);
+      }, LISTEN_RETRY_DELAY_MS);
+      return;
+    }
+    log.error('HTTP server error', { error: err.message, code: err.code });
+  });
+
+  httpServer.listen(PORT, HOST, () => {
+    if (listenRetries > 0) {
+      log.info(`Server running (after ${listenRetries} EADDRINUSE retries)`, {
+        url: `http://${HOST}:${PORT}`,
+        api: `http://${HOST}:${PORT}/api`
+      });
+    } else {
+      log.info('Server running', {
+        url: `http://${HOST}:${PORT}`,
+        api: `http://${HOST}:${PORT}/api`
+      });
+    }
 
     // Start status writer after server is listening
     globalStatusWriter.start();
     log.info('Status writer started', {
-      statusFile: globalStatusWriter.statusFile
+      statusFile: path.join(THEA_ROOT, 'shared', 'status', 'strategos.json')
     });
   });
 }
 
 // Graceful shutdown - save worker state before exit
+let _shuttingDown = false;
 async function gracefulShutdown(signal) {
+  if (_shuttingDown) {
+    console.log(`[Shutdown] Already shutting down, ignoring duplicate ${signal}`);
+    return;
+  }
+  _shuttingDown = true;
+
+  // Force-exit if graceful shutdown hangs (e.g., stuck HTTP connections, deadlocked async)
+  // If the process manager (systemd, etc.) force-kills before this fires,
+  // state saves and DB closes are interrupted. Ensure KillMode timeout exceeds this value.
+  const SHUTDOWN_TIMEOUT_MS = 15000;
+  const shutdownTimer = setTimeout(() => {
+    console.error(`[Shutdown] Graceful shutdown timed out after ${SHUTDOWN_TIMEOUT_MS}ms, forcing exit`);
+    process.exit(1);
+  }, SHUTDOWN_TIMEOUT_MS);
+  shutdownTimer.unref(); // Don't keep the process alive for this timer alone
+
   const log = getLogger();
   log.info(`${signal} received, initiating graceful shutdown...`);
 
@@ -468,6 +417,47 @@ async function gracefulShutdown(signal) {
     globalStatusWriter.shutdown(signal);
   }
 
+  // Stop accepting new connections and force-close existing ones.
+  // httpServer.close() stops new connections but waits for active ones to drain.
+  // Long-running routes (/api/headless can run 10min) would block shutdown,
+  // so we close idle connections immediately and force remaining after 2s.
+  if (globalIo) {
+    globalIo.disconnectSockets(true);
+    globalIo.close();
+    log.info('Socket.io connections closed');
+  }
+  if (globalHttpServer) {
+    globalHttpServer.closeIdleConnections();
+    // Wait for connections to drain naturally, force-close remaining after 2s
+    await new Promise((resolve) => {
+      let settled = false;
+      globalHttpServer.close(() => {
+        if (!settled) { settled = true; log.info('HTTP server drained'); resolve(); }
+      });
+      setTimeout(() => {
+        if (!settled) { settled = true; globalHttpServer.closeAllConnections(); log.info('HTTP server force-closed'); resolve(); }
+      }, 2000);
+    });
+  }
+
+  // Stop all timers before saving state (prevent races)
+  stopSentinel();
+  stopPeriodicCleanup();
+  stopAllHealthMonitors();
+  stopAllPtyCaptures();
+  stopMetricsBroadcast();
+
+  // Cleanup Ralph service BEFORE saving state — Ralph cleanup may modify
+  // worker state (unregister tokens, update statuses) that should be persisted
+  if (globalRalphService) {
+    try {
+      await globalRalphService.cleanup();
+      log.info('Ralph service cleaned up');
+    } catch (err) {
+      log.error('Error cleaning up Ralph service', { error: err.message });
+    }
+  }
+
   try {
     await saveWorkerState();
     log.info('Worker state saved successfully');
@@ -475,29 +465,32 @@ async function gracefulShutdown(signal) {
     log.error('Error saving worker state', { error: err.message });
   }
 
-  // Stop memory manager consolidation
-  if (globalMemoryManager) {
-    globalMemoryManager.stopAutoConsolidation();
-    globalMemoryManager.close();
-    log.info('Memory manager closed');
+  // Close output database (checkpoint WAL and close connection)
+  try {
+    closeOutputDb();
+  } catch (err) {
+    log.error('Error closing output database', { error: err.message });
   }
 
-  // Stop predictive scaling
-  if (globalPredictiveScaling) {
-    globalPredictiveScaling.stop();
-    log.info('Predictive scaling stopped');
+  // Close metrics database (stops aggregation timer)
+  try {
+    resetMetricsService();
+  } catch (err) {
+    log.error('Error closing metrics service', { error: err.message });
   }
 
-  // Cleanup Ralph service (pause active runs)
-  if (globalRalphService) {
-    await globalRalphService.cleanup();
-    log.info('Ralph service cleaned up');
-  }
-
-  // Close logger last
+  // Close logger last — must await so final entries flush to disk
   log.info('Shutdown complete');
   if (globalLogger) {
-    globalLogger.close();
+    await new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        resolve(); // Don't block shutdown if logger hangs
+      }, 3000);
+      globalLogger.close(() => {
+        clearTimeout(timeout);
+        resolve();
+      });
+    });
   }
 
   process.exit(0);
@@ -515,9 +508,13 @@ const MAX_EXCEPTIONS_BEFORE_EXIT = 10;
 // Crash protection - log and continue instead of crashing
 process.on('uncaughtException', (err) => {
   // EPIPE means stdout/stderr is broken - exit cleanly instead of looping
-  if (err.code === 'EPIPE' || err.message?.includes('EPIPE')) {
-    console.error = () => {};  // Disable console to prevent more errors
-    console.log = () => {};
+  // EADDRINUSE means another instance is already running - exit immediately
+  // Fatal errors that require immediate exit — system cannot recover
+  const FATAL_CODES = ['EPIPE', 'EADDRINUSE', 'ENOMEM', 'EMFILE', 'ENFILE'];
+  const FATAL_MESSAGES = ['EPIPE', 'EADDRINUSE', 'database disk image is malformed', 'SQLITE_CORRUPT'];
+  if (FATAL_CODES.includes(err.code) ||
+      FATAL_MESSAGES.some(m => err.message?.includes(m) || err.code === m)) {
+    console.error(`[CRASH PROTECTION] Fatal: ${err.code || err.message} — exiting`);
     process.exit(1);
     return;
   }
@@ -534,7 +531,8 @@ process.on('uncaughtException', (err) => {
   }
   _exceptionCount++;
   if (_exceptionCount > MAX_EXCEPTIONS_BEFORE_EXIT) {
-    process.exit(1);
+    gracefulShutdown('EXCEPTION_FLOOD');
+    return;
   }
 
   try {
@@ -550,11 +548,15 @@ process.on('uncaughtException', (err) => {
       recovered: true
     });
 
-    // Update status to show we caught an error but recovered
+    // Save worker state synchronously so crash recovery can restore workers
+    saveWorkerStateSync();
+
+    // Update status to show we caught an error but recovered.
+    // crash() stops the periodic interval, so call start() to restart it
+    // (start() sets status='running' and resumes periodic writes)
     if (globalStatusWriter) {
       globalStatusWriter.crash(err);
-      // Reset to running since we didn't actually crash
-      globalStatusWriter.status = 'running';
+      globalStatusWriter.start();
     }
   } finally {
     _handlingException = false;
@@ -563,10 +565,26 @@ process.on('uncaughtException', (err) => {
   // Don't exit - try to keep running
 });
 
+// Separate rejection counter (shares flood threshold with uncaughtException)
+let _rejectionCount = 0;
+let _rejectionResetTime = Date.now();
+
 process.on('unhandledRejection', (reason, promise) => {
   // Prevent cascading
   if (_handlingException) return;
   _handlingException = true;
+
+  // Rate limit rejections - if too many in a short period, exit
+  const now = Date.now();
+  if (now - _rejectionResetTime > 10000) {
+    _rejectionCount = 0;
+    _rejectionResetTime = now;
+  }
+  _rejectionCount++;
+  if (_rejectionCount > MAX_EXCEPTIONS_BEFORE_EXIT) {
+    gracefulShutdown('REJECTION_FLOOD');
+    return;
+  }
 
   try {
     const log = getLogger();
@@ -580,6 +598,9 @@ process.on('unhandledRejection', (reason, promise) => {
       reason: String(reason),
       recovered: true
     });
+
+    // Save worker state (same as uncaughtException handler)
+    saveWorkerStateSync();
   } finally {
     _handlingException = false;
   }
@@ -602,6 +623,9 @@ main().catch((err) => {
     globalStatusWriter.crash(err);
   }
 
+  // Close databases that may have been opened during partial startup
+  try { closeOutputDb(); } catch { /* best effort */ }
+  try { resetMetricsService(); } catch { /* best effort */ }
   // Close logger before exit
   if (globalLogger) {
     globalLogger.close();

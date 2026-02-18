@@ -8,8 +8,10 @@ import {
   runHeadless,
   runBatchOperation
 } from '../workerManager.js';
-import { projectExists } from '../projectScanner.js';
+import { projectExists, safeResolvePath } from '../projectScanner.js';
 import { getQuickStatus, getWorkerContext } from '../summaryService.js';
+import { sanitizeErrorMessage } from '../errorUtils.js';
+import { CONTROL_CHAR_RE, VALID_WORKER_ID } from '../validation.js';
 
 /**
  * Integration routes for thea-architect to control workers
@@ -49,18 +51,50 @@ export function createIntegrationRoutes(theaRoot, io) {
         return res.status(400).json({ error: 'projectPath is required' });
       }
 
-      if (!prompt) {
-        return res.status(400).json({ error: 'prompt is required' });
+      // Validate mode
+      const VALID_MODES = ['interactive', 'headless'];
+      if (!VALID_MODES.includes(mode)) {
+        return res.status(400).json({ error: `mode must be one of: ${VALID_MODES.join(', ')}` });
       }
 
-      // Resolve project path
-      let resolvedPath = projectPath;
-      if (!path.isAbsolute(projectPath)) {
-        resolvedPath = path.join(theaRoot, projectPath);
+      if (!prompt || typeof prompt !== 'string') {
+        return res.status(400).json({ error: 'prompt is required and must be a string' });
+      }
+      if (prompt.length > 50000) {
+        return res.status(400).json({ error: 'prompt exceeds maximum length (50KB)' });
+      }
+
+      // Validate optional fields
+      if (label !== undefined) {
+        if (typeof label !== 'string' || label.length > 200) {
+          return res.status(400).json({ error: 'label must be a string under 200 characters' });
+        }
+        if (CONTROL_CHAR_RE.test(label)) {
+          return res.status(400).json({ error: 'label must not contain control characters' });
+        }
+      }
+      if (systemPrompt !== undefined && (typeof systemPrompt !== 'string' || systemPrompt.length > 32768)) {
+        return res.status(400).json({ error: 'systemPrompt must be a string under 32KB' });
+      }
+      if (workerId !== undefined && (typeof workerId !== 'string' || !VALID_WORKER_ID.test(workerId))) {
+        return res.status(400).json({ error: 'Invalid workerId format' });
+      }
+      const VALID_OUTPUT_FORMATS = ['json', 'text', 'stream-json'];
+      if (outputFormat && !VALID_OUTPUT_FORMATS.includes(outputFormat)) {
+        return res.status(400).json({ error: `outputFormat must be one of: ${VALID_OUTPUT_FORMATS.join(', ')}` });
+      }
+      if (timeout !== undefined && (typeof timeout !== 'number' || timeout < 1000 || timeout > 600000)) {
+        return res.status(400).json({ error: 'timeout must be between 1000 and 600000 ms' });
+      }
+
+      // Resolve project path safely (prevents path traversal outside theaRoot)
+      const resolvedPath = safeResolvePath(projectPath, theaRoot);
+      if (!resolvedPath) {
+        return res.status(400).json({ error: 'Project path is outside allowed directories' });
       }
 
       if (!projectExists(resolvedPath)) {
-        return res.status(400).json({ error: `Project path does not exist: ${resolvedPath}` });
+        return res.status(400).json({ error: 'Project path does not exist' });
       }
 
       // Headless mode: run claude --print and return result
@@ -74,7 +108,7 @@ export function createIntegrationRoutes(theaRoot, io) {
         return res.json({
           success: true,
           mode: 'headless',
-          projectPath: resolvedPath,
+          project: path.basename(resolvedPath),
           result
         });
       }
@@ -86,7 +120,7 @@ export function createIntegrationRoutes(theaRoot, io) {
         // Use existing worker
         worker = getWorker(workerId);
         if (!worker) {
-          return res.status(404).json({ error: `Worker ${workerId} not found` });
+          return res.status(404).json({ error: 'Resource not found' });
         }
       } else {
         // Spawn new worker
@@ -106,11 +140,11 @@ export function createIntegrationRoutes(theaRoot, io) {
           status: worker.status,
           health: worker.health
         },
-        projectPath: resolvedPath,
+        project: path.basename(resolvedPath),
         promptSent: true
       });
     } catch (error) {
-      res.status(500).json({ error: error.message });
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
     }
   });
 
@@ -124,6 +158,10 @@ export function createIntegrationRoutes(theaRoot, io) {
    */
   router.get('/worker/:id/status', (req, res) => {
     try {
+      // Validate worker ID format (consistent with workflow-execute)
+      if (!/^[a-zA-Z0-9-]{1,36}$/.test(req.params.id)) {
+        return res.status(400).json({ error: 'Invalid workerId format' });
+      }
       const worker = getWorker(req.params.id);
 
       if (!worker) {
@@ -131,7 +169,7 @@ export function createIntegrationRoutes(theaRoot, io) {
       }
 
       const includeOutput = req.query.includeOutput === 'true';
-      const includeContext = req.query.includeContext !== 'false';
+      const includeContext = req.query.includeContext === undefined || req.query.includeContext === 'true';
 
       // Get quick status from output
       const output = getWorkerOutput(req.params.id);
@@ -142,7 +180,7 @@ export function createIntegrationRoutes(theaRoot, io) {
           id: worker.id,
           label: worker.label,
           project: worker.project,
-          workingDir: worker.workingDir,
+          workingDir: worker.project,
           status: worker.status,
           health: worker.health,
           mode: worker.mode,
@@ -152,11 +190,14 @@ export function createIntegrationRoutes(theaRoot, io) {
           lastOutput: worker.lastOutput
         },
         analysis: {
-          isIdle: quickStatus.isIdle,
-          hasError: quickStatus.hasError,
-          isThinking: quickStatus.isThinking,
-          awaitingInput: quickStatus.awaitingInput,
-          indicators: quickStatus.indicators
+          // getQuickStatus returns { status, lastLine, lineCount }
+          outputStatus: quickStatus.status,
+          isIdle: quickStatus.status === 'waiting_input' || quickStatus.status === 'unknown',
+          hasError: quickStatus.status === 'error',
+          isThinking: quickStatus.status === 'thinking',
+          awaitingInput: quickStatus.status === 'waiting_input',
+          lastLine: quickStatus.lastLine,
+          lineCount: quickStatus.lineCount
         }
       };
 
@@ -170,7 +211,7 @@ export function createIntegrationRoutes(theaRoot, io) {
 
       res.json(response);
     } catch (error) {
-      res.status(500).json({ error: error.message });
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
     }
   });
 
@@ -201,15 +242,52 @@ export function createIntegrationRoutes(theaRoot, io) {
         return res.status(400).json({ error: 'projects array is required' });
       }
 
-      if (!prompt) {
-        return res.status(400).json({ error: 'prompt is required' });
+      const MAX_BATCH_PROJECTS = 50;
+      if (projects.length > MAX_BATCH_PROJECTS) {
+        return res.status(400).json({ error: `projects array exceeds maximum of ${MAX_BATCH_PROJECTS}` });
       }
 
-      // Resolve project paths
-      const resolvedPaths = projects.map(p => {
-        if (path.isAbsolute(p)) return p;
-        return path.join(theaRoot, p);
-      });
+      if (!prompt || typeof prompt !== 'string') {
+        return res.status(400).json({ error: 'prompt is required and must be a string' });
+      }
+      if (prompt.length > 50000) {
+        return res.status(400).json({ error: 'prompt exceeds maximum length (50KB)' });
+      }
+
+      if (systemPrompt !== undefined && (typeof systemPrompt !== 'string' || systemPrompt.length > 32768)) {
+        return res.status(400).json({ error: 'systemPrompt must be a string under 32KB' });
+      }
+
+      const VALID_OUTPUT_FORMATS = ['json', 'text', 'stream-json'];
+      if (outputFormat && !VALID_OUTPUT_FORMATS.includes(outputFormat)) {
+        return res.status(400).json({ error: `outputFormat must be one of: ${VALID_OUTPUT_FORMATS.join(', ')}` });
+      }
+
+      if (timeout !== undefined && (typeof timeout !== 'number' || timeout < 1000 || timeout > 600000)) {
+        return res.status(400).json({ error: 'timeout must be between 1000 and 600000 ms' });
+      }
+
+      const MAX_CONCURRENCY = 20;
+      if (concurrency !== undefined && (typeof concurrency !== 'number' || concurrency < 1 || concurrency > MAX_CONCURRENCY || !Number.isInteger(concurrency))) {
+        return res.status(400).json({ error: `concurrency must be a positive integer up to ${MAX_CONCURRENCY}` });
+      }
+
+      // Resolve project paths safely (prevents path traversal)
+      // Track security-rejected paths separately from non-existent paths
+      let securityRejectedCount = 0;
+      const resolvedPaths = [];
+      for (const p of projects) {
+        if (typeof p !== 'string' || p.length === 0) {
+          securityRejectedCount++;
+          continue;
+        }
+        const resolved = safeResolvePath(p, theaRoot);
+        if (!resolved) {
+          securityRejectedCount++;
+        } else {
+          resolvedPaths.push(resolved);
+        }
+      }
 
       // Filter to only existing projects
       const validPaths = resolvedPaths.filter(p => projectExists(p));
@@ -218,7 +296,8 @@ export function createIntegrationRoutes(theaRoot, io) {
       if (validPaths.length === 0) {
         return res.status(400).json({
           error: 'No valid project paths found',
-          invalidPaths
+          invalidCount: invalidPaths.length,
+          rejectedCount: securityRejectedCount
         });
       }
 
@@ -252,11 +331,12 @@ export function createIntegrationRoutes(theaRoot, io) {
           successCount,
           failureCount
         },
-        invalidPaths: invalidPaths.length > 0 ? invalidPaths : undefined,
+        invalidCount: invalidPaths.length > 0 ? invalidPaths.length : undefined,
+        rejectedCount: securityRejectedCount > 0 ? securityRejectedCount : undefined,
         results
       });
     } catch (error) {
-      res.status(500).json({ error: error.message });
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
     }
   });
 
@@ -267,8 +347,14 @@ export function createIntegrationRoutes(theaRoot, io) {
  * Run batch operations with concurrency limit
  */
 async function runBatchWithConcurrency(projectPaths, prompt, options, concurrency) {
+  const MAX_BATCH_SIZE = 50;
+  if (projectPaths.length > MAX_BATCH_SIZE) {
+    throw new Error(`Batch size ${projectPaths.length} exceeds maximum of ${MAX_BATCH_SIZE}`);
+  }
+
   const results = [];
-  const queue = [...projectPaths];
+  // Track items by index to avoid indexOf bug with duplicate paths
+  const queue = projectPaths.map((p, i) => ({ path: p, index: i }));
   const inFlight = new Set();
 
   return new Promise((resolve) => {
@@ -279,17 +365,14 @@ async function runBatchWithConcurrency(projectPaths, prompt, options, concurrenc
       }
 
       while (queue.length > 0 && inFlight.size < concurrency) {
-        const projectPath = queue.shift();
-        const index = projectPaths.indexOf(projectPath);
+        const { path: projectPath, index } = queue.shift();
         inFlight.add(index);
 
         (async () => {
           try {
-            const { runHeadless } = await import('../workerManager.js');
             const result = await runHeadless(projectPath, prompt, options);
             results[index] = {
               project: path.basename(projectPath),
-              path: projectPath,
               success: true,
               result,
               error: null
@@ -297,10 +380,9 @@ async function runBatchWithConcurrency(projectPaths, prompt, options, concurrenc
           } catch (error) {
             results[index] = {
               project: path.basename(projectPath),
-              path: projectPath,
               success: false,
               result: null,
-              error: error.message
+              error: sanitizeErrorMessage(error)
             };
           } finally {
             inFlight.delete(index);

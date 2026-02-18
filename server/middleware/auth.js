@@ -13,9 +13,37 @@
  *   curl -H "Authorization: Bearer your_secret_key" http://localhost:38007/api/workers
  */
 
+import crypto from 'crypto';
+
+/**
+ * Timing-safe string comparison to prevent timing attacks on API key.
+ */
+function timingSafeEqual(a, b) {
+  // Coerce to strings to avoid timing leak from early type-check return.
+  // Without this, typeof check returns ~2ns vs ~150ns for actual comparison,
+  // leaking whether the input was a string at all.
+  const strA = typeof a === 'string' ? a : '';
+  const strB = typeof b === 'string' ? b : '';
+  // Pad to same length to avoid leaking key length via timing
+  const maxLen = Math.max(strA.length, strB.length, 1);
+  const bufA = Buffer.alloc(maxLen);
+  const bufB = Buffer.alloc(maxLen);
+  bufA.write(strA);
+  bufB.write(strB);
+  // Constant-time comparison + explicit length check (both constant-time)
+  return crypto.timingSafeEqual(bufA, bufB) && strA.length === strB.length;
+}
+
 const PUBLIC_PATHS = [
   '/api/health',
   '/api/ollama/health'
+];
+
+// Prefix-based public paths (for routes with dynamic segments).
+// The signal endpoint is already authenticated by its 128-bit completion token —
+// requiring an additional API key adds no security and breaks worker curl calls.
+const PUBLIC_PATH_PREFIXES = [
+  '/api/ralph/signal/'
 ];
 
 /**
@@ -44,8 +72,16 @@ export function authenticateRequest(req, res, next) {
     return next();
   }
 
-  // Skip auth for public paths
-  if (PUBLIC_PATHS.some(path => req.path === path || req.path.startsWith(path))) {
+  // Skip auth for public paths (exact match, normalize trailing slash)
+  const normalizedPath = req.path.length > 1 && req.path.endsWith('/')
+    ? req.path.slice(0, -1)
+    : req.path;
+  if (PUBLIC_PATHS.includes(normalizedPath)) {
+    return next();
+  }
+
+  // Skip auth for prefix-matched public paths (dynamic segments like :token)
+  if (PUBLIC_PATH_PREFIXES.some(prefix => normalizedPath.startsWith(prefix))) {
     return next();
   }
 
@@ -74,12 +110,19 @@ export function authenticateRequest(req, res, next) {
     });
   }
 
-  const token = authHeader.substring(7);
+  const token = authHeader.substring(7).trim();
+  if (!token) {
+    return res.status(401).json({
+      error: 'Authorization required',
+      message: 'Bearer token is empty'
+    });
+  }
+
   const validKey = getApiKey();
 
-  if (token !== validKey) {
+  if (!timingSafeEqual(token, validKey)) {
     console.warn(`[AUTH] Invalid API key for ${req.path}`);
-    return res.status(403).json({
+    return res.status(401).json({
       error: 'Invalid API key',
       message: 'The provided API key is not valid'
     });
@@ -99,14 +142,15 @@ export function authenticateSocket(socket, next) {
     return next();
   }
 
-  const token = socket.handshake.auth?.token || socket.handshake.query?.token;
+  // Only accept token from auth object — never from query string (leaks key in server logs)
+  const token = socket.handshake.auth?.token;
 
   if (!token) {
     console.warn(`[AUTH] Socket connection rejected - no token`);
     return next(new Error('Authentication required'));
   }
 
-  if (token !== getApiKey()) {
+  if (!timingSafeEqual(token, getApiKey())) {
     console.warn(`[AUTH] Socket connection rejected - invalid token`);
     return next(new Error('Invalid API key'));
   }

@@ -15,12 +15,22 @@ const CONFIG_FILE = 'projects.json';
  * @returns {boolean} True if path is safe, false if it escapes the root
  */
 export function isPathWithinRoot(resolvedPath, allowedRoot) {
-  // Normalize both paths to handle symlinks and relative segments
-  const normalizedPath = path.resolve(resolvedPath);
-  const normalizedRoot = path.resolve(allowedRoot);
+  // Resolve symlinks to prevent symlink-based path traversal
+  let normalizedPath = path.resolve(resolvedPath);
+  let normalizedRoot = path.resolve(allowedRoot);
+  try {
+    normalizedPath = fs.realpathSync(normalizedPath);
+  } catch {
+    // Path doesn't exist yet — use logical resolution (path.resolve already applied)
+  }
+  try {
+    normalizedRoot = fs.realpathSync(normalizedRoot);
+  } catch {
+    // Root doesn't exist — use logical resolution
+  }
 
   // Check if the normalized path starts with the root
-  // Add path.sep to avoid matching /home/druzy/thea2 when root is /home/druzy/thea
+  // Add path.sep to avoid matching /home/user/projects2 when root is /home/user/projects
   return normalizedPath === normalizedRoot ||
          normalizedPath.startsWith(normalizedRoot + path.sep);
 }
@@ -32,7 +42,7 @@ export function isPathWithinRoot(resolvedPath, allowedRoot) {
  * @returns {string|null} The resolved path if safe, null if path traversal detected
  */
 export function safeResolvePath(projectPath, theaRoot) {
-  if (!projectPath || typeof projectPath !== 'string') {
+  if (!projectPath || typeof projectPath !== 'string' || projectPath.includes('\0')) {
     return null;
   }
 
@@ -74,7 +84,13 @@ export function loadProjectConfig(theaRoot) {
   try {
     if (fs.existsSync(configPath)) {
       const content = fs.readFileSync(configPath, 'utf-8');
-      return JSON.parse(content);
+      const parsed = JSON.parse(content);
+      // Validate parsed value is a plain object (not array, string, number, null)
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        console.warn('[ProjectScanner] projects.json is not a JSON object, using defaults');
+      } else {
+        return parsed;
+      }
     }
   } catch (error) {
     console.error('Error loading project config:', error.message);
@@ -93,33 +109,64 @@ export function loadProjectConfig(theaRoot) {
  */
 export function saveProjectConfig(theaRoot, config) {
   const configPath = path.join(theaRoot, 'strategos', CONFIG_FILE);
+  const tmpPath = configPath + `.tmp.${process.pid}.${Date.now()}`;
 
   try {
-    fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
+    fs.writeFileSync(tmpPath, JSON.stringify(config, null, 2) + '\n');
+    fs.renameSync(tmpPath, configPath);
     return true;
   } catch (error) {
     console.error('Error saving project config:', error.message);
+    try { fs.unlinkSync(tmpPath); } catch { /* best effort cleanup */ }
     return false;
   }
 }
 
 /**
  * Get additional project roots from environment AND config
- * Format: STRATEGOS_ADDITIONAL_ROOTS=/path/one,/path/two
+ * Format: THEA_ADDITIONAL_ROOTS=/path/one,/path/two
  */
+const MAX_ADDITIONAL_ROOTS = 100;
+
 function getAdditionalRoots(theaRoot) {
   const roots = new Set();
 
-  // From environment
-  const envRoots = process.env.STRATEGOS_ADDITIONAL_ROOTS;
+  // From environment (validate each root is absolute and not overly broad)
+  const envRoots = process.env.THEA_ADDITIONAL_ROOTS;
   if (envRoots) {
-    envRoots.split(',').map(p => p.trim()).filter(p => p).forEach(p => roots.add(p));
+    const entries = envRoots.split(',').map(p => p.trim()).filter(p => p);
+    if (entries.length > MAX_ADDITIONAL_ROOTS) {
+      console.warn(`[ProjectScanner] THEA_ADDITIONAL_ROOTS has ${entries.length} entries, truncating to ${MAX_ADDITIONAL_ROOTS}`);
+      entries.length = MAX_ADDITIONAL_ROOTS;
+    }
+    entries.forEach(p => {
+      const normalized = path.resolve(p);
+      // Reject root-level paths (/) and relative paths to prevent full filesystem access
+      // Also reject paths under dangerous system directories
+      if (path.isAbsolute(p) && normalized !== '/' && !p.includes('..') && !isUnderDangerousPath(normalized)) {
+        roots.add(normalized);
+      } else {
+        console.warn(`[ProjectScanner] Rejecting unsafe additional root: ${p}`);
+      }
+    });
   }
 
-  // From config file
+  // From config file (apply same validation as env roots, with same bound)
   const config = loadProjectConfig(theaRoot);
   if (config.externalProjects && Array.isArray(config.externalProjects)) {
-    config.externalProjects.forEach(p => roots.add(p));
+    const configProjects = config.externalProjects.slice(0, MAX_ADDITIONAL_ROOTS);
+    if (config.externalProjects.length > MAX_ADDITIONAL_ROOTS) {
+      console.warn(`[ProjectScanner] Config has ${config.externalProjects.length} external projects, using first ${MAX_ADDITIONAL_ROOTS}`);
+    }
+    configProjects.forEach(p => {
+      if (typeof p !== 'string' || !p) return;
+      const normalized = path.resolve(p);
+      if (path.isAbsolute(p) && normalized !== '/' && !p.includes('..') && !isUnderDangerousPath(normalized)) {
+        roots.add(normalized);
+      } else {
+        console.warn(`[ProjectScanner] Rejecting unsafe config external root: ${p}`);
+      }
+    });
   }
 
   return [...roots];
@@ -128,6 +175,22 @@ function getAdditionalRoots(theaRoot) {
 /**
  * Add an external project directory
  */
+// Dangerous system paths that should never be added as external project roots
+const DANGEROUS_PATHS = ['/', '/etc', '/sys', '/proc', '/dev', '/boot', '/root', '/var', '/usr', '/bin', '/sbin', '/lib'];
+
+/**
+ * Check if a path is under a dangerous system directory (exact match or child).
+ */
+function isUnderDangerousPath(normalizedPath) {
+  for (const dp of DANGEROUS_PATHS) {
+    if (dp === '/') continue; // Already handled by normalized !== '/' check
+    if (normalizedPath === dp || normalizedPath.startsWith(dp + path.sep)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function addExternalProject(theaRoot, projectPath) {
   const config = loadProjectConfig(theaRoot);
   if (!config.externalProjects) {
@@ -137,13 +200,25 @@ export function addExternalProject(theaRoot, projectPath) {
   // Normalize path
   const normalizedPath = path.resolve(projectPath);
 
+  // Reject dangerous system paths (exact match or children like /var/log)
+  if (isUnderDangerousPath(normalizedPath) || !path.isAbsolute(projectPath) || projectPath.includes('..') || projectPath.includes('\0')) {
+    return { success: false, error: 'Path is not allowed (system directory or relative path)' };
+  }
+
   // Check if already exists
   if (config.externalProjects.includes(normalizedPath)) {
     return { success: false, error: 'Project already added' };
   }
 
-  // Verify path exists and is a directory
+  // Verify path exists and is a directory, and reject symlinks pointing outside
   try {
+    const lstat = fs.lstatSync(normalizedPath);
+    if (lstat.isSymbolicLink()) {
+      const realPath = fs.realpathSync(normalizedPath);
+      if (isUnderDangerousPath(realPath)) {
+        return { success: false, error: 'Symlink target is under a restricted system directory' };
+      }
+    }
     const stat = fs.statSync(normalizedPath);
     if (!stat.isDirectory()) {
       return { success: false, error: 'Path is not a directory' };
@@ -152,8 +227,15 @@ export function addExternalProject(theaRoot, projectPath) {
     return { success: false, error: 'Path does not exist' };
   }
 
+  // Enforce bound on external projects (same limit as env roots)
+  if (config.externalProjects.length >= MAX_ADDITIONAL_ROOTS) {
+    return { success: false, error: `Maximum of ${MAX_ADDITIONAL_ROOTS} external projects reached` };
+  }
+
   config.externalProjects.push(normalizedPath);
-  saveProjectConfig(theaRoot, config);
+  if (!saveProjectConfig(theaRoot, config)) {
+    return { success: false, error: 'Failed to save project configuration' };
+  }
 
   return { success: true, path: normalizedPath, name: path.basename(normalizedPath) };
 }
@@ -175,7 +257,9 @@ export function removeExternalProject(theaRoot, projectPath) {
   }
 
   config.externalProjects.splice(index, 1);
-  saveProjectConfig(theaRoot, config);
+  if (!saveProjectConfig(theaRoot, config)) {
+    return { success: false, error: 'Failed to save project configuration' };
+  }
 
   return { success: true };
 }
@@ -185,7 +269,7 @@ export function removeExternalProject(theaRoot, projectPath) {
  */
 export function listExternalProjects(theaRoot) {
   const config = loadProjectConfig(theaRoot);
-  const envRoots = process.env.STRATEGOS_ADDITIONAL_ROOTS?.split(',').map(p => p.trim()).filter(p => p) || [];
+  const envRoots = process.env.THEA_ADDITIONAL_ROOTS?.split(',').map(p => p.trim()).filter(p => p) || [];
 
   return {
     fromConfig: config.externalProjects || [],
@@ -194,13 +278,13 @@ export function listExternalProjects(theaRoot) {
 }
 
 /**
- * Scan projects root (and additional roots) for project directories
+ * Scan THEA_ROOT (and additional roots) for project directories
  */
 export function scanProjects(theaRoot) {
   const projects = [];
   const seenNames = new Set();
 
-  // Scan main projects root
+  // Scan main thea root
   scanDirectory(theaRoot, projects, seenNames);
 
   // Scan additional roots (individual project directories)
@@ -239,8 +323,9 @@ function scanDirectory(dirPath, projects, seenNames) {
     const entries = fs.readdirSync(dirPath, { withFileTypes: true });
 
     for (const entry of entries) {
-      // Only include directories, skip hidden and special folders
-      if (entry.isDirectory() && !entry.name.startsWith('.') && !entry.name.startsWith('_')) {
+      // Only include real directories — skip symlinks (could escape project root),
+      // hidden dirs, and special folders
+      if (entry.isDirectory() && !entry.isSymbolicLink() && !entry.name.startsWith('.') && !entry.name.startsWith('_')) {
         if (!seenNames.has(entry.name)) {
           const fullPath = path.join(dirPath, entry.name);
 
@@ -354,7 +439,11 @@ export function getProjectTree(theaRoot) {
  * Get a single project by name
  */
 export function getProject(theaRoot, projectName) {
-  const projectPath = path.join(theaRoot, projectName);
+  // SECURITY: Validate path stays within theaRoot to prevent traversal
+  const projectPath = safeResolvePath(projectName, theaRoot);
+  if (!projectPath) {
+    return null;
+  }
 
   try {
     const stat = fs.statSync(projectPath);

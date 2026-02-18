@@ -19,7 +19,7 @@
 
     <key>WorkingDirectory</key>
     <!-- Update this path to your installation directory -->
-    <string>/Users/YOUR_USERNAME/.strategos</string>
+    <string>/Users/drewrad8/.strategos</string>
 
     <key>RunAtLoad</key>
     <true/>
@@ -39,14 +39,14 @@
         <string>production</string>
         <key>STRATEGOS_CONFIG</key>
         <!-- Update this path to your config directory -->
-        <string>/Users/YOUR_USERNAME/.strategos/config/strategos.json</string>
+        <string>/Users/drewrad8/.strategos/config/strategos.json</string>
     </dict>
 
     <key>StandardOutPath</key>
     <!-- Update this path to your logs directory -->
-    <string>/Users/YOUR_USERNAME/.strategos/data/logs/strategos.log</string>
+    <string>/Users/drewrad8/.strategos/data/logs/strategos.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/YOUR_USERNAME/.strategos/data/logs/strategos.log</string>
+    <string>/Users/drewrad8/.strategos/data/logs/strategos.log</string>
 </dict>
 </plist>

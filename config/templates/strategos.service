@@ -5,7 +5,7 @@
 
 [Unit]
 Description=Strategos AI Orchestrator
-Documentation=https://github.com/YOUR_USERNAME/strategos
+Documentation=https://github.com/drewrad8/strategos
 After=network.target
 
 [Service]

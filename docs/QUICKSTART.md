@@ -6,7 +6,7 @@ Get Strategos running in 5 minutes.
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/strategos.git
+git clone https://github.com/drewrad8/strategos.git
 cd strategos
 
 # Run the installer
