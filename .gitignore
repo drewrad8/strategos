@@ -45,6 +45,11 @@ playwright-report/
 # Build artifacts (keep client/dist for release)
 # client/dist/  # Included for pre-built release
 
+# Worker state and checkpoints (runtime)
+server/.tmp/
+.tmp/
+tmp/
+
 # User data directories (created at runtime)
 data/
 uploads/

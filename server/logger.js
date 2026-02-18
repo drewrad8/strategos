@@ -50,6 +50,8 @@ class FileRotator {
     this.logPath = logPath;
     this.stream = null;
     this.currentSize = 0;
+    this._draining = false;   // Backpressure flag
+    this._droppedWrites = 0;  // Track dropped writes during backpressure
     this._openStream();
   }
 
@@ -63,14 +65,35 @@ class FileRotator {
     }
 
     this.stream = fs.createWriteStream(this.logPath, { flags: 'a' });
+    this.stream.on('error', (err) => {
+      console.error(`[Logger] Stream write error on ${this.logPath}: ${err.message}`);
+      // Destroy failed stream to release file descriptor
+      try { this.stream.destroy(); } catch { /* best effort */ }
+    });
+    this.stream.on('drain', () => {
+      if (this._draining) {
+        this._draining = false;
+        if (this._droppedWrites > 0) {
+          // Log how many writes were dropped during backpressure
+          const dropped = this._droppedWrites;
+          this._droppedWrites = 0;
+          // Write directly to stream to avoid recursion through _log
+          this.stream.write(`[Logger] Resumed after backpressure — dropped ${dropped} log writes\n`);
+        }
+      }
+    });
   }
 
   _rotate() {
-    this.stream.end();
+    // End previous stream; we don't await the callback because rotation
+    // is called synchronously during write() and the old stream will flush
+    // its remaining buffer asynchronously.  Opening a new stream to a new
+    // file is safe even while the old one drains.
+    try { this.stream.end(); } catch { /* already closed */ }
 
-    // Rotate existing files
+    // Rotate existing files (.4→.5, .3→.4, .2→.3, .1→.2)
     for (let i = MAX_LOG_FILES - 1; i >= 1; i--) {
-      const oldPath = i === 1 ? this.logPath : `${this.logPath}.${i}`;
+      const oldPath = `${this.logPath}.${i}`;
       const newPath = `${this.logPath}.${i + 1}`;
       try {
         if (fs.existsSync(oldPath)) {
@@ -105,17 +128,27 @@ class FileRotator {
   }
 
   write(line) {
+    // Drop writes during backpressure to prevent OOM from unbounded buffering
+    if (this._draining) {
+      this._droppedWrites++;
+      return;
+    }
     const bytes = Buffer.byteLength(line, 'utf8');
     if (this.currentSize + bytes > MAX_LOG_SIZE) {
       this._rotate();
     }
-    this.stream.write(line);
+    const canContinue = this.stream.write(line);
     this.currentSize += bytes;
+    if (!canContinue) {
+      this._draining = true;
+    }
   }
 
-  close() {
+  close(callback) {
     if (this.stream) {
-      this.stream.end();
+      this.stream.end(callback);
+    } else if (callback) {
+      callback();
     }
   }
 }
@@ -156,6 +189,8 @@ class Logger {
 
     this.db = new Database(this.dbPath);
     this.db.pragma('journal_mode = WAL');
+    this.db.pragma('journal_size_limit = 50000000'); // 50MB WAL limit
+    this.db.pragma('busy_timeout = 5000'); // 5s wait for locks (matches other DBs)
 
     // Create server_logs table
     this.db.exec(`
@@ -213,9 +248,48 @@ class Logger {
       LIMIT ?
     `);
 
-    // Cleanup old logs (keep 7 days)
+    // Prepared statements for getStats (avoid re-creating per call)
+    this._statsByLevel = this.db.prepare(`
+      SELECT level, COUNT(*) as count FROM server_logs GROUP BY level
+    `);
+    this._statsRecentErrors = this.db.prepare(`
+      SELECT COUNT(*) as count FROM server_logs
+      WHERE level IN ('ERROR', 'FATAL')
+        AND timestamp > datetime('now', '-1 hour')
+    `);
+    this._deleteOldLogs = this.db.prepare('DELETE FROM server_logs WHERE timestamp < ?');
+
+    // Cleanup old logs at startup (keep 7 days)
     const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-    this.db.prepare('DELETE FROM server_logs WHERE timestamp < ?').run(cutoff);
+    this._deleteOldLogs.run(cutoff);
+
+    // Periodic cleanup every hour during runtime
+    this._cleanupInterval = setInterval(() => {
+      try {
+        const c = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+        const result = this._deleteOldLogs.run(c);
+        if (result.changes > 0) {
+          console.log(`[Logger] Cleaned up ${result.changes} logs older than 7 days`);
+        }
+        // Periodic WAL checkpoint to prevent unbounded WAL growth
+        // Try PASSIVE first (non-blocking), escalate to RESTART if WAL is still large
+        try {
+          const walResult = this.db.pragma('wal_checkpoint(PASSIVE)');
+          // walResult[0] = { busy, checkpointed, log }
+          const walInfo = walResult[0];
+          if (walInfo && walInfo.log > 1000 && walInfo.checkpointed < walInfo.log) {
+            // PASSIVE didn't fully checkpoint — escalate to RESTART (briefly blocks writers)
+            this.db.pragma('wal_checkpoint(RESTART)');
+          }
+        } catch { /* best effort */ }
+      } catch (err) {
+        console.error(`[Logger] Cleanup failed: ${err.message}`);
+      }
+    }, 60 * 60 * 1000);
+
+    if (this._cleanupInterval.unref) {
+      this._cleanupInterval.unref();
+    }
   }
 
   _initFiles() {
@@ -256,7 +330,11 @@ class Logger {
     if (source) {
       line += ` [${source}]`;
     }
-    line += ` ${message}`;
+    // Sanitize newlines/carriage returns to prevent log injection
+    const safeMessage = typeof message === 'string'
+      ? message.replace(/\n/g, '\\n').replace(/\r/g, '\\r')
+      : String(message);
+    line += ` ${safeMessage}`;
     if (context && Object.keys(context).length > 0) {
       line += ` ${JSON.stringify(context)}`;
     }
@@ -390,16 +468,8 @@ class Logger {
   }
 
   getStats() {
-    const counts = this.db.prepare(`
-      SELECT level, COUNT(*) as count FROM server_logs
-      GROUP BY level
-    `).all();
-
-    const recentErrors = this.db.prepare(`
-      SELECT COUNT(*) as count FROM server_logs
-      WHERE level IN ('ERROR', 'FATAL')
-        AND timestamp > datetime('now', '-1 hour')
-    `).get();
+    const counts = this._statsByLevel.all();
+    const recentErrors = this._statsRecentErrors.get();
 
     return {
       totalLogs: this.logCount,
@@ -409,10 +479,51 @@ class Logger {
     };
   }
 
-  close() {
-    this.mainLog?.close();
-    this.errorLog?.close();
-    this.db?.close();
+  close(callback) {
+    if (this._cleanupInterval) {
+      clearInterval(this._cleanupInterval);
+      this._cleanupInterval = null;
+    }
+
+    // Flush file streams before closing database
+    let remaining = 0;
+    const onStreamDone = () => {
+      if (--remaining > 0) return;
+      // All streams flushed — now safe to close database
+      if (this.db) {
+        try {
+          this.db.pragma('wal_checkpoint(TRUNCATE)');
+        } catch {
+          // Best effort WAL checkpoint
+        }
+        this.db.close();
+        this.db = null;
+      }
+      if (callback) callback();
+    };
+
+    if (this.mainLog) remaining++;
+    if (this.errorLog) remaining++;
+
+    if (remaining === 0) {
+      // No file rotators to flush
+      onStreamDone();
+      remaining = 1; // prevent double call
+      return;
+    }
+
+    // Close rotators with flush callbacks
+    if (this.mainLog) this.mainLog.close(onStreamDone);
+    if (this.errorLog) this.errorLog.close(onStreamDone);
+
+    // Safety timeout: if streams don't flush in 5 seconds, force close anyway
+    setTimeout(() => {
+      if (this.db) {
+        try { this.db.pragma('wal_checkpoint(TRUNCATE)'); } catch { /* best effort */ }
+        try { this.db.close(); } catch { /* best effort */ }
+        this.db = null;
+      }
+    }, 5000).unref();
   }
 }
 
@@ -436,13 +547,5 @@ export function getLogger() {
   }
   return loggerInstance;
 }
-
-// Convenience exports
-export const debug = (msg, ctx) => getLogger().debug(msg, ctx);
-export const info = (msg, ctx) => getLogger().info(msg, ctx);
-export const warn = (msg, ctx) => getLogger().warn(msg, ctx);
-export const error = (msg, ctx) => getLogger().error(msg, ctx);
-export const fatal = (msg, ctx) => getLogger().fatal(msg, ctx);
-export const logLifecycle = (type, reason, extra) => getLogger().logLifecycle(type, reason, extra);
 
 export default { initLogger, getLogger, LogLevel, LifecycleEvent };

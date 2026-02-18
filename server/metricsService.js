@@ -18,36 +18,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // ============================================
 
 export const MetricTypes = {
-  // Worker lifecycle
-  WORKER_SPAWN_TIME: 'worker_spawn_time',
-  WORKER_READY_TIME: 'worker_ready_time',
-  WORKER_COMPLETION_TIME: 'worker_completion_time',
-  WORKER_IDLE_TIME: 'worker_idle_time',
-
-  // Error tracking
-  ERROR_COUNT: 'error_count',
-  ERROR_RECOVERY_TIME: 'error_recovery_time',
-  ERROR_RECOVERY_SUCCESS: 'error_recovery_success',
-
-  // Circuit breaker
-  CIRCUIT_BREAKER_TRIP: 'circuit_breaker_trip',
-  CIRCUIT_BREAKER_RESET: 'circuit_breaker_reset',
-
-  // API performance
-  API_RESPONSE_TIME: 'api_response_time',
-  API_ERROR_RATE: 'api_error_rate',
-
-  // Health monitoring
-  HEALTH_CHECK_LATENCY: 'health_check_latency',
-  HEALTH_DEGRADATION_COUNT: 'health_degradation_count',
-
-  // Task metrics
-  TASK_QUEUE_DEPTH: 'task_queue_depth',
-  TASK_PROCESSING_TIME: 'task_processing_time',
-
-  // System metrics
-  MEMORY_USAGE: 'memory_usage',
-  ACTIVE_WORKERS: 'active_workers'
+  WORKER_SPAWN_TIME: 'worker_spawn_time',       // Recorded in workerManager.js via recordWorkerSpawn
 };
 
 // ============================================
@@ -61,6 +32,7 @@ class MetricsService {
     this.inMemoryMetrics = new Map(); // For real-time metrics
     this.timers = new Map(); // For timing operations
     this.aggregationInterval = null;
+    this._aggregationCount = 0; // Track cycles for periodic cleanup
 
     this._initDatabase();
     this._startAggregation();
@@ -72,6 +44,11 @@ class MetricsService {
 
   _initDatabase() {
     this.db = new Database(this.dbPath);
+
+    // Enable WAL mode for concurrent reads during writes
+    this.db.pragma('journal_mode = WAL');
+    this.db.pragma('journal_size_limit = 50000000'); // 50MB WAL limit
+    this.db.pragma('busy_timeout = 5000');
 
     // Create metrics table
     this.db.exec(`
@@ -87,6 +64,7 @@ class MetricsService {
       CREATE INDEX IF NOT EXISTS idx_metrics_type ON metrics(type);
       CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON metrics(timestamp);
       CREATE INDEX IF NOT EXISTS idx_metrics_session ON metrics(session_id);
+      CREATE INDEX IF NOT EXISTS idx_metrics_type_timestamp ON metrics(type, timestamp);
 
       -- Aggregated metrics table (hourly summaries)
       CREATE TABLE IF NOT EXISTS metrics_aggregated (
@@ -139,6 +117,42 @@ class MetricsService {
       `),
       endSession: this.db.prepare(`
         UPDATE sessions SET end_time = ? WHERE id = ?
+      `),
+      // getSummary queries (called every 5s by metrics subscribers + every 5min by aggregation)
+      getSummaryStats: this.db.prepare(`
+        SELECT
+          COUNT(*) as count,
+          SUM(value) as sum,
+          AVG(value) as avg,
+          MIN(value) as min,
+          MAX(value) as max
+        FROM metrics
+        WHERE type = ? AND timestamp >= ? AND timestamp <= ?
+      `),
+      getSummaryValues: this.db.prepare(`
+        SELECT value FROM metrics
+        WHERE type = ? AND timestamp >= ? AND timestamp <= ?
+        ORDER BY value
+        LIMIT 10000
+      `),
+      // Aggregation INSERT (called every 5min per metric type)
+      insertAggregated: this.db.prepare(`
+        INSERT INTO metrics_aggregated
+        (type, period_start, period_end, count, sum, min, max, avg, p50, p95, p99)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `),
+      // Cleanup queries (called hourly)
+      cleanupMetrics: this.db.prepare(`DELETE FROM metrics WHERE timestamp < ?`),
+      cleanupAggregated: this.db.prepare(`DELETE FROM metrics_aggregated WHERE period_end < ?`),
+      cleanupSessions: this.db.prepare(`DELETE FROM sessions WHERE start_time < ?`),
+      // Session query (on API request)
+      getSession: this.db.prepare(`SELECT * FROM sessions WHERE id = ?`),
+      getSessionMetrics: this.db.prepare(`
+        SELECT type, value, labels, timestamp
+        FROM metrics
+        WHERE session_id = ?
+        ORDER BY timestamp
+        LIMIT 50000
       `)
     };
   }
@@ -248,23 +262,10 @@ class MetricsService {
     const start = startTime || new Date(Date.now() - 3600000).toISOString(); // Last hour
     const end = endTime || new Date().toISOString();
 
-    const stats = this.db.prepare(`
-      SELECT
-        COUNT(*) as count,
-        SUM(value) as sum,
-        AVG(value) as avg,
-        MIN(value) as min,
-        MAX(value) as max
-      FROM metrics
-      WHERE type = ? AND timestamp >= ? AND timestamp <= ?
-    `).get(type, start, end);
+    const stats = this._stmts.getSummaryStats.get(type, start, end);
 
-    // Calculate percentiles
-    const values = this.db.prepare(`
-      SELECT value FROM metrics
-      WHERE type = ? AND timestamp >= ? AND timestamp <= ?
-      ORDER BY value
-    `).all(type, start, end).map(r => r.value);
+    // Calculate percentiles (capped at 10k rows to prevent OOM)
+    const values = this._stmts.getSummaryValues.all(type, start, end).map(r => r.value);
 
     const percentile = (arr, p) => {
       if (arr.length === 0) return null;
@@ -336,26 +337,22 @@ class MetricsService {
    * Get metrics for a specific session
    */
   getSessionMetrics(sessionId) {
-    const session = this.db.prepare(`
-      SELECT * FROM sessions WHERE id = ?
-    `).get(sessionId);
+    const session = this._stmts.getSession.get(sessionId);
 
     if (!session) {
       return null;
     }
 
-    const metrics = this.db.prepare(`
-      SELECT type, value, labels, timestamp
-      FROM metrics
-      WHERE session_id = ?
-      ORDER BY timestamp
-    `).all(sessionId);
+    const metrics = this._stmts.getSessionMetrics.all(sessionId);
 
-    // Group by type
+    // Group by type — parse labels from JSON string back to object
     const byType = {};
     for (const m of metrics) {
       if (!byType[m.type]) {
         byType[m.type] = [];
+      }
+      if (m.labels && typeof m.labels === 'string') {
+        try { m.labels = JSON.parse(m.labels); } catch { m.labels = {}; }
       }
       byType[m.type].push(m);
     }
@@ -364,12 +361,19 @@ class MetricsService {
     const summaries = {};
     for (const [type, values] of Object.entries(byType)) {
       const nums = values.map(v => v.value);
+      // Use reduce instead of Math.min/max(...nums) — spread throws RangeError for >65k items
+      let min = Infinity, max = -Infinity, sum = 0;
+      for (const n of nums) {
+        if (n < min) min = n;
+        if (n > max) max = n;
+        sum += n;
+      }
       summaries[type] = {
         count: nums.length,
-        sum: nums.reduce((a, b) => a + b, 0),
-        avg: nums.reduce((a, b) => a + b, 0) / nums.length,
-        min: Math.min(...nums),
-        max: Math.max(...nums)
+        sum,
+        avg: sum / nums.length,
+        min: nums.length > 0 ? min : null,
+        max: nums.length > 0 ? max : null
       };
     }
 
@@ -425,7 +429,46 @@ class MetricsService {
   _startAggregation() {
     // Run aggregation every 5 minutes
     this.aggregationInterval = setInterval(() => {
-      this._aggregate();
+      try {
+        this._aggregate();
+      } catch (err) {
+        console.error(`[MetricsService] Aggregation failed: ${err.message}`);
+      }
+      // Checkpoint WAL after aggregation to prevent unbounded WAL growth.
+      // Use PASSIVE first (non-blocking), escalate to RESTART if too many pages remain.
+      try {
+        const walResult = this.db.pragma('wal_checkpoint(PASSIVE)');
+        const walInfo = walResult[0];
+        if (walInfo && walInfo.log > 1000 && walInfo.checkpointed < walInfo.log) {
+          this.db.pragma('wal_checkpoint(RESTART)');
+        }
+      } catch (e) { /* best effort */ }
+
+      // Run cleanup every 12 cycles (once per hour) — 7 day retention
+      this._aggregationCount++;
+      if (this._aggregationCount % 12 === 0) {
+        try {
+          const removed = this.cleanup(7);
+          if (removed > 0) {
+            console.log(`[MetricsService] Cleaned up ${removed} metrics older than 7 days`);
+          }
+        } catch (err) {
+          console.error(`[MetricsService] Cleanup failed: ${err.message}`);
+        }
+        // Prune stale timers (started > 10 min ago, never ended)
+        const timerCutoff = Date.now() - 10 * 60 * 1000;
+        let staleTimers = 0;
+        for (const [timerId, timer] of this.timers) {
+          const startTime = new Date(timer.startTimestamp).getTime();
+          if (Number.isNaN(startTime) || startTime < timerCutoff) {
+            this.timers.delete(timerId);
+            staleTimers++;
+          }
+        }
+        if (staleTimers > 0) {
+          console.log(`[MetricsService] Pruned ${staleTimers} stale timers`);
+        }
+      }
     }, 5 * 60 * 1000);
 
     // Allow Node.js to exit
@@ -436,29 +479,33 @@ class MetricsService {
 
   _aggregate() {
     const now = new Date();
-    const hourAgo = new Date(now.getTime() - 3600000);
+    // Aggregate the last 5-minute window (matches the aggregation interval).
+    // Previously used a 1-hour lookback, which produced 12 overlapping windows per hour
+    // with redundant/inflated data.
+    const periodStart = new Date(now.getTime() - 5 * 60 * 1000);
 
     for (const type of Object.values(MetricTypes)) {
-      const summary = this.getSummary(type, hourAgo.toISOString(), now.toISOString());
+      try {
+        const summary = this.getSummary(type, periodStart.toISOString(), now.toISOString());
 
-      if (summary.count > 0) {
-        this.db.prepare(`
-          INSERT INTO metrics_aggregated
-          (type, period_start, period_end, count, sum, min, max, avg, p50, p95, p99)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(
-          type,
-          hourAgo.toISOString(),
-          now.toISOString(),
-          summary.count,
-          summary.sum,
-          summary.min,
-          summary.max,
-          summary.avg,
-          summary.p50,
-          summary.p95,
-          summary.p99
-        );
+        if (summary.count > 0) {
+          this._stmts.insertAggregated.run(
+            type,
+            periodStart.toISOString(),
+            now.toISOString(),
+            summary.count,
+            summary.sum,
+            summary.min,
+            summary.max,
+            summary.avg,
+            summary.p50,
+            summary.p95,
+            summary.p99
+          );
+        }
+      } catch (err) {
+        // Per-type catch: one failed type shouldn't block remaining types
+        console.error(`[MetricsService] Aggregation failed for ${type}: ${err.message}`);
       }
     }
   }
@@ -473,11 +520,15 @@ class MetricsService {
   cleanup(daysToKeep = 30) {
     const cutoff = new Date(Date.now() - daysToKeep * 24 * 60 * 60 * 1000).toISOString();
 
-    const result = this.db.prepare(`
-      DELETE FROM metrics WHERE timestamp < ?
-    `).run(cutoff);
+    const result = this._stmts.cleanupMetrics.run(cutoff);
 
-    return result.changes;
+    // Also clean aggregated metrics (keep 30 days regardless)
+    const aggResult = this._stmts.cleanupAggregated.run(cutoff);
+
+    // Clean up old sessions (was previously skipped — sessions accumulated forever)
+    const sessionsResult = this._stmts.cleanupSessions.run(cutoff);
+
+    return result.changes + aggResult.changes + sessionsResult.changes;
   }
 
   /**
@@ -486,10 +537,15 @@ class MetricsService {
   close() {
     if (this.aggregationInterval) {
       clearInterval(this.aggregationInterval);
+      this.aggregationInterval = null;
     }
     if (this.db) {
+      try { this.db.pragma('wal_checkpoint(TRUNCATE)'); } catch (e) { /* best effort */ }
       this.db.close();
+      this.db = null;
     }
+    this.inMemoryMetrics.clear();
+    this.timers.clear();
   }
 }
 
@@ -525,42 +581,6 @@ export function recordWorkerSpawn(workerId, durationMs, labels = {}) {
     MetricTypes.WORKER_SPAWN_TIME,
     durationMs,
     { workerId, ...labels }
-  );
-}
-
-/**
- * Record API response time
- */
-export function recordApiResponse(endpoint, method, durationMs, statusCode) {
-  getMetricsService().record(
-    MetricTypes.API_RESPONSE_TIME,
-    durationMs,
-    { endpoint, method, statusCode }
-  );
-}
-
-/**
- * Record error occurrence
- */
-export function recordError(errorType, labels = {}) {
-  getMetricsService().increment(MetricTypes.ERROR_COUNT, 1, { errorType, ...labels });
-}
-
-/**
- * Record circuit breaker trip
- */
-export function recordCircuitBreakerTrip(name) {
-  getMetricsService().increment(MetricTypes.CIRCUIT_BREAKER_TRIP, 1, { name });
-}
-
-/**
- * Record health check latency
- */
-export function recordHealthCheck(workerId, latencyMs, status) {
-  getMetricsService().record(
-    MetricTypes.HEALTH_CHECK_LATENCY,
-    latencyMs,
-    { workerId, status }
   );
 }
 

@@ -17,7 +17,7 @@ Strategos is an open-source orchestration system that lets you:
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/strategos.git
+git clone https://github.com/drewrad8/strategos.git
 cd strategos
 
 # Run the interactive installer

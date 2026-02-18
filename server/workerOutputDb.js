@@ -11,7 +11,7 @@ const DB_PATH = path.join(DB_DIR, 'worker_outputs.db');
 
 // Ensure directory exists
 if (!fs.existsSync(DB_DIR)) {
-  fs.mkdirSync(DB_DIR, { recursive: true });
+  fs.mkdirSync(DB_DIR, { recursive: true, mode: 0o700 });
 }
 
 // Initialize database
@@ -19,6 +19,9 @@ const db = new Database(DB_PATH);
 
 // Enable WAL mode for better concurrent read/write performance
 db.pragma('journal_mode = WAL');
+db.pragma('journal_size_limit = 50000000'); // 50MB WAL limit
+db.pragma('foreign_keys = ON');
+db.pragma('busy_timeout = 5000');
 
 // Create tables for worker output persistence
 db.exec(`
@@ -136,6 +139,34 @@ const getLastChunkHash = db.prepare(`
   LIMIT 1
 `);
 
+const getFullOutputBySessionId = db.prepare(
+  'SELECT output_chunk FROM worker_outputs WHERE session_id = ? ORDER BY id ASC LIMIT 50000'
+);
+
+// Pre-cached stats queries (was inline db.prepare() on every getStats() call)
+const stmtSessionCount = db.prepare('SELECT COUNT(*) as count FROM worker_sessions');
+const stmtOutputCount = db.prepare('SELECT COUNT(*) as count FROM worker_outputs');
+const stmtActiveSessionCount = db.prepare('SELECT COUNT(*) as count FROM worker_sessions WHERE ended_at IS NULL');
+const stmtOldestSession = db.prepare('SELECT MIN(started_at) as oldest FROM worker_sessions');
+const stmtNewestSession = db.prepare('SELECT MAX(started_at) as newest FROM worker_sessions');
+
+// Pre-cached cleanup queries (was inline db.prepare() in cleanup functions)
+const stmtOldSessions = db.prepare(`
+  SELECT id FROM worker_sessions
+  WHERE started_at < ? AND ended_at IS NOT NULL
+`);
+const stmtOrphanedSessions = db.prepare(`
+  UPDATE worker_sessions
+  SET ended_at = CURRENT_TIMESTAMP, final_status = 'orphaned'
+  WHERE ended_at IS NULL AND started_at < ?
+`);
+const stmtDeleteOldestOutputs = db.prepare(`
+  DELETE FROM worker_outputs WHERE id IN (
+    SELECT id FROM worker_outputs ORDER BY timestamp ASC LIMIT 10000
+  )
+`);
+const stmtOutputRowCount = db.prepare('SELECT COUNT(*) as c FROM worker_outputs');
+
 // Track active session IDs for each worker
 const activeSessionIds = new Map();
 
@@ -147,7 +178,7 @@ function simpleHash(str) {
   for (let i = 0; i < str.length; i++) {
     const char = str.charCodeAt(i);
     hash = ((hash << 5) - hash) + char;
-    hash = hash & hash;
+    hash = hash | 0; // Convert to 32-bit integer (was `hash & hash` which is a no-op)
   }
   return hash.toString(16);
 }
@@ -259,7 +290,8 @@ export function storeOutput(workerId, output, chunkType = 'stdout') {
  * @returns {Object} Sessions with pagination info
  */
 export function getWorkerSessions(workerId, options = {}) {
-  const { limit = 20, offset = 0 } = options;
+  const { limit: rawLimit = 20, offset = 0 } = options;
+  const limit = Math.min(Math.max(1, rawLimit), 500); // Cap at 500
 
   try {
     const sessions = getSessionsByWorkerIdPaginated.all(workerId, limit, offset);
@@ -287,7 +319,8 @@ export function getWorkerSessions(workerId, options = {}) {
  * @returns {Object} Output chunks with pagination info
  */
 export function getSessionOutput(sessionId, options = {}) {
-  const { limit = 100, offset = 0 } = options;
+  const { limit: rawLimit = 100, offset = 0 } = options;
+  const limit = Math.min(Math.max(1, rawLimit), 10000); // Cap at 10000
 
   try {
     const outputs = getOutputsBySessionIdPaginated.all(sessionId, limit, offset);
@@ -315,7 +348,8 @@ export function getSessionOutput(sessionId, options = {}) {
  * @returns {Object} Output data
  */
 export function getWorkerHistory(workerId, options = {}) {
-  const { limit = 100, sessionId = null, offset = 0 } = options;
+  const { limit: rawLimit = 100, sessionId = null, offset = 0 } = options;
+  const limit = Math.min(Math.max(1, rawLimit), 10000); // Cap at 10000
 
   try {
     if (sessionId) {
@@ -351,8 +385,17 @@ export function getWorkerHistory(workerId, options = {}) {
  */
 export function getSessionFullOutput(sessionId) {
   try {
-    const outputs = getOutputsBySessionId.all(sessionId);
-    return outputs.map(o => o.output_chunk).join('');
+    // Stream rows via .iterate() instead of .all() to avoid loading 50K rows into memory.
+    // The 5MB cap stops iteration early — no need to pre-load the full result set.
+    const MAX_OUTPUT_SIZE = 5 * 1024 * 1024;
+    let totalSize = 0;
+    const chunks = [];
+    for (const o of getFullOutputBySessionId.iterate(sessionId)) {
+      totalSize += o.output_chunk.length;
+      if (totalSize > MAX_OUTPUT_SIZE) break;
+      chunks.push(o.output_chunk);
+    }
+    return chunks.join('');
   } catch (err) {
     console.error('[WorkerOutputDb] Failed to get full output:', err.message);
     return '';
@@ -365,16 +408,18 @@ export function getSessionFullOutput(sessionId) {
  * @returns {Object} Cleanup statistics
  */
 export function cleanupOldData(daysToKeep = 7) {
+  // Validate parameter to prevent accidental full deletion
+  if (typeof daysToKeep !== 'number' || daysToKeep < 1 || daysToKeep > 365) {
+    console.warn(`[WorkerOutputDb] Invalid daysToKeep=${daysToKeep}, using default 7`);
+    daysToKeep = 7;
+  }
   const cutoffDate = new Date();
   cutoffDate.setDate(cutoffDate.getDate() - daysToKeep);
   const cutoffStr = cutoffDate.toISOString();
 
   try {
     // Get IDs of old sessions to delete
-    const oldSessions = db.prepare(`
-      SELECT id FROM worker_sessions
-      WHERE started_at < ? AND ended_at IS NOT NULL
-    `).all(cutoffStr);
+    const oldSessions = stmtOldSessions.all(cutoffStr);
 
     const sessionIds = oldSessions.map(s => s.id);
 
@@ -382,23 +427,44 @@ export function cleanupOldData(daysToKeep = 7) {
       return { sessionsDeleted: 0, outputsDeleted: 0 };
     }
 
-    // Delete outputs first (foreign key constraint)
-    const outputResult = db.prepare(`
-      DELETE FROM worker_outputs
-      WHERE session_id IN (${sessionIds.join(',')})
-    `).run();
+    // Batch deletes in chunks of 400 to stay under SQLite's SQLITE_MAX_VARIABLE_NUMBER limit
+    // (default 999 in many builds). ON DELETE CASCADE handles outputs automatically.
+    // Wrap in transaction for atomicity — prevents orphaned outputs if crash mid-cleanup.
+    const BATCH_SIZE = 400;
+    const cleanupTx = db.transaction(() => {
+      let totalOutputsDeleted = 0;
+      let totalSessionsDeleted = 0;
 
-    // Delete sessions
-    const sessionResult = db.prepare(`
-      DELETE FROM worker_sessions
-      WHERE id IN (${sessionIds.join(',')})
-    `).run();
+      for (let i = 0; i < sessionIds.length; i += BATCH_SIZE) {
+        const batch = sessionIds.slice(i, i + BATCH_SIZE);
+        const placeholders = batch.map(() => '?').join(',');
 
-    console.log(`[WorkerOutputDb] Cleanup: deleted ${sessionResult.changes} sessions, ${outputResult.changes} output chunks`);
+        // Delete outputs first (redundant if CASCADE works, but safe for FK enforcement)
+        const outputResult = db.prepare(
+          `DELETE FROM worker_outputs WHERE session_id IN (${placeholders})`
+        ).run(...batch);
+        totalOutputsDeleted += outputResult.changes;
+
+        // Delete sessions
+        const sessionResult = db.prepare(
+          `DELETE FROM worker_sessions WHERE id IN (${placeholders})`
+        ).run(...batch);
+        totalSessionsDeleted += sessionResult.changes;
+      }
+
+      return { totalOutputsDeleted, totalSessionsDeleted };
+    });
+
+    const { totalOutputsDeleted, totalSessionsDeleted } = cleanupTx();
+
+    console.log(`[WorkerOutputDb] Cleanup: deleted ${totalSessionsDeleted} sessions, ${totalOutputsDeleted} output chunks`);
+
+    // Size management (VACUUM) is handled by enforceDbSizeLimit() which runs
+    // in the same periodic cleanup cycle. Don't VACUUM here to avoid double-VACUUM.
 
     return {
-      sessionsDeleted: sessionResult.changes,
-      outputsDeleted: outputResult.changes
+      sessionsDeleted: totalSessionsDeleted,
+      outputsDeleted: totalOutputsDeleted
     };
   } catch (err) {
     console.error('[WorkerOutputDb] Cleanup failed:', err.message);
@@ -412,15 +478,15 @@ export function cleanupOldData(daysToKeep = 7) {
  */
 export function getStats() {
   try {
-    const sessionCount = db.prepare('SELECT COUNT(*) as count FROM worker_sessions').get().count;
-    const outputCount = db.prepare('SELECT COUNT(*) as count FROM worker_outputs').get().count;
-    const activeSessions = db.prepare('SELECT COUNT(*) as count FROM worker_sessions WHERE ended_at IS NULL').get().count;
+    const sessionCount = stmtSessionCount.get().count;
+    const outputCount = stmtOutputCount.get().count;
+    const activeSessions = stmtActiveSessionCount.get().count;
 
     const dbSize = fs.statSync(DB_PATH).size;
 
     // Get oldest and newest records
-    const oldest = db.prepare('SELECT MIN(started_at) as oldest FROM worker_sessions').get().oldest;
-    const newest = db.prepare('SELECT MAX(started_at) as newest FROM worker_sessions').get().newest;
+    const oldest = stmtOldestSession.get().oldest;
+    const newest = stmtNewestSession.get().newest;
 
     return {
       totalSessions: sessionCount,
@@ -452,27 +518,6 @@ export function getSession(sessionId) {
 }
 
 /**
- * Update session task description
- * @param {string} workerId - Worker ID
- * @param {string} taskDescription - Task description
- */
-export function updateSessionTask(workerId, taskDescription) {
-  try {
-    const sessionId = activeSessionIds.get(workerId);
-    if (sessionId) {
-      db.prepare(`
-        UPDATE worker_sessions SET task_description = ? WHERE id = ?
-      `).run(taskDescription, sessionId);
-      return true;
-    }
-    return false;
-  } catch (err) {
-    console.error('[WorkerOutputDb] Failed to update task:', err.message);
-    return false;
-  }
-}
-
-/**
  * Clean up orphaned sessions (active sessions older than specified hours)
  * This addresses sessions that were never properly ended due to server restarts,
  * worker crashes, or external tmux session termination.
@@ -480,17 +525,16 @@ export function updateSessionTask(workerId, taskDescription) {
  * @returns {Object} Cleanup statistics
  */
 export function cleanupOrphanedSessions(maxAgeHours = 24) {
+  if (typeof maxAgeHours !== 'number' || maxAgeHours < 1 || maxAgeHours > 720) {
+    console.warn(`[WorkerOutputDb] Invalid maxAgeHours=${maxAgeHours}, using default 24`);
+    maxAgeHours = 24;
+  }
   try {
     const cutoffDate = new Date(Date.now() - maxAgeHours * 60 * 60 * 1000);
     const cutoffStr = cutoffDate.toISOString();
 
     // Mark orphaned sessions as ended with 'orphaned' status
-    const result = db.prepare(`
-      UPDATE worker_sessions
-      SET ended_at = CURRENT_TIMESTAMP, final_status = 'orphaned'
-      WHERE ended_at IS NULL
-      AND started_at < ?
-    `).run(cutoffStr);
+    const result = stmtOrphanedSessions.run(cutoffStr);
 
     if (result.changes > 0) {
       console.log(`[WorkerOutputDb] Marked ${result.changes} orphaned sessions as ended`);
@@ -503,25 +547,118 @@ export function cleanupOrphanedSessions(maxAgeHours = 24) {
   }
 }
 
+// Max DB size: 200MB. If exceeded, aggressively delete oldest data.
+const MAX_DB_SIZE_BYTES = 200 * 1024 * 1024;
+
+/**
+ * Size-based cleanup: if DB exceeds MAX_DB_SIZE_BYTES, delete oldest output
+ * chunks until under limit. This prevents unbounded growth regardless of age.
+ */
+export function enforceDbSizeLimit() {
+  try {
+    // Checkpoint WAL first so size reflects actual data
+    try { db.pragma('wal_checkpoint(PASSIVE)'); } catch (e) { /* ignore */ }
+
+    // Check total size including WAL file
+    const mainSize = fs.statSync(DB_PATH).size;
+    const walPath = DB_PATH + '-wal';
+    const walSize = fs.existsSync(walPath) ? fs.statSync(walPath).size : 0;
+    const dbSize = mainSize + walSize;
+    if (dbSize <= MAX_DB_SIZE_BYTES) return { trimmed: false, dbSizeMB: (dbSize / 1024 / 1024).toFixed(0) };
+
+    console.log(`[WorkerOutputDb] DB is ${(dbSize / 1024 / 1024).toFixed(0)}MB (limit: ${(MAX_DB_SIZE_BYTES / 1024 / 1024)}MB) - trimming...`);
+
+    // Delete oldest output chunks in batches until under limit
+    const deleteOldest = stmtDeleteOldestOutputs;
+
+    let rounds = 0;
+    const maxRounds = 50; // Safety limit
+    while (rounds < maxRounds) {
+      try {
+        const result = deleteOldest.run();
+        if (result.changes === 0) break;
+        rounds++;
+
+        // Check size after each batch (WAL mode means size may not shrink immediately)
+        const currentRows = stmtOutputRowCount.get().c;
+        if (currentRows < 5000) break; // Keep at least some data
+      } catch (deleteErr) {
+        console.error(`[WorkerOutputDb] Delete batch failed (round ${rounds}): ${deleteErr.message}`);
+        break; // Don't loop forever if DELETE itself fails (e.g. SQLITE_FULL)
+      }
+    }
+
+    // VACUUM to reclaim space
+    db.exec('VACUUM');
+    const newSize = fs.statSync(DB_PATH).size;
+    console.log(`[WorkerOutputDb] Trimmed: ${(dbSize / 1024 / 1024).toFixed(0)}MB → ${(newSize / 1024 / 1024).toFixed(0)}MB (${rounds} rounds)`);
+    return { trimmed: true, oldSizeMB: (dbSize / 1024 / 1024).toFixed(0), newSizeMB: (newSize / 1024 / 1024).toFixed(0) };
+  } catch (err) {
+    console.error('[WorkerOutputDb] Size enforcement failed:', err.message);
+    return { trimmed: false, error: err.message };
+  }
+}
+
 // Run cleanup on startup (in background)
-setTimeout(() => {
-  // First, mark orphaned sessions as ended (sessions >24h old that are still "active")
-  const orphanResult = cleanupOrphanedSessions(24);
+let _startupCleanupTimer = setTimeout(() => {
+  if (_dbClosed) return;
+  // First, mark orphaned sessions as ended (sessions >12h old that are still "active")
+  const orphanResult = cleanupOrphanedSessions(12);
   if (orphanResult.orphansCleaned > 0) {
     console.log(`[WorkerOutputDb] Startup: Marked ${orphanResult.orphansCleaned} orphaned sessions as ended`);
   }
 
-  // Then delete old ended sessions (>3 days)
-  const result = cleanupOldData(3);
+  // Delete old ended sessions (>1 day instead of 3)
+  const result = cleanupOldData(1);
   if (result.sessionsDeleted > 0 || result.outputsDeleted > 0) {
     console.log(`[WorkerOutputDb] Startup cleanup: ${result.sessionsDeleted} old sessions, ${result.outputsDeleted} output chunks removed`);
   }
+
+  // Enforce size limit
+  enforceDbSizeLimit();
 }, 5000);
 
-// Schedule periodic cleanup (every 6 hours)
-setInterval(() => {
-  cleanupOldData(3);
-}, 6 * 60 * 60 * 1000);
+// Schedule periodic cleanup (every 30 minutes instead of 6 hours)
+let _periodicCleanupInterval = setInterval(() => {
+  try {
+    cleanupOldData(1);
+    cleanupOrphanedSessions(12); // Catch sessions orphaned mid-run (not just at startup)
+    enforceDbSizeLimit();
+  } catch (err) {
+    console.error('[WorkerOutputDb] Periodic cleanup failed:', err.message);
+  }
+  // Checkpoint WAL to prevent unbounded WAL growth
+  // Escalate to RESTART if PASSIVE leaves too many pages uncheckpointed (active readers block PASSIVE)
+  try {
+    const walResult = db.pragma('wal_checkpoint(PASSIVE)');
+    const walInfo = walResult[0];
+    if (walInfo && walInfo.log > 1000 && walInfo.checkpointed < walInfo.log) {
+      db.pragma('wal_checkpoint(RESTART)');
+    }
+  } catch (e) { /* best effort */ }
+}, 30 * 60 * 1000);
+if (_periodicCleanupInterval.unref) _periodicCleanupInterval.unref();
+
+let _dbClosed = false;
+export function closeDatabase() {
+  if (_startupCleanupTimer) {
+    clearTimeout(_startupCleanupTimer);
+    _startupCleanupTimer = null;
+  }
+  if (_periodicCleanupInterval) {
+    clearInterval(_periodicCleanupInterval);
+    _periodicCleanupInterval = null;
+  }
+  if (_dbClosed) return;
+  _dbClosed = true;
+  try {
+    db.pragma('wal_checkpoint(TRUNCATE)');
+    db.close();
+    console.log('[WorkerOutputDb] Database closed cleanly');
+  } catch (err) {
+    console.error('[WorkerOutputDb] Error closing database:', err.message);
+  }
+}
 
 export default {
   startSession,
@@ -533,7 +670,8 @@ export default {
   getSessionFullOutput,
   cleanupOldData,
   cleanupOrphanedSessions,
+  enforceDbSizeLimit,
   getStats,
   getSession,
-  updateSessionTask
+  closeDatabase
 };

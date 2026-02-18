@@ -28,10 +28,10 @@ PORT=""
 INSTALL_SERVICE=false
 
 echo -e "${BOLD}${BLUE}"
-echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║                     Strategos Installer                       ║"
-echo "║            Multi-provider AI Orchestrator                     ║"
-echo "╚══════════════════════════════════════════════════════════════╝"
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║                   Strategos Installer                    ║"
+echo "║          Multi-provider AI Orchestrator                  ║"
+echo "╚════════════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 
 # ============================================
@@ -53,16 +53,16 @@ echo -e "  ${GREEN}✓${NC} Operating System: $OS_TYPE"
 if ! command -v node &> /dev/null; then
     echo -e "  ${RED}✗${NC} Node.js not found"
     echo ""
-    echo -e "${YELLOW}Node.js 18+ is required. Install from:${NC}"
+    echo -e "${YELLOW}Node.js 20+ is required. Install from:${NC}"
     echo "  https://nodejs.org/"
     echo "  or via nvm: https://github.com/nvm-sh/nvm"
     exit 1
 fi
 
 NODE_VERSION=$(node --version | cut -d'v' -f2 | cut -d'.' -f1)
-if [ "$NODE_VERSION" -lt 18 ]; then
+if [ "$NODE_VERSION" -lt 20 ]; then
     echo -e "  ${RED}✗${NC} Node.js version $(node --version) is too old"
-    echo -e "${YELLOW}Node.js 18+ is required${NC}"
+    echo -e "${YELLOW}Node.js 20+ is required${NC}"
     exit 1
 fi
 echo -e "  ${GREEN}✓${NC} Node.js $(node --version)"
@@ -327,33 +327,22 @@ echo -e "  Installing Node.js dependencies..."
 cd "$INSTALL_DIR"
 npm install --production 2>&1 | grep -E "(added|removed|audited)" || true
 
-# Create config file
+# Create config files
 echo -e "  Creating configuration..."
+
+# Core config: projects root (read by server/setup.js at startup)
+cat > "$INSTALL_DIR/config/strategos.env" << EOF
+THEA_ROOT=$PROJECTS_DIR
+EOF
+chmod 600 "$INSTALL_DIR/config/strategos.env"
+
+# Extended config
 cat > "$INSTALL_DIR/config/strategos.json" << EOF
 {
-  "version": "1.0.0",
+  "version": "2.0.0",
   "port": $PORT,
   "projectsRoot": "$PROJECTS_DIR",
   "dataDir": "$INSTALL_DIR/data",
-
-  "providers": {
-    "workers": {
-      "default": "claude",
-      "available": ["claude"$([ -n "$OPENAI_KEY" ] && echo ', "openai"')$([ -n "$GEMINI_KEY" ] && echo ', "gemini"')],
-      "openai": { "model": "gpt-4o" },
-      "gemini": { "model": "gemini-2.0-flash" }
-    },
-    "api": {
-      "default": "$([ "$ENABLE_SUMMARIES" = true ] && echo "ollama" || echo "none")",
-      "ollama": {
-        "url": "$OLLAMA_URL",
-        "model": "$SUMMARY_MODEL"
-      },
-      "openai": { "model": "gpt-4o-mini" },
-      "gemini": { "model": "gemini-1.5-flash" }
-    }
-  },
-
   "features": {
     "summaries": $ENABLE_SUMMARIES
   }
@@ -363,12 +352,18 @@ EOF
 # Create .env file for secrets
 echo -e "  Creating secrets file..."
 cat > "$INSTALL_DIR/.env" << EOF
-# Strategos API Keys
-# Keep this file secure - do not commit to version control
+# Strategos Environment
+# Keep this file secure — do not commit to version control
 
-$([ -n "$OPENAI_KEY" ] && echo "OPENAI_API_KEY=$OPENAI_KEY")
+PORT=$PORT
+THEA_ROOT=$PROJECTS_DIR
+NODE_ENV=production
+
 $([ -n "$GEMINI_KEY" ] && echo "GEMINI_API_KEY=$GEMINI_KEY")
 $([ -n "$ANTHROPIC_KEY" ] && echo "ANTHROPIC_API_KEY=$ANTHROPIC_KEY")
+$([ "$ENABLE_SUMMARIES" = true ] && echo "ENABLE_OLLAMA_SUMMARIES=true")
+$([ "$ENABLE_SUMMARIES" = true ] && echo "OLLAMA_URL=$OLLAMA_URL")
+$([ "$ENABLE_SUMMARIES" = true ] && echo "SUMMARY_MODEL=$SUMMARY_MODEL")
 EOF
 chmod 600 "$INSTALL_DIR/.env"
 
@@ -379,19 +374,29 @@ if [ "$INSTALL_SERVICE" = true ]; then
     if [ "$OS_TYPE" = "Linux" ]; then
         # systemd user service
         mkdir -p "$HOME/.config/systemd/user"
+        NODE_PATH="$(dirname "$(which node)")"
         cat > "$HOME/.config/systemd/user/strategos.service" << EOF
 [Unit]
 Description=Strategos AI Orchestrator
 After=network.target
+StartLimitBurst=10
+StartLimitIntervalSec=300
 
 [Service]
 Type=simple
 WorkingDirectory=$INSTALL_DIR
-ExecStart=/usr/bin/node server/index.js
+ExecStart=$(which node) server/index.js
 Restart=on-failure
 RestartSec=10
+TimeoutStopSec=20
+KillMode=process
+
 Environment=NODE_ENV=production
-Environment=STRATEGOS_CONFIG=$INSTALL_DIR/config/strategos.json
+Environment=PORT=$PORT
+Environment=THEA_ROOT=$PROJECTS_DIR
+Environment=TERM=xterm-256color
+Environment=HOME=$HOME
+Environment=PATH=$NODE_PATH:/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=default.target
@@ -457,9 +462,9 @@ echo ""
 # ============================================
 
 echo -e "${GREEN}"
-echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║                Installation Complete!                         ║"
-echo "╚══════════════════════════════════════════════════════════════╝"
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║                Installation Complete!                    ║"
+echo "╚════════════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 
 echo "Next steps:"
@@ -484,5 +489,5 @@ echo "  4. Or use the CLI:"
 echo "     strategos-worker list"
 echo "     strategos-worker spawn ~/my-project \"IMPL: My Task\""
 echo ""
-echo "Documentation: https://github.com/YOUR_USERNAME/strategos"
+echo "Documentation: https://github.com/drewrad8/strategos"
 echo ""
