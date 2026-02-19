@@ -453,8 +453,13 @@ export function createWorkerRoutes(theaRoot, io) {
       // Default autoAccept and ralphMode to TRUE for all spawns
       options.autoAccept = autoAccept !== false; // true unless explicitly false
       options.ralphMode = ralphMode !== false;   // true unless explicitly false
-      // Backend selection: 'claude' (default) or 'gemini'
-      if (backend === 'gemini') options.backend = 'gemini';
+      // Backend selection: explicit > parent inheritance > 'claude' default
+      if (backend === 'gemini') {
+        options.backend = 'gemini';
+      } else if (!backend && validParentWorkerId) {
+        const parentWorker = getWorker(validParentWorkerId);
+        if (parentWorker?.backend === 'gemini') options.backend = 'gemini';
+      }
       // Duplicate detection is ON by default — callers must opt-in to duplicates
       options.allowDuplicate = allowDuplicate === true;
 
@@ -641,10 +646,12 @@ export function createWorkerRoutes(theaRoot, io) {
           };
 
       // Spawn with template settings
+      // Backend priority: template explicit > parent inheritance > 'claude' default
+      const resolvedBackend = tmpl.backend || (parent?.backend === 'gemini' ? 'gemini' : 'claude');
       const options = {
         autoAccept: tmpl.autoAccept,
         ralphMode: tmpl.ralphMode,
-        backend: tmpl.backend || 'claude',
+        backend: resolvedBackend,
         task: taskObj,
         parentWorkerId,
         parentLabel: parent?.label,
