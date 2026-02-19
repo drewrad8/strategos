@@ -629,6 +629,23 @@ Spawned by ${escapePromptXml(parentWorkerId)}${parentLabel ? ` (${escapePromptXm
 Report back: \`curl -s -X POST ${STRATEGOS_API}/api/workers/${escapePromptXml(parentWorkerId)}/input -H "Content-Type: application/json" -d '{"input":"your message","fromWorkerId":"${escapePromptXml(workerId)}"}'\`
 ` : '';
 
+  const bulldozeSection = bulldozeMode ? `
+## Bulldoze Mode
+
+BULLDOZE MODE is ACTIVE. The orchestrator automatically sends continuation prompts when you go idle.
+
+Your persistent state file: \`${escapePromptXml(projectPath)}/tmp/bulldoze-state-${workerId}.md\`
+
+After completing each task:
+1. Update the state file: mark completed items, add new discoveries, set next priorities
+2. Git commit your changes with descriptive messages
+3. If stuck 3 times on the same item, skip it — mark as "SKIPPED: [reason]" and move on
+4. Periodically audit: git log, test results, codebase health — discover new work
+5. If no more work exists, write "## Status: EXHAUSTED" in the state file
+
+State file format: "## Current" (active), "## Backlog" (prioritized TODO), "## Completed" (with commit hashes), "## Learnings" (patterns to remember across compactions), "Compaction Count: N".
+` : '';
+
   const authorityLine = (isGeneral || isColonel) ?
     `**Operational Authority:** Full autonomy within ${escapePromptXml(THEA_ROOT)}/. Make decisions and act. Escalate to the human ONLY for: missing credentials, required payments, or physical access.` :
     `**Operational Authority:** You are authorized to run scripts, install packages, and modify code within ${escapePromptXml(THEA_ROOT)}/. Act within your task scope.`;
@@ -641,7 +658,7 @@ ${authorityLine}
 
 Worker ID: ${workerId} | Label: ${escapePromptXml(workerLabel)} | Role: ${workerRole}
 Project: ${escapePromptXml(projectName)} | Dir: ${escapePromptXml(projectPath)}
-${missionSection}${parentSection}${ralphSection}
+${missionSection}${parentSection}${bulldozeSection}${ralphSection}
 ## API Best Practices
 
 When calling Strategos API endpoints with curl, ALWAYS save to a temp file first:

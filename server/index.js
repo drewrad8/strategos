@@ -7,10 +7,6 @@ import rateLimit from 'express-rate-limit';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-// IMPORTANT: setup.js must be imported FIRST — it reads config/strategos.env
-// and sets process.env.THEA_ROOT before state.js evaluates.
-import { getConfiguredRoot, mountSetupRoutes } from './setup.js';
-
 import { createRoutes } from './routes.js';
 import { createIntegrationRoutes } from './routes/integration.js';
 import { createADRRoutes } from './routes/adrs.js';
@@ -38,7 +34,7 @@ let globalStatusWriter = null;
 let globalHttpServer = null;
 let globalIo = null;
 
-// Configuration — default port 38007
+// Configuration - Thea Kingdom port convention: 380XX
 // Server: 38007, Client: 38008 (see /docs/PORT_REGISTRY.md)
 const PORT = parseInt(process.env.PORT || '38007', 10);
 if (isNaN(PORT) || PORT < 1 || PORT > 65535) {
@@ -107,24 +103,6 @@ async function main() {
     theaRoot: THEA_ROOT
   });
 
-  // First-run setup check: if no projects root is configured, start in setup mode.
-  // This serves a minimal setup page to let the user configure their projects directory.
-  const configuredRoot = getConfiguredRoot();
-  if (!configuredRoot && !process.env.THEA_ROOT) {
-    log.info('No projects root configured — starting in setup mode');
-    const setupApp = express();
-    const setupServer = createServer(setupApp);
-    setupApp.use(express.json());
-    setupApp.use(express.static(path.join(__dirname, '..', 'client', 'dist')));
-    mountSetupRoutes(setupApp);
-    setupServer.listen(PORT, HOST, () => {
-      log.info(`Setup server running at http://${HOST}:${PORT}/setup`);
-      console.log(`\n  Strategos needs initial configuration.`);
-      console.log(`  Open http://localhost:${PORT}/setup in your browser.\n`);
-    });
-    return; // Don't start the full server
-  }
-
   // Check tmux availability
   const hasTmux = await checkTmux();
   if (!hasTmux) {
@@ -134,7 +112,7 @@ async function main() {
     process.exit(1);
   }
 
-  log.info('Strategos Server starting');
+  log.info('Thea Orchestrator Server starting');
   log.info('Configuration', { THEA_ROOT, PORT, HOST, CLIENT_ORIGIN });
   logAuthStatus();
 
