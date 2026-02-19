@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
+import { DB_JOURNAL_SIZE_LIMIT, DB_BUSY_TIMEOUT } from './validation.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -19,9 +20,9 @@ const db = new Database(DB_PATH);
 
 // Enable WAL mode for better concurrent read/write performance
 db.pragma('journal_mode = WAL');
-db.pragma('journal_size_limit = 50000000'); // 50MB WAL limit
+db.pragma(`journal_size_limit = ${DB_JOURNAL_SIZE_LIMIT}`);
 db.pragma('foreign_keys = ON');
-db.pragma('busy_timeout = 5000');
+db.pragma(`busy_timeout = ${DB_BUSY_TIMEOUT}`);
 
 // Create tables for worker output persistence
 db.exec(`

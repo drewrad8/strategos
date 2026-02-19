@@ -8,6 +8,7 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
+import { DB_JOURNAL_SIZE_LIMIT, DB_BUSY_TIMEOUT } from './validation.js';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -189,8 +190,8 @@ class Logger {
 
     this.db = new Database(this.dbPath);
     this.db.pragma('journal_mode = WAL');
-    this.db.pragma('journal_size_limit = 50000000'); // 50MB WAL limit
-    this.db.pragma('busy_timeout = 5000'); // 5s wait for locks (matches other DBs)
+    this.db.pragma(`journal_size_limit = ${DB_JOURNAL_SIZE_LIMIT}`);
+    this.db.pragma(`busy_timeout = ${DB_BUSY_TIMEOUT}`);
 
     // Create server_logs table
     this.db.exec(`

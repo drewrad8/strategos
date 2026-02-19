@@ -11,7 +11,11 @@ import {
 import { projectExists, safeResolvePath } from '../projectScanner.js';
 import { getQuickStatus, getWorkerContext } from '../summaryService.js';
 import { sanitizeErrorMessage } from '../errorUtils.js';
-import { CONTROL_CHAR_RE, VALID_WORKER_ID } from '../validation.js';
+import {
+  CONTROL_CHAR_RE, VALID_WORKER_ID,
+  MAX_PROMPT_LENGTH, MAX_SYSTEM_PROMPT_LENGTH,
+  MIN_TIMEOUT_MS, MAX_TIMEOUT_MS
+} from '../validation.js';
 
 /**
  * Integration routes for thea-architect to control workers
@@ -60,8 +64,8 @@ export function createIntegrationRoutes(theaRoot, io) {
       if (!prompt || typeof prompt !== 'string') {
         return res.status(400).json({ error: 'prompt is required and must be a string' });
       }
-      if (prompt.length > 50000) {
-        return res.status(400).json({ error: 'prompt exceeds maximum length (50KB)' });
+      if (prompt.length > MAX_PROMPT_LENGTH) {
+        return res.status(400).json({ error: `prompt exceeds maximum length (${MAX_PROMPT_LENGTH} chars)` });
       }
 
       // Validate optional fields
@@ -73,8 +77,8 @@ export function createIntegrationRoutes(theaRoot, io) {
           return res.status(400).json({ error: 'label must not contain control characters' });
         }
       }
-      if (systemPrompt !== undefined && (typeof systemPrompt !== 'string' || systemPrompt.length > 32768)) {
-        return res.status(400).json({ error: 'systemPrompt must be a string under 32KB' });
+      if (systemPrompt !== undefined && (typeof systemPrompt !== 'string' || systemPrompt.length > MAX_SYSTEM_PROMPT_LENGTH)) {
+        return res.status(400).json({ error: `systemPrompt must be a string under ${MAX_SYSTEM_PROMPT_LENGTH} characters` });
       }
       if (workerId !== undefined && (typeof workerId !== 'string' || !VALID_WORKER_ID.test(workerId))) {
         return res.status(400).json({ error: 'Invalid workerId format' });
@@ -83,8 +87,8 @@ export function createIntegrationRoutes(theaRoot, io) {
       if (outputFormat && !VALID_OUTPUT_FORMATS.includes(outputFormat)) {
         return res.status(400).json({ error: `outputFormat must be one of: ${VALID_OUTPUT_FORMATS.join(', ')}` });
       }
-      if (timeout !== undefined && (typeof timeout !== 'number' || timeout < 1000 || timeout > 600000)) {
-        return res.status(400).json({ error: 'timeout must be between 1000 and 600000 ms' });
+      if (timeout !== undefined && (typeof timeout !== 'number' || timeout < MIN_TIMEOUT_MS || timeout > MAX_TIMEOUT_MS)) {
+        return res.status(400).json({ error: `timeout must be between ${MIN_TIMEOUT_MS} and ${MAX_TIMEOUT_MS} ms` });
       }
 
       // Resolve project path safely (prevents path traversal outside theaRoot)
@@ -250,12 +254,12 @@ export function createIntegrationRoutes(theaRoot, io) {
       if (!prompt || typeof prompt !== 'string') {
         return res.status(400).json({ error: 'prompt is required and must be a string' });
       }
-      if (prompt.length > 50000) {
-        return res.status(400).json({ error: 'prompt exceeds maximum length (50KB)' });
+      if (prompt.length > MAX_PROMPT_LENGTH) {
+        return res.status(400).json({ error: `prompt exceeds maximum length (${MAX_PROMPT_LENGTH} chars)` });
       }
 
-      if (systemPrompt !== undefined && (typeof systemPrompt !== 'string' || systemPrompt.length > 32768)) {
-        return res.status(400).json({ error: 'systemPrompt must be a string under 32KB' });
+      if (systemPrompt !== undefined && (typeof systemPrompt !== 'string' || systemPrompt.length > MAX_SYSTEM_PROMPT_LENGTH)) {
+        return res.status(400).json({ error: `systemPrompt must be a string under ${MAX_SYSTEM_PROMPT_LENGTH} characters` });
       }
 
       const VALID_OUTPUT_FORMATS = ['json', 'text', 'stream-json'];
@@ -263,8 +267,8 @@ export function createIntegrationRoutes(theaRoot, io) {
         return res.status(400).json({ error: `outputFormat must be one of: ${VALID_OUTPUT_FORMATS.join(', ')}` });
       }
 
-      if (timeout !== undefined && (typeof timeout !== 'number' || timeout < 1000 || timeout > 600000)) {
-        return res.status(400).json({ error: 'timeout must be between 1000 and 600000 ms' });
+      if (timeout !== undefined && (typeof timeout !== 'number' || timeout < MIN_TIMEOUT_MS || timeout > MAX_TIMEOUT_MS)) {
+        return res.status(400).json({ error: `timeout must be between ${MIN_TIMEOUT_MS} and ${MAX_TIMEOUT_MS} ms` });
       }
 
       const MAX_CONCURRENCY = 20;

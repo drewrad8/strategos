@@ -42,10 +42,9 @@ import {
 import { sanitizeErrorMessage } from '../errorUtils.js';
 import {
   VALID_WORKER_ID, VALID_SIMPLE_ID, CONTROL_CHAR_RE,
-  MAX_TASK_LENGTH, MAX_LABEL_LENGTH, MAX_INPUT_LENGTH, isValidSessionId
+  MAX_TASK_LENGTH, MAX_LABEL_LENGTH, MAX_INPUT_LENGTH, MAX_PROMPT_LENGTH,
+  isValidSessionId
 } from '../validation.js';
-
-const VALID_SESSION_ID = (n) => isValidSessionId(n) && n < 2147483647;
 
 // =============================================
 // SPAWN TEMPLATES - Simplified worker spawning
@@ -962,8 +961,8 @@ curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Co
       if (!prompt || typeof prompt !== 'string') {
         return res.status(400).json({ error: 'prompt is required' });
       }
-      if (prompt.length > 50000) {
-        return res.status(400).json({ error: 'prompt must be under 50000 characters' });
+      if (prompt.length > MAX_PROMPT_LENGTH) {
+        return res.status(400).json({ error: `prompt must be under ${MAX_PROMPT_LENGTH} characters` });
       }
       if (systemPrompt !== undefined && (typeof systemPrompt !== 'string' || systemPrompt.length > 10000)) {
         return res.status(400).json({ error: 'systemPrompt must be a string under 10000 characters' });
@@ -1041,7 +1040,7 @@ curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Co
       const limit = Math.min(parseInt(req.query.limit, 10) || 100, 1000);
       const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
       const rawSessionId = req.query.sessionId ? parseInt(req.query.sessionId, 10) : null;
-      const sessionId = (rawSessionId !== null && VALID_SESSION_ID(rawSessionId)) ? rawSessionId : null;
+      const sessionId = (rawSessionId !== null && isValidSessionId(rawSessionId)) ? rawSessionId : null;
 
       const history = getWorkerHistory(workerId, { limit, offset, sessionId });
       res.json(history);
