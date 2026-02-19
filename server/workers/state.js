@@ -205,6 +205,8 @@ export function validateSessionName(name) {
 const QUIET_TMUX_COMMANDS = new Set(['capture-pane', 'has-session']);
 export const TMUX_SOCKET = 'strategos';
 
+const TMUX_TIMEOUT_MS = 30_000; // 30s timeout for tmux commands
+
 export function spawnTmux(args) {
   return new Promise((resolve, reject) => {
     const fullArgs = ['-L', TMUX_SOCKET, ...args];
@@ -221,11 +223,22 @@ export function spawnTmux(args) {
     const proc = spawn('tmux', fullArgs, { stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
+    let settled = false;
+
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { proc.kill('SIGKILL'); } catch { /* already dead */ }
+      reject(new Error(`tmux command timed out after ${TMUX_TIMEOUT_MS / 1000}s: tmux ${args.join(' ')}`));
+    }, TMUX_TIMEOUT_MS);
 
     proc.stdout.on('data', data => stdout += data.toString());
     proc.stderr.on('data', data => stderr += data.toString());
 
     proc.on('close', code => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
       if (!isQuiet || code !== 0) {
         console.log(`[spawnTmux] Exited with code ${code}${stderr ? `, stderr: ${stderr}` : ''}`);
       }
@@ -237,6 +250,9 @@ export function spawnTmux(args) {
     });
 
     proc.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
       console.error(`[spawnTmux] Error:`, err);
       reject(err);
     });
