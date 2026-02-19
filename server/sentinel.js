@@ -23,6 +23,12 @@ const TMUX_SOCKET = 'strategos';
 const SENTINEL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const MAX_HISTORY = 288; // 24h at 5min intervals
 
+// Memory and event loop thresholds
+const RSS_ERROR_MB = 500;
+const RSS_WARNING_MB = 300;
+const EVENT_LOOP_WARNING_MS = 100;
+const EVENT_LOOP_ERROR_MS = 500;
+
 let _interval = null;
 let _history = [];
 let _lastResult = null;
@@ -67,16 +73,16 @@ export async function runDiagnostics() {
     nodeVersion: process.version,
   };
 
-  if (rssMB > 500) issues.push(`High RSS memory: ${rssMB}MB (threshold 500MB)`);
-  else if (rssMB > 300) warnings.push(`Elevated RSS memory: ${rssMB}MB`);
+  if (rssMB > RSS_ERROR_MB) issues.push(`High RSS memory: ${rssMB}MB (threshold ${RSS_ERROR_MB}MB)`);
+  else if (rssMB > RSS_WARNING_MB) warnings.push(`Elevated RSS memory: ${rssMB}MB`);
 
   // Event loop lag (rough check)
   const lagStart = Date.now();
   await new Promise(r => setImmediate(r));
   const lagMs = Date.now() - lagStart;
   checks.process.eventLoopLagMs = lagMs;
-  if (lagMs > 100) warnings.push(`Event loop lag: ${lagMs}ms`);
-  if (lagMs > 500) issues.push(`Critical event loop lag: ${lagMs}ms`);
+  if (lagMs > EVENT_LOOP_WARNING_MS) warnings.push(`Event loop lag: ${lagMs}ms`);
+  if (lagMs > EVENT_LOOP_ERROR_MS) issues.push(`Critical event loop lag: ${lagMs}ms`);
 
   // --- Worker Coherence ---
   const workers = getWorkers();

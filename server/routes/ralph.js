@@ -50,12 +50,12 @@ export function createRalphRoutes(ralphService) {
       }
 
       // Validate string fields — cap sizes to prevent data amplification
-      const MAX_FIELD = 2000;
-      if (currentStep !== undefined && (typeof currentStep !== 'string' || currentStep.length > MAX_FIELD)) {
-        return res.status(400).json({ error: `currentStep must be a string (max ${MAX_FIELD} chars)` });
+      const MAX_SIGNAL_FIELD = 2000;
+      if (currentStep !== undefined && (typeof currentStep !== 'string' || currentStep.length > MAX_SIGNAL_FIELD)) {
+        return res.status(400).json({ error: `currentStep must be a string (max ${MAX_SIGNAL_FIELD} chars)` });
       }
-      if (reason !== undefined && (typeof reason !== 'string' || reason.length > MAX_FIELD)) {
-        return res.status(400).json({ error: `reason must be a string (max ${MAX_FIELD} chars)` });
+      if (reason !== undefined && (typeof reason !== 'string' || reason.length > MAX_SIGNAL_FIELD)) {
+        return res.status(400).json({ error: `reason must be a string (max ${MAX_SIGNAL_FIELD} chars)` });
       }
       if (learnings !== undefined && (typeof learnings !== 'string' || learnings.length > 10000)) {
         return res.status(400).json({ error: 'learnings must be a string (max 10000 chars)' });
