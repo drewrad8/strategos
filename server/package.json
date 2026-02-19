@@ -1,7 +1,7 @@
 {
-  "name": "strategos-server",
+  "name": "thea-orchestrator-server",
   "version": "1.0.0",
-  "description": "Strategos orchestrator server",
+  "description": "Server for Thea Orchestrator",
   "main": "index.js",
   "type": "module",
   "scripts": {
