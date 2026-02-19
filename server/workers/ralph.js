@@ -223,7 +223,8 @@ export function updateWorkerRalphStatus(workerId, signalData, io = null) {
   }
 
   // 2. Parent self-check: worker with all children done + progress >= 80
-  if (!autoPromoted && status === 'in_progress' && worker.ralphProgress >= 80) {
+  // Skip persistent tiers (GENERAL/COLONEL) — they manage their own lifecycle
+  if (!autoPromoted && status === 'in_progress' && worker.ralphProgress >= 80 && !isPersistentTier(worker)) {
     const childIds = worker.childWorkerIds || [];
     if (childIds.length > 0) {
       const children = childIds.map(cid => workers.get(cid)).filter(Boolean);
@@ -365,8 +366,10 @@ function _updateParentAggregation(parentWorkerId, io) {
   }
 
   // Auto-promote parent to done when ALL children are done and parent is at >= 80%
+  // Skip persistent tiers (GENERAL/COLONEL) — they manage their own lifecycle
   if (doneCount === children.length && parent.ralphStatus !== 'done' &&
-      parent.status !== 'awaiting_review' && (parent.ralphProgress >= 80 || avgProgress >= 100)) {
+      parent.status !== 'awaiting_review' && !isPersistentTier(parent) &&
+      (parent.ralphProgress >= 80 || avgProgress >= 100)) {
     parent.ralphProgress = 100;
     parent.ralphStatus = 'done';
     parent.ralphSignaledAt = new Date();
