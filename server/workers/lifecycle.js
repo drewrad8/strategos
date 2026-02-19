@@ -50,6 +50,7 @@ import {
   canWorkerStart,
   registerWorkflowWorker,
 } from '../dependencyGraph.js';
+import { MAX_SYSTEM_PROMPT_LENGTH, MAX_TIMEOUT_MS } from '../validation.js';
 
 // ============================================
 // WORKER INITIALIZATION
@@ -1204,9 +1205,8 @@ export async function runHeadless(projectPath, prompt, options = {}) {
     timeout: rawTimeout = 300000
   } = options;
 
-  const MAX_HEADLESS_TIMEOUT = 600000;
   const timeout = (typeof rawTimeout === 'number' && Number.isFinite(rawTimeout) && rawTimeout > 0)
-    ? Math.min(rawTimeout, MAX_HEADLESS_TIMEOUT)
+    ? Math.min(rawTimeout, MAX_TIMEOUT_MS)
     : 300000;
 
   const stats = await fs.stat(projectPath).catch(() => null);
@@ -1219,8 +1219,8 @@ export async function runHeadless(projectPath, prompt, options = {}) {
     throw new Error(`Invalid output format: ${outputFormat}`);
   }
 
-  if (systemPrompt && systemPrompt.length > 32768) {
-    throw new Error('systemPrompt exceeds maximum length (32KB)');
+  if (systemPrompt && systemPrompt.length > MAX_SYSTEM_PROMPT_LENGTH) {
+    throw new Error(`systemPrompt exceeds maximum length (${MAX_SYSTEM_PROMPT_LENGTH} chars)`);
   }
 
   return new Promise((resolve, reject) => {

@@ -23,10 +23,27 @@ export const MAX_LABEL_LENGTH = 200;
 /** Max task/prompt length sent to workers */
 export const MAX_TASK_LENGTH = 10000;
 
+/** Max prompt length for headless/batch/integration endpoints */
+export const MAX_PROMPT_LENGTH = 50000;
+
+/** Max system prompt length */
+export const MAX_SYSTEM_PROMPT_LENGTH = 32768;
+
 /** Max input length for worker stdin (1MB) */
 export const MAX_INPUT_LENGTH = 1024 * 1024;
 
-/** Validate that a session ID is a positive integer */
+/** Timeout bounds for headless/batch operations (ms) */
+export const MIN_TIMEOUT_MS = 1000;
+export const MAX_TIMEOUT_MS = 600000;
+
+/** SQLite max integer (used for session ID range) */
+export const MAX_SESSION_ID = 2147483647;
+
+/** Database pragma defaults — shared across all SQLite instances */
+export const DB_JOURNAL_SIZE_LIMIT = 50000000; // 50MB WAL limit
+export const DB_BUSY_TIMEOUT = 5000; // 5s wait for locks
+
+/** Validate that a session ID is a positive integer within SQLite range */
 export function isValidSessionId(value) {
-  return Number.isFinite(value) && value > 0 && Number.isInteger(value);
+  return Number.isFinite(value) && value > 0 && Number.isInteger(value) && value < MAX_SESSION_ID;
 }

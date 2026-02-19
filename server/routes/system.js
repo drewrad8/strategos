@@ -48,10 +48,10 @@ import {
 } from '../metricsService.js';
 import { sanitizeErrorMessage } from '../errorUtils.js';
 import {
-  CONTROL_CHAR_RE, isValidSessionId
+  CONTROL_CHAR_RE, isValidSessionId,
+  MAX_PROMPT_LENGTH, MAX_SYSTEM_PROMPT_LENGTH,
+  MIN_TIMEOUT_MS, MAX_TIMEOUT_MS
 } from '../validation.js';
-
-const VALID_SESSION_ID = (n) => isValidSessionId(n) && n < 2147483647;
 
 // Helper function to format uptime in human-readable format
 function formatUptime(seconds) {
@@ -131,7 +131,7 @@ export function createSystemRoutes(theaRoot, io) {
   router.get('/sessions/:id', (req, res) => {
     try {
       const sessionId = parseInt(req.params.id, 10);
-      if (!VALID_SESSION_ID(sessionId)) {
+      if (!isValidSessionId(sessionId)) {
         return res.status(400).json({ error: 'Invalid session ID' });
       }
       const session = getSession(sessionId);
@@ -150,7 +150,7 @@ export function createSystemRoutes(theaRoot, io) {
   router.get('/sessions/:id/output', (req, res) => {
     try {
       const sessionId = parseInt(req.params.id, 10);
-      if (!VALID_SESSION_ID(sessionId)) {
+      if (!isValidSessionId(sessionId)) {
         return res.status(400).json({ error: 'Invalid session ID' });
       }
       const limit = Math.min(parseInt(req.query.limit, 10) || 100, 1000);
@@ -172,7 +172,7 @@ export function createSystemRoutes(theaRoot, io) {
   router.get('/sessions/:id/full-output', (req, res) => {
     try {
       const sessionId = parseInt(req.params.id, 10);
-      if (!VALID_SESSION_ID(sessionId)) {
+      if (!isValidSessionId(sessionId)) {
         return res.status(400).json({ error: 'Invalid session ID' });
       }
 
@@ -253,11 +253,11 @@ export function createSystemRoutes(theaRoot, io) {
       if (!projectPath || !prompt) {
         return res.status(400).json({ error: 'projectPath and prompt are required' });
       }
-      if (typeof prompt !== 'string' || prompt.length > 50000) {
-        return res.status(400).json({ error: 'prompt must be a string under 50000 characters' });
+      if (typeof prompt !== 'string' || prompt.length > MAX_PROMPT_LENGTH) {
+        return res.status(400).json({ error: `prompt must be a string under ${MAX_PROMPT_LENGTH} characters` });
       }
-      if (systemPrompt !== undefined && (typeof systemPrompt !== 'string' || systemPrompt.length > 10000)) {
-        return res.status(400).json({ error: 'systemPrompt must be a string under 10000 characters' });
+      if (systemPrompt !== undefined && (typeof systemPrompt !== 'string' || systemPrompt.length > MAX_SYSTEM_PROMPT_LENGTH)) {
+        return res.status(400).json({ error: `systemPrompt must be a string under ${MAX_SYSTEM_PROMPT_LENGTH} characters` });
       }
 
       // SECURITY: Safely resolve project path with traversal prevention
@@ -275,9 +275,8 @@ export function createSystemRoutes(theaRoot, io) {
       if (outputFormat && !VALID_OUTPUT_FORMATS.includes(outputFormat)) {
         return res.status(400).json({ error: `outputFormat must be one of: ${VALID_OUTPUT_FORMATS.join(', ')}` });
       }
-      // Validate timeout range (matches integration route validation)
-      if (timeout !== undefined && (typeof timeout !== 'number' || timeout < 1000 || timeout > 600000)) {
-        return res.status(400).json({ error: 'timeout must be between 1000 and 600000 ms' });
+      if (timeout !== undefined && (typeof timeout !== 'number' || timeout < MIN_TIMEOUT_MS || timeout > MAX_TIMEOUT_MS)) {
+        return res.status(400).json({ error: `timeout must be between ${MIN_TIMEOUT_MS} and ${MAX_TIMEOUT_MS} ms` });
       }
 
       const result = await runHeadless(resolvedPath, prompt, {
@@ -307,18 +306,18 @@ export function createSystemRoutes(theaRoot, io) {
       if (!prompt || typeof prompt !== 'string') {
         return res.status(400).json({ error: 'prompt is required and must be a string' });
       }
-      if (prompt.length > 50000) {
-        return res.status(400).json({ error: 'prompt must be under 50000 characters' });
+      if (prompt.length > MAX_PROMPT_LENGTH) {
+        return res.status(400).json({ error: `prompt must be under ${MAX_PROMPT_LENGTH} characters` });
       }
-      if (systemPrompt !== undefined && (typeof systemPrompt !== 'string' || systemPrompt.length > 10000)) {
-        return res.status(400).json({ error: 'systemPrompt must be a string under 10000 characters' });
+      if (systemPrompt !== undefined && (typeof systemPrompt !== 'string' || systemPrompt.length > MAX_SYSTEM_PROMPT_LENGTH)) {
+        return res.status(400).json({ error: `systemPrompt must be a string under ${MAX_SYSTEM_PROMPT_LENGTH} characters` });
       }
       const VALID_BATCH_FORMATS = ['json', 'text', 'stream-json'];
       if (outputFormat && !VALID_BATCH_FORMATS.includes(outputFormat)) {
         return res.status(400).json({ error: `outputFormat must be one of: ${VALID_BATCH_FORMATS.join(', ')}` });
       }
-      if (timeout !== undefined && (typeof timeout !== 'number' || timeout < 1000 || timeout > 600000)) {
-        return res.status(400).json({ error: 'timeout must be between 1000 and 600000 ms' });
+      if (timeout !== undefined && (typeof timeout !== 'number' || timeout < MIN_TIMEOUT_MS || timeout > MAX_TIMEOUT_MS)) {
+        return res.status(400).json({ error: `timeout must be between ${MIN_TIMEOUT_MS} and ${MAX_TIMEOUT_MS} ms` });
       }
 
       // SECURITY: Safely resolve project paths with traversal prevention
