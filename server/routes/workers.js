@@ -662,6 +662,15 @@ export function createWorkerRoutes(theaRoot, io) {
         }
       }
 
+      // Atomically enable bulldoze if requested (avoids two-step spawn + settings dance)
+      if (req.body.bulldozeMode) {
+        const bulldozeSettings = { bulldozeMode: true };
+        if (req.body.bulldozeMission) bulldozeSettings.bulldozeMission = String(req.body.bulldozeMission).slice(0, MAX_TASK_LENGTH);
+        if (req.body.bulldozeBacklog) bulldozeSettings.bulldozeBacklog = String(req.body.bulldozeBacklog).slice(0, MAX_TASK_LENGTH);
+        if (req.body.bulldozeStandingOrders) bulldozeSettings.bulldozeStandingOrders = String(req.body.bulldozeStandingOrders).slice(0, MAX_TASK_LENGTH);
+        updateWorkerSettings(worker.id, bulldozeSettings, io);
+      }
+
       // Build response — use normalizeWorker allowlist to strip internal fields (ralphToken etc.)
       const response = normalizeWorker(worker);
       if (!parentWorkerId) {

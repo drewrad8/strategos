@@ -630,6 +630,12 @@ async function teardownWorker(workerId, worker, io, { activityMessage, logPrefix
   removeWorkerDependencies(workerId);
   stopHealthMonitor(workerId);
 
+  // Clean up bulldoze state file if it exists
+  if (worker.workingDir) {
+    const bulldozeStatePath = path.join(worker.workingDir, 'tmp', `bulldoze-state-${workerId}.md`);
+    try { await fs.unlink(bulldozeStatePath); } catch { /* ENOENT is fine */ }
+  }
+
   console.log(`[${logPrefix}] Worker ${workerId} cleanup complete`);
 
   const activity = addActivity('worker_stopped', workerId, worker.label, worker.project,

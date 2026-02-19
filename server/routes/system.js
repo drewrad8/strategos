@@ -794,8 +794,10 @@ export function createSystemRoutes(theaRoot, io) {
       ralphProgress: data.ralphProgress ?? 0,
       ralphCurrentStep: data.ralphCurrentStep || '',
       ralphLearnings: data.ralphLearnings || '',
-      ralphOutputs: data.ralphOutputs || '',
-      ralphArtifacts: data.ralphArtifacts || '',
+      ralphOutputs: Array.isArray(data.ralphOutputs) ? data.ralphOutputs
+        : (typeof data.ralphOutputs === 'string' && data.ralphOutputs ? [data.ralphOutputs] : []),
+      ralphArtifacts: Array.isArray(data.ralphArtifacts) ? data.ralphArtifacts
+        : (typeof data.ralphArtifacts === 'string' && data.ralphArtifacts ? [data.ralphArtifacts] : []),
       parentLabel: data.parentLabel || '',
       crashReason: data.crashReason || '',
     };
@@ -845,19 +847,13 @@ export function createSystemRoutes(theaRoot, io) {
   });
 
   // ─── Claude Usage / Rate Limits ──────────────────────────────────────────────
-  // SECURITY: This endpoint reads ~/.claude/.credentials.json to check rate limits.
-  // Disabled by default to prevent credential exposure. Enable with:
-  //   STRATEGOS_EXPOSE_CREDENTIALS=true
+  // Reads ~/.claude/.credentials.json server-side to check rate limits via Anthropic API.
+  // Only rate limit utilization data is returned to client — no tokens or credentials are exposed.
   let _usageCache = null;
   let _usageCacheTime = 0;
   const USAGE_CACHE_TTL = 60_000; // 60s
 
   router.get('/usage', async (req, res) => {
-    if (process.env.STRATEGOS_EXPOSE_CREDENTIALS !== 'true') {
-      return res.status(403).json({
-        error: 'Usage endpoint disabled. Set STRATEGOS_EXPOSE_CREDENTIALS=true to enable.'
-      });
-    }
 
     const now = Date.now();
     if (_usageCache && (now - _usageCacheTime) < USAGE_CACHE_TTL) {

@@ -12,6 +12,86 @@ import {
 
 import { isProtectedWorker } from './templates.js';
 import { sendInputDirect } from './output.js';
+import { getLogger } from '../logger.js';
+
+// Shared completion keyword regex — used for keyword-based auto-promotion.
+// Centralized here so ralph.js, health.js, and persistence.js all use the same pattern.
+const COMPLETION_RE = /\b(complete[d]?|done|finished|awaiting\s+(?:orders|further)|ready\s+for\s+next|all\b.*\bpassing)\b/i;
+
+/**
+ * Check if a worker is a persistent-tier worker (GENERAL/COLONEL) that should
+ * NOT be auto-promoted based on completion keywords (they use these words routinely).
+ */
+function isPersistentTier(worker) {
+  const upperLabel = (worker.label || '').toUpperCase();
+  return upperLabel.startsWith('GENERAL:') || upperLabel.startsWith('GENERAL ') ||
+    upperLabel.startsWith('COLONEL:') || upperLabel.startsWith('COL-') || upperLabel.startsWith('COL:');
+}
+
+/**
+ * Shared auto-promotion: checks if a worker should be promoted to "done" based on
+ * completion keywords in their currentStep, and if so, performs the full done-path
+ * transition: status change, parent delivery, parent aggregation, socket events.
+ *
+ * Called from: ralph.js (on signal), health.js (periodic sweep), persistence.js (on restore).
+ *
+ * @param {Object} worker - The worker object (from workers Map)
+ * @param {Object} io - Socket.io instance (nullable)
+ * @param {string} source - Caller identifier for logging (e.g. 'signal', 'health', 'restore')
+ * @returns {boolean} True if the worker was auto-promoted
+ */
+export function tryAutoPromoteWorker(worker, io, source = 'unknown') {
+  if (!worker) return false;
+  if (worker.ralphStatus !== 'in_progress') return false;
+  if (worker.ralphProgress == null || worker.ralphProgress < 90) return false;
+  if (!worker.ralphCurrentStep) return false;
+  if (isPersistentTier(worker)) return false;
+  if (!COMPLETION_RE.test(worker.ralphCurrentStep)) return false;
+
+  const workerId = worker.id;
+  getLogger().info(`Auto-promoted worker ${workerId} (${worker.label}) to done [${source}]`, { workerId, label: worker.label, source, currentStep: worker.ralphCurrentStep?.slice(0, 100) });
+
+  worker.ralphProgress = 100;
+  worker.ralphStatus = 'done';
+  worker.ralphSignaledAt = new Date();
+  worker.status = 'awaiting_review';
+  worker.awaitingReviewAt = new Date();
+
+  if (io) {
+    io.emit('worker:updated', normalizeWorker(worker));
+    io.emit('worker:awaiting_review', {
+      workerId,
+      label: worker.label,
+      learnings: worker.ralphLearnings,
+      outputs: worker.ralphOutputs,
+      artifacts: worker.ralphArtifacts,
+      parentWorkerId: worker.parentWorkerId,
+    });
+  }
+
+  // Deliver results to parent worker
+  if (worker.parentWorkerId) {
+    const resultSummary = [
+      `[RESULTS FROM ${worker.label} (${workerId})]`,
+      worker.ralphLearnings ? `Learnings: ${worker.ralphLearnings}` : null,
+      worker.ralphOutputs ? `Outputs: ${typeof worker.ralphOutputs === 'string' ? worker.ralphOutputs : JSON.stringify(worker.ralphOutputs)}` : null,
+      worker.ralphArtifacts ? `Artifacts: ${Array.isArray(worker.ralphArtifacts) ? worker.ralphArtifacts.join(', ') : worker.ralphArtifacts}` : null,
+      `Status: Complete (auto-promoted). Worker is alive for follow-up questions.`,
+      `To dismiss: curl -s -X POST ${STRATEGOS_API}/api/workers/${workerId}/dismiss`,
+    ].filter(Boolean).join('\n');
+
+    sendInputDirect(worker.parentWorkerId, resultSummary).catch(e => {
+      getLogger().warn(`Could not deliver auto-promoted results to parent ${worker.parentWorkerId}`, { workerId, parentWorkerId: worker.parentWorkerId, error: e.message });
+    });
+  }
+
+  // Update parent progress aggregation
+  if (worker.parentWorkerId) {
+    _updateParentAggregation(worker.parentWorkerId, io);
+  }
+
+  return true;
+}
 
 /**
  * Update a worker's Ralph status (called when worker signals).
@@ -23,7 +103,7 @@ import { sendInputDirect } from './output.js';
 export function updateWorkerRalphStatus(workerId, signalData, io = null) {
   const worker = workers.get(workerId);
   if (!worker) {
-    console.log(`[RalphStatus] Worker ${workerId} not found`);
+    getLogger().warn(`Worker ${workerId} not found for Ralph signal`, { workerId });
     return false;
   }
 
@@ -37,24 +117,36 @@ export function updateWorkerRalphStatus(workerId, signalData, io = null) {
   // Validate status — only known values are accepted
   const VALID_STATUSES = ['in_progress', 'done', 'blocked', 'pending'];
   if (!status || !VALID_STATUSES.includes(status)) {
-    console.warn(`[RalphStatus] Worker ${workerId} sent invalid status: ${JSON.stringify(status)}`);
+    getLogger().warn(`Worker ${workerId} sent invalid Ralph status`, { workerId, status });
     return false;
   }
 
   // Validate progress range if provided
   if (progress !== undefined && (typeof progress !== 'number' || progress < 0 || progress > 100)) {
-    console.warn(`[RalphStatus] Worker ${workerId} sent invalid progress: ${JSON.stringify(progress)}`);
+    getLogger().warn(`Worker ${workerId} sent invalid Ralph progress`, { workerId, progress });
     return false;
   }
 
   // Validate currentStep type if provided
   if (currentStep !== undefined && typeof currentStep !== 'string') {
-    console.warn(`[RalphStatus] Worker ${workerId} sent non-string currentStep`);
+    getLogger().warn(`Worker ${workerId} sent non-string Ralph currentStep`, { workerId });
     return false;
   }
 
   worker.ralphStatus = status;
   worker.lastActivity = new Date();
+
+  // If worker is in awaiting_review and signals in_progress, revert to running.
+  // This allows bulldoze to resume on workers that were previously done but got a new mission.
+  if (status === 'in_progress' && worker.status === 'awaiting_review') {
+    worker.status = 'running';
+    worker.awaitingReviewAt = null;
+    getLogger().info(`Worker ${workerId} (${worker.label}) reverted from awaiting_review → running (in_progress signal)`, { workerId, label: worker.label });
+  }
+
+  // Track that this worker has manually signaled (used to prevent child aggregation
+  // from overwriting manually-reported progress — see _updateParentAggregation)
+  worker._ralphManuallySignaled = true;
 
   // Efficiency tracking — count signals, track first signal time
   worker.ralphSignalCount = (worker.ralphSignalCount || 0) + 1;
@@ -68,6 +160,14 @@ export function updateWorkerRalphStatus(workerId, signalData, io = null) {
     worker.ralphSignaledAt = new Date();
   }
 
+  // Track blocked reason (P3 fix: was never stored before)
+  if (status === 'blocked') {
+    worker.ralphBlockedReason = (typeof reason === 'string' ? reason.slice(0, 2000) : null);
+  } else {
+    // Clear blocked reason when status changes away from blocked
+    worker.ralphBlockedReason = null;
+  }
+
   // Update optional fields if provided (with size caps to prevent memory bloat)
   if (progress !== undefined) worker.ralphProgress = progress;
   if (currentStep !== undefined) {
@@ -79,7 +179,7 @@ export function updateWorkerRalphStatus(workerId, signalData, io = null) {
   if (outputs !== undefined) {
     const outputStr = typeof outputs === 'string' ? outputs : JSON.stringify(outputs);
     if (outputStr.length > 100000) {
-      console.warn(`[RalphStatus] Outputs field for ${workerId} truncated (${outputStr.length} chars)`);
+      getLogger().warn(`Outputs field for ${workerId} truncated`, { workerId, length: outputStr.length });
     }
     if (typeof outputs === 'string') {
       worker.ralphOutputs = outputs.slice(0, 100000);
@@ -89,42 +189,37 @@ export function updateWorkerRalphStatus(workerId, signalData, io = null) {
       const sanitized = Array.isArray(outputs) ? outputs : Object.fromEntries(
         Object.entries(outputs).filter(([k]) => !DANGEROUS_KEYS.includes(k))
       );
-      worker.ralphOutputs = sanitized;
+      // P3 fix: enforce 100KB size cap on object outputs (was only capped for strings)
+      const sanitizedStr = JSON.stringify(sanitized);
+      if (sanitizedStr.length > 100000) {
+        getLogger().warn(`Object outputs for ${workerId} exceed 100KB — rejecting`, { workerId, length: sanitizedStr.length });
+        worker.ralphOutputs = { _truncated: true, _reason: `Object outputs exceeded 100KB limit (${sanitizedStr.length} chars)` };
+      } else {
+        worker.ralphOutputs = sanitized;
+      }
     } else {
       worker.ralphOutputs = outputs;
     }
   }
   if (artifacts !== undefined) {
     if (!Array.isArray(artifacts)) {
-      console.warn(`[RalphStatus] Worker ${workerId} sent non-array artifacts — ignoring`);
+      getLogger().warn(`Worker ${workerId} sent non-array artifacts — ignoring`, { workerId });
     } else if (artifacts.length > 100) {
-      console.warn(`[RalphStatus] Artifacts array for ${workerId} truncated (${artifacts.length} items)`);
+      getLogger().warn(`Artifacts array for ${workerId} truncated`, { workerId, length: artifacts.length });
       worker.ralphArtifacts = artifacts.slice(0, 100);
     } else {
       worker.ralphArtifacts = artifacts;
     }
   }
 
-  console.log(`[RalphStatus] Worker ${workerId} signaled: ${status}${progress !== undefined ? ` (${progress}%)` : ''}`);
+  getLogger().info(`Worker ${workerId} signaled: ${status}${progress !== undefined ? ` (${progress}%)` : ''}`, { workerId, status, progress });
 
   // === Auto-promotion: detect workers effectively done but not signaling it ===
   let autoPromoted = false;
 
-  // Persistent tiers (GENERAL, COLONEL) should NOT be auto-promoted based on completion keywords
-  const upperLabel = (worker.label || '').toUpperCase();
-  const isPersistentTier = upperLabel.startsWith('GENERAL:') || upperLabel.startsWith('GENERAL ') ||
-    upperLabel.startsWith('COLONEL:') || upperLabel.startsWith('COL-') || upperLabel.startsWith('COL:');
-
-  // 1. Keyword-based: worker at >= 90% with completion phrases in currentStep
-  if (!isPersistentTier && status === 'in_progress' && worker.ralphProgress >= 90 && worker.ralphCurrentStep) {
-    const COMPLETION_RE = /\b(complete[d]?|done|finished|awaiting\s+(?:orders|further)|ready\s+for\s+next|all\b.*\bpassing)\b/i;
-    if (COMPLETION_RE.test(worker.ralphCurrentStep)) {
-      worker.ralphProgress = 100;
-      worker.ralphStatus = 'done';
-      worker.ralphSignaledAt = new Date();
-      autoPromoted = true;
-      console.log(`[RalphStatus] Auto-promoted worker ${workerId} (${worker.label}) to done (completion keywords detected in: "${worker.ralphCurrentStep.slice(0, 100)}")`);
-    }
+  // 1. Keyword-based auto-promotion (uses shared tryAutoPromoteWorker)
+  if (status === 'in_progress') {
+    autoPromoted = tryAutoPromoteWorker(worker, io, 'signal');
   }
 
   // 2. Parent self-check: worker with all children done + progress >= 80
@@ -140,23 +235,24 @@ export function updateWorkerRalphStatus(workerId, signalData, io = null) {
         worker.ralphStatus = 'done';
         worker.ralphSignaledAt = new Date();
         autoPromoted = true;
-        console.log(`[RalphStatus] Auto-promoted worker ${workerId} (${worker.label}) to done (all ${children.length} children complete)`);
+        getLogger().info(`Auto-promoted worker ${workerId} (${worker.label}) to done (all ${children.length} children complete)`, { workerId, label: worker.label, childCount: children.length });
       }
     }
   }
 
-  // Emit update event
-  if (io) {
+  // Emit update event (if not already emitted by tryAutoPromoteWorker)
+  if (!autoPromoted && io) {
     io.emit('worker:updated', normalizeWorker(worker));
   }
 
-  // On "done": transition to awaiting_review
-  if (status === 'done' || autoPromoted) {
+  // On "done": transition to awaiting_review (only if not already handled by tryAutoPromoteWorker)
+  if ((status === 'done' || autoPromoted) && worker.status !== 'awaiting_review') {
     worker.status = 'awaiting_review';
     worker.awaitingReviewAt = new Date();
-    console.log(`[RalphStatus] Worker ${workerId} (${worker.label}) → awaiting_review`);
+    getLogger().info(`Worker ${workerId} (${worker.label}) → awaiting_review`, { workerId, label: worker.label });
 
     if (io) {
+      io.emit('worker:updated', normalizeWorker(worker));
       io.emit('worker:awaiting_review', {
         workerId,
         label: worker.label,
@@ -179,7 +275,7 @@ export function updateWorkerRalphStatus(workerId, signalData, io = null) {
       ].filter(Boolean).join('\n');
 
       sendInputDirect(worker.parentWorkerId, resultSummary).catch(e => {
-        console.warn(`[RalphStatus] Could not deliver results to parent ${worker.parentWorkerId}: ${e.message}`);
+        getLogger().warn(`Could not deliver results to parent ${worker.parentWorkerId}`, { workerId, parentWorkerId: worker.parentWorkerId, error: e.message });
       });
     }
   }
@@ -203,87 +299,105 @@ export function updateWorkerRalphStatus(workerId, signalData, io = null) {
 
   // Auto-update parent Ralph progress from aggregate of children's progress
   if (worker.parentWorkerId) {
-    const parent = workers.get(worker.parentWorkerId);
-    if (parent && parent.childWorkerIds && parent.childWorkerIds.length > 0) {
-      const children = parent.childWorkerIds
-        .map(cid => workers.get(cid))
-        .filter(Boolean);
-      if (children.length > 0) {
-        let totalProgress = 0;
-        let doneCount = 0;
-        const steps = [];
-        for (const child of children) {
-          const cp = child.ralphProgress || 0;
-          const cs = child.ralphStatus;
-          if (cs === 'done' || child.status === 'awaiting_review' || child.status === 'completed') {
-            totalProgress += 100;
-            doneCount++;
-          } else {
-            totalProgress += cp;
-            if (child.ralphCurrentStep) {
-              steps.push(`${child.label.slice(0, 30)}: ${child.ralphCurrentStep.slice(0, 60)}`);
-            }
-          }
-        }
-        const avgProgress = Math.round(totalProgress / children.length);
-        const stepSummary = doneCount === children.length
-          ? `All ${doneCount} children complete`
-          : `${doneCount}/${children.length} done` + (steps.length > 0 ? ` | ${steps[0]}` : '');
-
-        // Only auto-update if parent hasn't manually signaled recently (within 30s)
-        const parentLastSignal = parent.lastRalphSignalAt ? new Date(parent.lastRalphSignalAt).getTime() : 0;
-        const childDriven = !parentLastSignal || (Date.now() - parentLastSignal > 30000);
-        if (childDriven) {
-          parent.ralphProgress = avgProgress;
-          parent.ralphCurrentStep = stepSummary.slice(0, 500);
-          if (io) {
-            io.emit('worker:updated', normalizeWorker(parent));
-          }
-        }
-
-        // Auto-promote parent to done when ALL children are done and parent is at >= 80%
-        if (doneCount === children.length && parent.ralphStatus !== 'done' &&
-            parent.status !== 'awaiting_review' && (parent.ralphProgress >= 80 || avgProgress >= 100)) {
-          parent.ralphProgress = 100;
-          parent.ralphStatus = 'done';
-          parent.ralphSignaledAt = new Date();
-          parent.status = 'awaiting_review';
-          parent.awaitingReviewAt = new Date();
-          console.log(`[RalphStatus] Auto-promoted parent ${worker.parentWorkerId} (${parent.label}) to done (all ${children.length} children complete)`);
-          if (io) {
-            io.emit('worker:updated', normalizeWorker(parent));
-            io.emit('worker:awaiting_review', {
-              workerId: worker.parentWorkerId,
-              label: parent.label,
-              learnings: parent.ralphLearnings,
-              outputs: parent.ralphOutputs,
-              artifacts: parent.ralphArtifacts,
-              parentWorkerId: parent.parentWorkerId
-            });
-          }
-          // Deliver results to grandparent if exists
-          if (parent.parentWorkerId) {
-            const resultSummary = [
-              `[RESULTS FROM ${parent.label} (${worker.parentWorkerId})]`,
-              parent.ralphLearnings ? `Learnings: ${parent.ralphLearnings}` : null,
-              parent.ralphOutputs ? `Outputs: ${typeof parent.ralphOutputs === 'string' ? parent.ralphOutputs : JSON.stringify(parent.ralphOutputs)}` : null,
-              `Status: Complete (auto-promoted — all children done). Worker is alive for follow-up.`,
-              `To dismiss: curl -s -X POST ${STRATEGOS_API}/api/workers/${worker.parentWorkerId}/dismiss`
-            ].filter(Boolean).join('\n');
-            sendInputDirect(parent.parentWorkerId, resultSummary).catch(e => {
-              console.warn(`[RalphStatus] Could not deliver auto-promoted results to grandparent ${parent.parentWorkerId}: ${e.message}`);
-            });
-          }
-        }
-      }
-    }
+    _updateParentAggregation(worker.parentWorkerId, io);
   }
 
   // Lazy import to avoid circular dependency (persistence → output → persistence)
   import('./persistence.js').then(({ saveWorkerState }) => {
-    saveWorkerState().catch(err => console.error(`[SignalProgress] State save failed: ${err.message}`));
+    saveWorkerState().catch(err => getLogger().error(`State save failed after Ralph signal`, { error: err.message }));
   });
   return true;
+}
+
+/**
+ * Internal helper: update parent's aggregate progress from children's progress.
+ * Extracted to avoid duplication between signal handler and tryAutoPromoteWorker.
+ */
+function _updateParentAggregation(parentWorkerId, io) {
+  const parent = workers.get(parentWorkerId);
+  if (!parent || !parent.childWorkerIds || parent.childWorkerIds.length === 0) return;
+
+  const children = parent.childWorkerIds
+    .map(cid => workers.get(cid))
+    .filter(Boolean);
+  if (children.length === 0) return;
+
+  let totalProgress = 0;
+  let doneCount = 0;
+  const steps = [];
+  for (const child of children) {
+    const cp = child.ralphProgress || 0;
+    const cs = child.ralphStatus;
+    if (cs === 'done' || child.status === 'awaiting_review' || child.status === 'completed') {
+      totalProgress += 100;
+      doneCount++;
+    } else {
+      totalProgress += cp;
+      if (child.ralphCurrentStep) {
+        steps.push(`${child.label.slice(0, 30)}: ${child.ralphCurrentStep.slice(0, 60)}`);
+      }
+    }
+  }
+  const avgProgress = Math.round(totalProgress / children.length);
+  const stepSummary = doneCount === children.length
+    ? `All ${doneCount} children complete`
+    : `${doneCount}/${children.length} done` + (steps.length > 0 ? ` | ${steps[0]}` : '');
+
+  // Only auto-update if parent hasn't manually signaled, OR if aggregate is higher.
+  // If the parent has directly signaled via updateWorkerRalphStatus, _ralphManuallySignaled
+  // is true — in that case, child aggregate should never DOWNGRADE parent progress.
+  if (parent._ralphManuallySignaled) {
+    // Parent has manually signaled — only update if aggregate is higher
+    if (avgProgress > (parent.ralphProgress || 0)) {
+      parent.ralphProgress = avgProgress;
+      parent.ralphCurrentStep = stepSummary.slice(0, 500);
+      if (io) {
+        io.emit('worker:updated', normalizeWorker(parent));
+      }
+    }
+  } else {
+    // No manual signal — child-driven updates take full control
+    parent.ralphProgress = avgProgress;
+    parent.ralphCurrentStep = stepSummary.slice(0, 500);
+    if (io) {
+      io.emit('worker:updated', normalizeWorker(parent));
+    }
+  }
+
+  // Auto-promote parent to done when ALL children are done and parent is at >= 80%
+  if (doneCount === children.length && parent.ralphStatus !== 'done' &&
+      parent.status !== 'awaiting_review' && (parent.ralphProgress >= 80 || avgProgress >= 100)) {
+    parent.ralphProgress = 100;
+    parent.ralphStatus = 'done';
+    parent.ralphSignaledAt = new Date();
+    parent.status = 'awaiting_review';
+    parent.awaitingReviewAt = new Date();
+    getLogger().info(`Auto-promoted parent ${parentWorkerId} (${parent.label}) to done (all ${children.length} children complete)`, { parentWorkerId, label: parent.label, childCount: children.length });
+    if (io) {
+      io.emit('worker:updated', normalizeWorker(parent));
+      io.emit('worker:awaiting_review', {
+        workerId: parentWorkerId,
+        label: parent.label,
+        learnings: parent.ralphLearnings,
+        outputs: parent.ralphOutputs,
+        artifacts: parent.ralphArtifacts,
+        parentWorkerId: parent.parentWorkerId
+      });
+    }
+    // Deliver results to grandparent if exists
+    if (parent.parentWorkerId) {
+      const resultSummary = [
+        `[RESULTS FROM ${parent.label} (${parentWorkerId})]`,
+        parent.ralphLearnings ? `Learnings: ${parent.ralphLearnings}` : null,
+        parent.ralphOutputs ? `Outputs: ${typeof parent.ralphOutputs === 'string' ? parent.ralphOutputs : JSON.stringify(parent.ralphOutputs)}` : null,
+        `Status: Complete (auto-promoted — all children done). Worker is alive for follow-up.`,
+        `To dismiss: curl -s -X POST ${STRATEGOS_API}/api/workers/${parentWorkerId}/dismiss`
+      ].filter(Boolean).join('\n');
+      sendInputDirect(parent.parentWorkerId, resultSummary).catch(e => {
+        getLogger().warn(`Could not deliver auto-promoted results to grandparent ${parent.parentWorkerId}`, { parentWorkerId, grandparentWorkerId: parent.parentWorkerId, error: e.message });
+      });
+    }
+  }
 }
 
 // ============================================

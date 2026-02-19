@@ -14,6 +14,7 @@ import {
 
 import { isProtectedWorker } from './templates.js';
 import { startPtyCapture, stopPtyCapture, sendInputDirect } from './output.js';
+import { tryAutoPromoteWorker } from './ralph.js';
 import {
   startHealthMonitor, stopHealthMonitor,
   getCrashPatterns, handleCrashedWorker,
@@ -179,6 +180,7 @@ async function _doSaveWorkerState() {
         ralphLearnings: w.ralphLearnings ?? null,
         ralphOutputs: w.ralphOutputs ?? null,
         ralphArtifacts: w.ralphArtifacts ?? null,
+        ralphBlockedReason: w.ralphBlockedReason ?? null,
         // Lifecycle timestamps
         completedAt: w.completedAt ?? null,
         awaitingReviewAt: w.awaitingReviewAt ?? null,
@@ -190,7 +192,8 @@ async function _doSaveWorkerState() {
         bulldozePauseReason: w.bulldozePauseReason ?? null,
         bulldozeCyclesCompleted: w.bulldozeCyclesCompleted ?? 0,
         bulldozeStartedAt: w.bulldozeStartedAt ?? null,
-        bulldozeLastCycleAt: w.bulldozeLastCycleAt ?? null
+        bulldozeLastCycleAt: w.bulldozeLastCycleAt ?? null,
+        bulldozeConsecutiveErrors: w.bulldozeConsecutiveErrors ?? 0,
       }))
     };
 
@@ -250,6 +253,7 @@ export function saveWorkerStateSync() {
         ralphLearnings: w.ralphLearnings ?? null,
         ralphOutputs: w.ralphOutputs ?? null,
         ralphArtifacts: w.ralphArtifacts ?? null,
+        ralphBlockedReason: w.ralphBlockedReason ?? null,
         // Lifecycle timestamps
         completedAt: w.completedAt ?? null,
         awaitingReviewAt: w.awaitingReviewAt ?? null,
@@ -261,7 +265,8 @@ export function saveWorkerStateSync() {
         bulldozePauseReason: w.bulldozePauseReason ?? null,
         bulldozeCyclesCompleted: w.bulldozeCyclesCompleted ?? 0,
         bulldozeStartedAt: w.bulldozeStartedAt ?? null,
-        bulldozeLastCycleAt: w.bulldozeLastCycleAt ?? null
+        bulldozeLastCycleAt: w.bulldozeLastCycleAt ?? null,
+        bulldozeConsecutiveErrors: w.bulldozeConsecutiveErrors ?? 0,
       }))
     };
 
@@ -321,6 +326,14 @@ export async function restoreWorkerState(io = null) {
       const exists = await sessionExists(savedWorker.tmuxSession);
       if (!exists) {
         console.log(`  Skipping ${savedWorker.label} (${savedWorker.id}) - session no longer exists`);
+        // Clean up orphaned bulldoze state file
+        if (savedWorker.workingDir && savedWorker.bulldozeMode) {
+          const normalizedWd = path.resolve(savedWorker.workingDir);
+          if (path.isAbsolute(normalizedWd) && !normalizedWd.includes('..')) {
+            const bulldozeStatePath = path.join(normalizedWd, 'tmp', `bulldoze-state-${savedWorker.id}.md`);
+            try { await fs.unlink(bulldozeStatePath); console.log(`  Cleaned up orphaned bulldoze state: ${bulldozeStatePath}`); } catch { /* ENOENT is fine */ }
+          }
+        }
         // Clean up orphaned context file if no other worker shares the path
         if (savedWorker.workingDir && typeof savedWorker.workingDir === 'string') {
           // Normalize and validate path from persistence file (defense-in-depth against tampered file)
@@ -460,6 +473,7 @@ export async function restoreWorkerState(io = null) {
         ralphArtifacts: Array.isArray(savedWorker.ralphArtifacts)
           ? savedWorker.ralphArtifacts.filter(a => typeof a === 'string')
           : (typeof savedWorker.ralphArtifacts === 'string' ? savedWorker.ralphArtifacts : null),
+        ralphBlockedReason: typeof savedWorker.ralphBlockedReason === 'string' ? savedWorker.ralphBlockedReason : null,
         ralphSignalCount: typeof savedWorker.ralphSignalCount === 'number' ? savedWorker.ralphSignalCount : 0,
         firstRalphAt: savedWorker.firstRalphAt ? new Date(savedWorker.firstRalphAt) : null,
         lastRalphSignalAt: savedWorker.lastRalphSignalAt ? new Date(savedWorker.lastRalphSignalAt) : null,
@@ -473,6 +487,7 @@ export async function restoreWorkerState(io = null) {
         bulldozeCyclesCompleted: typeof savedWorker.bulldozeCyclesCompleted === 'number' ? savedWorker.bulldozeCyclesCompleted : 0,
         bulldozeStartedAt: savedWorker.bulldozeStartedAt ? new Date(savedWorker.bulldozeStartedAt) : null,
         bulldozeLastCycleAt: savedWorker.bulldozeLastCycleAt ? new Date(savedWorker.bulldozeLastCycleAt) : null,
+        bulldozeConsecutiveErrors: typeof savedWorker.bulldozeConsecutiveErrors === 'number' ? savedWorker.bulldozeConsecutiveErrors : 0,
         bulldozeIdleCount: 0, // Runtime-only, reset on restore
       };
 
@@ -618,31 +633,11 @@ export async function restoreWorkerState(io = null) {
         // Workers at >= 90% in_progress with completion keywords in their currentStep
         // may have been missed if the auto-promotion code was deployed after the signal
         // or the server restarted before the promoted state was saved.
-        const COMPLETION_RE = /\b(complete[d]?|done|finished|awaiting\s+(?:orders|further)|ready\s+for\s+next|all\b.*\bpassing)\b/i;
+        // Uses shared tryAutoPromoteWorker which handles the full done-path:
+        // status change, parent delivery, parent aggregation, socket events.
         let promoted = 0;
         for (const [wId, w] of workers.entries()) {
-          if (w.ralphStatus !== 'in_progress' || w.ralphProgress == null || w.ralphProgress < 90) continue;
-          if (!w.ralphCurrentStep) continue;
-          // Skip persistent tiers — they use completion words in progress reports
-          const wLabel = (w.label || '').toUpperCase();
-          const persistent = wLabel.startsWith('GENERAL:') || wLabel.startsWith('GENERAL ') ||
-            wLabel.startsWith('COLONEL:') || wLabel.startsWith('COL-') || wLabel.startsWith('COL:');
-          if (persistent) continue;
-          if (COMPLETION_RE.test(w.ralphCurrentStep)) {
-            console.log(`[Restore] Auto-promoting worker ${wId} (${w.label}) from ${w.ralphProgress}% to done (completion keywords in: "${w.ralphCurrentStep.slice(0, 100)}")`);
-            w.ralphProgress = 100;
-            w.ralphStatus = 'done';
-            w.ralphSignaledAt = new Date();
-            w.status = 'awaiting_review';
-            w.awaitingReviewAt = new Date();
-            if (io) {
-              io.emit('worker:updated', normalizeWorker(w));
-              io.emit('worker:awaiting_review', {
-                workerId: wId, label: w.label,
-                learnings: w.ralphLearnings, outputs: w.ralphOutputs,
-                artifacts: w.ralphArtifacts, parentWorkerId: w.parentWorkerId
-              });
-            }
+          if (tryAutoPromoteWorker(w, io, 'restore')) {
             promoted++;
           }
         }

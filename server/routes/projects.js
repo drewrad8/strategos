@@ -4,7 +4,6 @@
  */
 
 import express from 'express';
-import fs from 'fs';
 import path from 'path';
 import {
   scanProjects,
@@ -15,8 +14,7 @@ import {
   saveProjectConfig,
   addExternalProject,
   removeExternalProject,
-  listExternalProjects,
-  isPathWithinRoot
+  listExternalProjects
 } from '../projectScanner.js';
 import { getWorkers, getWorkersByProject } from '../workerManager.js';
 import { sanitizeErrorMessage } from '../errorUtils.js';
@@ -160,47 +158,6 @@ export function createProjectRoutes(theaRoot) {
       } else {
         res.status(400).json({ error: result.error });
       }
-    } catch (error) {
-      res.status(500).json({ error: sanitizeErrorMessage(error) });
-    }
-  });
-
-  // POST /api/projects/create - Create a new project directory under theaRoot
-  router.post('/create', (req, res) => {
-    try {
-      const { name } = req.body;
-      if (!name || typeof name !== 'string') {
-        return res.status(400).json({ error: 'name is required and must be a string' });
-      }
-
-      // Validate project name — alphanumeric, hyphens, underscores only
-      if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(name)) {
-        return res.status(400).json({
-          error: 'Project name must start with a letter or number, contain only letters, numbers, hyphens, and underscores, and be 1-64 characters'
-        });
-      }
-
-      const projectDir = path.join(theaRoot, name);
-
-      // Security: verify resolved path stays within theaRoot
-      if (!isPathWithinRoot(projectDir, theaRoot)) {
-        return res.status(400).json({ error: 'Invalid project name' });
-      }
-
-      // Check if directory already exists
-      if (fs.existsSync(projectDir)) {
-        return res.status(409).json({ error: `Project "${name}" already exists` });
-      }
-
-      // Create project directory
-      fs.mkdirSync(projectDir, { recursive: true });
-
-      res.status(201).json({
-        success: true,
-        name,
-        path: projectDir,
-        message: `Project "${name}" created at ${projectDir}`
-      });
     } catch (error) {
       res.status(500).json({ error: sanitizeErrorMessage(error) });
     }

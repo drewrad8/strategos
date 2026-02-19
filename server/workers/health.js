@@ -16,6 +16,7 @@ import {
 
 import { isProtectedWorker } from './templates.js';
 import { stopPtyCapture, sendInputDirect } from './output.js';
+import { tryAutoPromoteWorker } from './ralph.js';
 import { clearWorkerContext } from '../summaryService.js';
 import { getLogger } from '../logger.js';
 import {
@@ -162,30 +163,10 @@ function checkWorkerHealth(workerId, io) {
     }
   }
 
-  // Auto-promotion sweep
-  if (worker.ralphStatus === 'in_progress' && worker.ralphProgress != null && worker.ralphProgress >= 90 && worker.ralphCurrentStep) {
-    const wLabel = (worker.label || '').toUpperCase();
-    const persistent = wLabel.startsWith('GENERAL:') || wLabel.startsWith('GENERAL ') ||
-      wLabel.startsWith('COLONEL:') || wLabel.startsWith('COL-') || wLabel.startsWith('COL:');
-    if (!persistent) {
-      const COMPLETION_RE = /\b(complete[d]?|done|finished|awaiting\s+(?:orders|further)|ready\s+for\s+next|all\b.*\bpassing)\b/i;
-      if (COMPLETION_RE.test(worker.ralphCurrentStep)) {
-        console.log(`[HealthMonitor] Auto-promoting worker ${workerId} (${worker.label}) to done (completion keywords in: "${worker.ralphCurrentStep.slice(0, 80)}")`);
-        worker.ralphProgress = 100;
-        worker.ralphStatus = 'done';
-        worker.ralphSignaledAt = new Date();
-        worker.status = 'awaiting_review';
-        worker.awaitingReviewAt = new Date();
-        if (io) {
-          io.emit('worker:awaiting_review', {
-            workerId, label: worker.label,
-            learnings: worker.ralphLearnings, outputs: worker.ralphOutputs,
-            artifacts: worker.ralphArtifacts, parentWorkerId: worker.parentWorkerId
-          });
-        }
-      }
-    }
-  }
+  // Auto-promotion sweep — delegates to shared function which handles the full
+  // done-path: status change, parent delivery, parent aggregation, socket events.
+  // (P2/P3 fix: was previously inline and skipped parent delivery)
+  tryAutoPromoteWorker(worker, io, 'health');
 
   const queue = commandQueues.get(workerId) || [];
   worker.queuedCommands = queue.length;

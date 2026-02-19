@@ -342,6 +342,7 @@ export function normalizeWorker(worker) {
     ralphCurrentStep: worker.ralphCurrentStep ?? null,
     ralphOutputs: worker.ralphOutputs ?? null,
     ralphArtifacts: worker.ralphArtifacts ?? null,
+    ralphBlockedReason: worker.ralphBlockedReason ?? null,
     ralphSignalCount: worker.ralphSignalCount ?? 0,
     firstRalphAt: worker.firstRalphAt ?? null,
     lastRalphSignalAt: worker.lastRalphSignalAt ?? null,

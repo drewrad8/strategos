@@ -65,6 +65,7 @@ export {
 
 // From ralph.js — Ralph status updates, getters, resource stats
 export {
+  tryAutoPromoteWorker,
   updateWorkerRalphStatus,
   getWorkers,
   getWorker,

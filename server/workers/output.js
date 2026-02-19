@@ -23,6 +23,7 @@ import {
   BULLDOZE_MAX_COMPACTIONS, BULLDOZE_CONTINUATION_PREFIX,
   detectWorkerType, isProtectedWorker,
   writeStrategosContext,
+  writeGeminiContext,
 } from './templates.js';
 
 import {
@@ -277,6 +278,12 @@ async function captureWorkerOutput(workerId, instance, io) {
     const { stopHealthMonitor } = await import('./health.js');
     stopHealthMonitor(workerId);
 
+    // Clean up bulldoze state file if it exists
+    if (w?.workingDir) {
+      const bulldozeStatePath = path.join(w.workingDir, 'tmp', `bulldoze-state-${workerId}.md`);
+      fs.unlink(bulldozeStatePath).catch(() => { /* ENOENT is fine */ });
+    }
+
     if (io) {
       io.emit('worker:deleted', { workerId });
       io.emit('activity:new', activity);
@@ -470,7 +477,10 @@ function shouldContinueBulldoze(workerId) {
   if (childIds.length > 0) {
     const activeChildren = childIds.filter(cid => {
       const child = workers.get(cid);
-      return child && child.status === 'running' && child.ralphStatus === 'in_progress';
+      if (!child) return false;
+      // Dead/crashed children should not block bulldoze even if ralphStatus is still in_progress
+      if (child.health === 'dead' || child.health === 'crashed') return false;
+      return child.status === 'running' && child.ralphStatus === 'in_progress';
     });
     if (activeChildren.length > 0) {
       return false;
@@ -647,7 +657,20 @@ async function handleBulldozeContinuation(workerId, io) {
 
     if (newCommits === 0) {
       worker._bulldozeNoCommitCycles = (worker._bulldozeNoCommitCycles || 0) + 1;
-      if (worker._bulldozeNoCommitCycles >= 3) {
+      if (worker._bulldozeNoCommitCycles >= 5) {
+        console.warn(`[Bulldoze] Worker ${workerId} stalled — ${worker._bulldozeNoCommitCycles} cycles without commits, auto-pausing`);
+        worker.bulldozePaused = true;
+        worker.bulldozePauseReason = 'no_commits';
+        if (io) {
+          io.emit('worker:updated', normalizeWorker(worker));
+          io.emit('worker:bulldoze:paused', {
+            workerId,
+            reason: 'no_commits',
+            cyclesCompleted: worker.bulldozeCyclesCompleted || 0
+          });
+        }
+        return;
+      } else if (worker._bulldozeNoCommitCycles >= 3) {
         console.warn(`[Bulldoze] Worker ${workerId} has gone ${worker._bulldozeNoCommitCycles} cycles without commits — possible stall`);
       }
     } else {
@@ -742,24 +765,41 @@ export function updateWorkerSettings(workerId, settings, io = null) {
     }
     worker.bulldozeMode = settings.bulldozeMode;
     if (settings.bulldozeMode) {
-      worker.bulldozeStartedAt = worker.bulldozeStartedAt || new Date();
+      // If worker is in awaiting_review, revert to running so bulldoze can operate
+      if (worker.status === 'awaiting_review') {
+        worker.status = 'running';
+        worker.awaitingReviewAt = null;
+        console.log(`[Bulldoze] ${worker.label} reverted from awaiting_review → running (bulldoze enabled)`);
+      }
+      worker.bulldozeStartedAt = new Date();
       worker.bulldozePaused = false;
       worker.bulldozePauseReason = null;
       worker.bulldozeIdleCount = 0;
-      createBulldozeStateFile(worker, settings).catch(err =>
-        console.error(`[Bulldoze] Failed to create state file for ${workerId}: ${err.message}`)
-      );
-      writeStrategosContext(worker.id, worker.label, worker.workingDir, worker.ralphToken, {
-        bulldozeMode: true,
-        parentWorkerId: worker.parentWorkerId,
-        parentLabel: worker.parentLabel,
-      }).catch(err => console.error(`[Bulldoze] Failed to rewrite rules for ${workerId}: ${err.message}`));
-      resetBulldozeStateFileStatus(worker).catch(err =>
-        console.error(`[Bulldoze] Failed to reset state file for ${workerId}: ${err.message}`)
-      );
+      // Serialize: create state file first, then rewrite context rules, then reset status
+      createBulldozeStateFile(worker, settings)
+        .then(() => resetBulldozeStateFileStatus(worker))
+        .then(() => writeStrategosContext(worker.id, worker.label, worker.workingDir, worker.ralphToken, {
+          bulldozeMode: true,
+          parentWorkerId: worker.parentWorkerId,
+          parentLabel: worker.parentLabel,
+        }))
+        .catch(err => console.error(`[Bulldoze] Failed to set up bulldoze for ${workerId}: ${err.message}`));
       console.log(`[Bulldoze] ${worker.label} bulldoze mode ENABLED`);
     } else {
       console.log(`[Bulldoze] ${worker.label} bulldoze mode DISABLED (${worker.bulldozeCyclesCompleted || 0} cycles completed)`);
+      // Rewrite rules file without <bulldoze> section
+      const rewriteContext = worker.backend === 'gemini'
+        ? writeGeminiContext(worker.id, worker.label, worker.workingDir, worker.ralphToken, {
+            parentWorkerId: worker.parentWorkerId,
+            parentLabel: worker.parentLabel,
+            bulldozeMode: false,
+          })
+        : writeStrategosContext(worker.id, worker.label, worker.workingDir, worker.ralphToken, {
+            parentWorkerId: worker.parentWorkerId,
+            parentLabel: worker.parentLabel,
+            bulldozeMode: false,
+          });
+      rewriteContext.catch(err => console.error(`[Bulldoze] Failed to rewrite rules for ${workerId}: ${err.message}`));
     }
   }
 
