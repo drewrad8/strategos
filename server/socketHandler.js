@@ -227,8 +227,13 @@ export function setupSocketHandlers(io, theaRoot) {
         // Default autoAccept and ralphMode to TRUE for all spawns (match routes.js)
         options.autoAccept = autoAccept !== false; // true unless explicitly false
         options.ralphMode = ralphMode !== false;   // true unless explicitly false
-        // Backend selection: 'claude' (default) or 'gemini'
-        if (backend === 'gemini') options.backend = 'gemini';
+        // Backend selection: explicit > parent inheritance > 'claude' default
+        if (backend === 'gemini') {
+          options.backend = 'gemini';
+        } else if (!backend && validParentWorkerId) {
+          const parentWorker = getWorkerInternal(validParentWorkerId);
+          if (parentWorker?.backend === 'gemini') options.backend = 'gemini';
+        }
 
         const worker = await spawnWorker(resolvedPath, label, io, options);
 
