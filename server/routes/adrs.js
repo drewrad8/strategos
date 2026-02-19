@@ -136,15 +136,15 @@ export function createADRRoutes() {
       }
 
       // Validate string field sizes
-      const MAX_FIELD = 10000; // 10KB per field
-      if (context && (typeof context !== 'string' || context.length > MAX_FIELD)) {
-        return res.status(400).json({ error: `context must be a string (max ${MAX_FIELD} chars)` });
+      const MAX_ADR_FIELD = 10000; // 10KB per field
+      if (context && (typeof context !== 'string' || context.length > MAX_ADR_FIELD)) {
+        return res.status(400).json({ error: `context must be a string (max ${MAX_ADR_FIELD} chars)` });
       }
-      if (decision && (typeof decision !== 'string' || decision.length > MAX_FIELD)) {
-        return res.status(400).json({ error: `decision must be a string (max ${MAX_FIELD} chars)` });
+      if (decision && (typeof decision !== 'string' || decision.length > MAX_ADR_FIELD)) {
+        return res.status(400).json({ error: `decision must be a string (max ${MAX_ADR_FIELD} chars)` });
       }
-      if (consequences && (typeof consequences !== 'string' || consequences.length > MAX_FIELD)) {
-        return res.status(400).json({ error: `consequences must be a string (max ${MAX_FIELD} chars)` });
+      if (consequences && (typeof consequences !== 'string' || consequences.length > MAX_ADR_FIELD)) {
+        return res.status(400).json({ error: `consequences must be a string (max ${MAX_ADR_FIELD} chars)` });
       }
 
       // Validate status whitelist
@@ -202,10 +202,10 @@ export function createADRRoutes() {
       if (title !== undefined && CONTROL_CHAR_RE.test(title)) {
         return res.status(400).json({ error: 'Title must not contain control characters' });
       }
-      const MAX_FIELD = 10000;
+      const MAX_ADR_FIELD = 10000;
       for (const [name, val] of [['context', context], ['decision', decision], ['consequences', consequences]]) {
-        if (val !== undefined && (typeof val !== 'string' || val.length > MAX_FIELD)) {
-          return res.status(400).json({ error: `${name} must be a string (max ${MAX_FIELD} chars)` });
+        if (val !== undefined && (typeof val !== 'string' || val.length > MAX_ADR_FIELD)) {
+          return res.status(400).json({ error: `${name} must be a string (max ${MAX_ADR_FIELD} chars)` });
         }
       }
       const VALID_STATUSES = ['proposed', 'accepted', 'deprecated', 'superseded'];
