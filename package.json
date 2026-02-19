@@ -1,34 +1,32 @@
 {
-  "name": "thea-orchestrator",
+  "name": "strategos",
   "version": "1.0.0",
-  "description": "Control multiple Claude Code instances from your iPad",
+  "description": "Web dashboard for orchestrating AI coding agents in tmux sessions",
   "private": true,
   "workspaces": [
-    "server",
-    "client"
+    "server"
   ],
   "scripts": {
-    "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
-    "dev:server": "cd server && npm run dev",
-    "dev:client": "cd client && npm run dev",
     "start": "cd server && npm start",
     "server": "cd server && npm start",
-    "build": "cd client && npm run build",
+    "dev": "cd server && npm run dev",
     "test": "npx playwright test",
     "test:ui": "npx playwright test --ui",
     "test:headed": "npx playwright test --headed"
   },
   "bin": {
-    "thea-cc": "./bin/thea-cc.js"
+    "strategos": "./bin/strategos"
   },
   "keywords": [
     "claude-code",
+    "gemini-cli",
     "orchestrator",
     "tmux",
-    "ai"
+    "ai-agents",
+    "multi-agent"
   ],
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "devDependencies": {
     "@playwright/test": "^1.58.2",
     "concurrently": "^8.2.2"
