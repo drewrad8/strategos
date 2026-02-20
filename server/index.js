@@ -227,7 +227,22 @@ async function main() {
 
   // Serve static client files in production
   const clientDist = path.join(__dirname, '..', 'client', 'dist');
-  app.use(express.static(clientDist));
+
+  // Hashed assets (e.g., /assets/index-abc123.js) — cache forever since hash changes on rebuild
+  app.use('/assets', express.static(path.join(clientDist, 'assets'), {
+    maxAge: '1y',
+    immutable: true,
+  }));
+
+  // Non-hashed files (index.html, favicon) — never cache so browser always gets latest chunk refs
+  app.use(express.static(clientDist, {
+    maxAge: 0,
+    setHeaders: (res, filePath) => {
+      if (filePath.endsWith('.html')) {
+        res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+      }
+    },
+  }));
 
   // Fallback to index.html for SPA routing (non-API paths only)
   // I-1: Reject paths with dots (file extensions) that weren't served by express.static —
