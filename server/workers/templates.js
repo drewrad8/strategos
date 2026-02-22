@@ -410,6 +410,8 @@ State file format: "## Current" (active), "## Backlog" (prioritized TODO), "## C
 
   return `# Strategos Worker Instructions
 
+> **IDENTITY: You are worker \`${workerId}\`.** This file is ONLY for worker ${workerId}. If you see other strategos-worker-*.md files with different worker IDs in .claude/rules/, IGNORE THEM COMPLETELY — they belong to sibling workers sharing this project directory. Only follow instructions matching YOUR worker ID: ${workerId}.
+
 ${authorityLine}
 
 **Use Strategos API (\`curl\`) for spawning/coordination. NEVER use Claude Code's Task tool.**
@@ -500,6 +502,42 @@ async function _doWriteStrategosContext(workerId, workerLabel, projectPath, ralp
 
   try {
     await fs.mkdir(rulesDir, { recursive: true });
+
+    // Clean up stale rules files for workers no longer running in this project.
+    // Claude Code loads ALL .md files from .claude/rules/, so multiple per-worker
+    // files cause identity confusion (workers adopt the wrong worker ID).
+    try {
+      const { workers } = await import('./state.js');
+      const files = await fs.readdir(rulesDir);
+      for (const file of files) {
+        if (file.startsWith('strategos-worker-') && file.endsWith('.md') && !file.endsWith('.tmp')) {
+          const fileWorkerId = file.slice('strategos-worker-'.length, -'.md'.length);
+          if (fileWorkerId !== workerId) {
+            const existing = workers.get(fileWorkerId);
+            if (!existing || existing.status !== 'running') {
+              await fs.unlink(path.join(rulesDir, file));
+              console.log(`[StrategosContext] Cleaned stale rules file: ${file} (worker ${existing ? existing.status : 'not found'})`);
+            }
+          }
+        }
+      }
+    } catch (cleanupErr) {
+      // Non-fatal — log and continue with the write
+      console.warn(`[StrategosContext] Stale rules cleanup failed: ${cleanupErr.message}`);
+    }
+
+    // Ensure .gitignore prevents git from tracking per-worker rules files.
+    // Workers running "git add -A" would otherwise commit/rename each other's files.
+    const gitignorePath = path.join(rulesDir, '.gitignore');
+    try {
+      let gitignore = '';
+      try { gitignore = await fs.readFile(gitignorePath, 'utf-8'); } catch { /* ENOENT */ }
+      if (!gitignore.includes('strategos-worker-')) {
+        const entry = '# Auto-generated: per-worker rules files should not be committed\nstrategos-worker-*.md\n';
+        await fs.writeFile(gitignorePath, gitignore ? gitignore + '\n' + entry : entry, 'utf-8');
+      }
+    } catch { /* non-fatal */ }
+
     await fs.writeFile(tmpPath, content, 'utf-8');
     await fs.rename(tmpPath, contextPath);
     console.log(`[StrategosContext] Wrote rules file for ${workerLabel} at ${contextPath}`);
@@ -790,6 +828,26 @@ async function _doWriteGeminiContext(workerId, workerLabel, projectPath, ralphTo
   const content = generateGeminiContext(workerId, workerLabel, projectPath, ralphToken, options);
 
   try {
+    // Clean up stale Gemini context files for non-running workers
+    try {
+      const { workers } = await import('./state.js');
+      const allFiles = await fs.readdir(projectPath);
+      for (const file of allFiles) {
+        if (file.startsWith('GEMINI-strategos-worker-') && file.endsWith('.md') && !file.endsWith('.tmp')) {
+          const fileWorkerId = file.slice('GEMINI-strategos-worker-'.length, -'.md'.length);
+          if (fileWorkerId !== workerId) {
+            const existing = workers.get(fileWorkerId);
+            if (!existing || existing.status !== 'running') {
+              await fs.unlink(path.join(projectPath, file));
+              console.log(`[GeminiContext] Cleaned stale context file: ${file} (worker ${existing ? existing.status : 'not found'})`);
+            }
+          }
+        }
+      }
+    } catch (cleanupErr) {
+      console.warn(`[GeminiContext] Stale cleanup failed: ${cleanupErr.message}`);
+    }
+
     await fs.writeFile(tmpPath, content, 'utf-8');
     await fs.rename(tmpPath, contextPath);
     console.log(`[GeminiContext] Wrote context file for ${workerLabel} at ${contextPath}`);
