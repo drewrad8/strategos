@@ -10,6 +10,71 @@ import { getWorkerInternal } from '../workerManager.js';
  * See: tmp/ralph-prd-engine-evaluation.md
  */
 
+/**
+ * Validate and normalize signal body fields.
+ * Returns { error: string } on failure, or { signalData } on success.
+ */
+function validateSignalBody(body) {
+  const { status = 'done', progress, currentStep, reason, learnings, outputs, artifacts } = body;
+
+  // Accept "completed" as alias for "done" (workers frequently use the wrong term)
+  const normalizedStatus = status === 'completed' ? 'done' : status;
+  if (!['in_progress', 'done', 'blocked'].includes(normalizedStatus)) {
+    return { error: 'status must be "in_progress", "done", "completed", or "blocked"' };
+  }
+
+  // Validate progress range if provided
+  if (progress !== undefined && (typeof progress !== 'number' || progress < 0 || progress > 100)) {
+    return { error: 'progress must be a number between 0 and 100' };
+  }
+
+  // Validate string fields — cap sizes to prevent data amplification
+  const MAX_SIGNAL_FIELD = 2000;
+  if (currentStep !== undefined && (typeof currentStep !== 'string' || currentStep.length > MAX_SIGNAL_FIELD)) {
+    return { error: `currentStep must be a string (max ${MAX_SIGNAL_FIELD} chars)` };
+  }
+  if (reason !== undefined && (typeof reason !== 'string' || reason.length > MAX_SIGNAL_FIELD)) {
+    return { error: `reason must be a string (max ${MAX_SIGNAL_FIELD} chars)` };
+  }
+  if (learnings !== undefined && (typeof learnings !== 'string' || learnings.length > 10000)) {
+    return { error: 'learnings must be a string (max 10000 chars)' };
+  }
+
+  // Validate structured outputs — must be object with bounded values
+  if (outputs !== undefined) {
+    if (typeof outputs !== 'object' || outputs === null || Array.isArray(outputs)) {
+      return { error: 'outputs must be a plain object' };
+    }
+    const keys = Object.keys(outputs);
+    if (keys.length > 50) {
+      return { error: 'outputs must have at most 50 keys' };
+    }
+    for (const key of keys) {
+      if (key.length > 200) {
+        return { error: 'outputs key names must be under 200 characters' };
+      }
+      const val = outputs[key];
+      if (typeof val === 'string' && val.length > 10000) {
+        return { error: `outputs["${key.slice(0, 50)}"] exceeds max value length (10KB)` };
+      }
+    }
+  }
+
+  // Validate artifacts — must be array of strings
+  if (artifacts !== undefined) {
+    if (!Array.isArray(artifacts) || artifacts.length > 100) {
+      return { error: 'artifacts must be an array (max 100 items)' };
+    }
+    if (!artifacts.every(a => typeof a === 'string' && a.length <= 500)) {
+      return { error: 'each artifact must be a string (max 500 chars)' };
+    }
+  }
+
+  return {
+    signalData: { status: normalizedStatus, progress, currentStep, reason, learnings, outputs, artifacts }
+  };
+}
+
 export function createRalphRoutes(ralphService) {
   const router = express.Router();
 
@@ -36,69 +101,18 @@ export function createRalphRoutes(ralphService) {
         return res.status(400).json({ error: 'Invalid token format' });
       }
 
-      const { status = 'done', progress, currentStep, reason, learnings, outputs, artifacts } = req.body;
-
-      // Accept "completed" as alias for "done" (workers frequently use the wrong term)
-      const normalizedStatus = status === 'completed' ? 'done' : status;
-      if (!['in_progress', 'done', 'blocked'].includes(normalizedStatus)) {
-        return res.status(400).json({ error: 'status must be "in_progress", "done", "completed", or "blocked"' });
+      const validation = validateSignalBody(req.body);
+      if (validation.error) {
+        return res.status(400).json({ error: validation.error });
       }
 
-      // Validate progress range if provided
-      if (progress !== undefined && (typeof progress !== 'number' || progress < 0 || progress > 100)) {
-        return res.status(400).json({ error: 'progress must be a number between 0 and 100' });
-      }
-
-      // Validate string fields — cap sizes to prevent data amplification
-      const MAX_SIGNAL_FIELD = 2000;
-      if (currentStep !== undefined && (typeof currentStep !== 'string' || currentStep.length > MAX_SIGNAL_FIELD)) {
-        return res.status(400).json({ error: `currentStep must be a string (max ${MAX_SIGNAL_FIELD} chars)` });
-      }
-      if (reason !== undefined && (typeof reason !== 'string' || reason.length > MAX_SIGNAL_FIELD)) {
-        return res.status(400).json({ error: `reason must be a string (max ${MAX_SIGNAL_FIELD} chars)` });
-      }
-      if (learnings !== undefined && (typeof learnings !== 'string' || learnings.length > 10000)) {
-        return res.status(400).json({ error: 'learnings must be a string (max 10000 chars)' });
-      }
-
-      // Validate structured outputs — must be object with bounded values
-      if (outputs !== undefined) {
-        if (typeof outputs !== 'object' || outputs === null || Array.isArray(outputs)) {
-          return res.status(400).json({ error: 'outputs must be a plain object' });
-        }
-        const keys = Object.keys(outputs);
-        if (keys.length > 50) {
-          return res.status(400).json({ error: 'outputs must have at most 50 keys' });
-        }
-        for (const key of keys) {
-          if (key.length > 200) {
-            return res.status(400).json({ error: 'outputs key names must be under 200 characters' });
-          }
-          const val = outputs[key];
-          if (typeof val === 'string' && val.length > 10000) {
-            return res.status(400).json({ error: `outputs["${key.slice(0, 50)}"] exceeds max value length (10KB)` });
-          }
-        }
-      }
-
-      // Validate artifacts — must be array of strings
-      if (artifacts !== undefined) {
-        if (!Array.isArray(artifacts) || artifacts.length > 100) {
-          return res.status(400).json({ error: 'artifacts must be an array (max 100 items)' });
-        }
-        if (!artifacts.every(a => typeof a === 'string' && a.length <= 500)) {
-          return res.status(400).json({ error: 'each artifact must be a string (max 500 chars)' });
-        }
-      }
-
-      const signalData = { status: normalizedStatus, progress, currentStep, reason, learnings, outputs, artifacts };
-      const result = await ralphService.handleCompletionSignal(token, signalData);
+      const result = await ralphService.handleCompletionSignal(token, validation.signalData);
 
       if (!result) {
         return res.status(404).json({ error: 'Unknown completion token' });
       }
 
-      res.json({ success: true, message: `Status updated to ${normalizedStatus}`, progress });
+      res.json({ success: true, message: `Status updated to ${validation.signalData.status}`, progress: validation.signalData.progress });
     } catch (error) {
       res.status(500).json({ error: sanitizeErrorMessage(error) });
     }
@@ -130,26 +144,18 @@ export function createRalphRoutes(ralphService) {
       // Ensure token is registered (may be lost after server restart)
       ralphService.registerStandaloneWorker(worker.ralphToken, workerId);
 
-      // Forward to the signal handler via ralphService
-      const { status = 'done', progress, currentStep, reason, learnings, outputs, artifacts } = req.body;
-
-      const normalizedStatus = status === 'completed' ? 'done' : status;
-      if (!['in_progress', 'done', 'blocked'].includes(normalizedStatus)) {
-        return res.status(400).json({ error: 'status must be "in_progress", "done", "completed", or "blocked"' });
+      const validation = validateSignalBody(req.body);
+      if (validation.error) {
+        return res.status(400).json({ error: validation.error });
       }
 
-      if (progress !== undefined && (typeof progress !== 'number' || progress < 0 || progress > 100)) {
-        return res.status(400).json({ error: 'progress must be a number between 0 and 100' });
-      }
-
-      const signalData = { status: normalizedStatus, progress, currentStep, reason, learnings, outputs, artifacts };
-      const result = await ralphService.handleCompletionSignal(worker.ralphToken, signalData);
+      const result = await ralphService.handleCompletionSignal(worker.ralphToken, validation.signalData);
 
       if (!result) {
         return res.status(500).json({ error: 'Signal handling failed' });
       }
 
-      res.json({ success: true, message: `Status updated to ${normalizedStatus}`, progress });
+      res.json({ success: true, message: `Status updated to ${validation.signalData.status}`, progress: validation.signalData.progress });
     } catch (error) {
       res.status(500).json({ error: sanitizeErrorMessage(error) });
     }

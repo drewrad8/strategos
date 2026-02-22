@@ -105,8 +105,12 @@ async function checkGeneralRoleViolation(workerId, output, io) {
   // Update dedup hash
   worker._lastViolationHash = tailHash;
 
-  // Increment counter
+  // Increment both counters (roleViolations for normalizeWorker, delegationMetrics for structured tracking)
   worker.roleViolations = (worker.roleViolations || 0) + 1;
+  if (!worker.delegationMetrics) {
+    worker.delegationMetrics = { spawnsIssued: 0, roleViolations: 0, filesEdited: 0, commandsRun: 0 };
+  }
+  worker.delegationMetrics.roleViolations = worker.roleViolations;
 
   const correctionMessage = `ROLE VIOLATION: You are a GENERAL. You just attempted to ${violation}. Generals do NOT write code, edit files, or run implementation commands. Spawn a worker instead: curl -s -X POST http://localhost:38007/api/workers/spawn-from-template -H "Content-Type: application/json" -d '{"template":"impl","label":"IMPL: <task>","projectPath":"<path>","parentWorkerId":"${workerId}","task":{"description":"<what needs doing>"}}'`;
 

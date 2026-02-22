@@ -249,8 +249,9 @@ export function updateWorkerRalphStatus(workerId, signalData, io = null) {
     }
   }
 
-  // Emit update event (if not already emitted by tryAutoPromoteWorker)
-  if (!autoPromoted && io) {
+  // Emit update event (skip if auto-promoted or if done handler will emit below)
+  const willEnterDoneHandler = (status === 'done' || autoPromoted) && worker.status !== 'awaiting_review';
+  if (!autoPromoted && !willEnterDoneHandler && io) {
     io.emit('worker:updated', normalizeWorker(worker));
   }
 
