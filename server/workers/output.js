@@ -39,6 +39,101 @@ import {
 let globalCaptureInterval = null;
 
 // ============================================
+// GENERAL ROLE-VIOLATION DETECTION (SENTINEL)
+// ============================================
+
+// Claude Code v2.1.50 renders tools as:
+//   Write(filename)  — file creation
+//   Update(filename) — file edit (the Edit tool)
+//   Edit(filename)   — also possible in some versions
+// Match both the internal names (Edit:/Write:) and the rendered names (Update(/Write()
+const GENERAL_VIOLATION_PATTERNS = [
+  { pattern: /● (?:Edit|Update)\(/,  description: 'use the Edit tool (file modification)' },
+  { pattern: /● Write\(/,            description: 'use the Write tool (file creation)' },
+  { pattern: /● NotebookEdit\(/,     description: 'use the NotebookEdit tool (notebook modification)' },
+  { pattern: /\bEdit:\s/,            description: 'use the Edit tool (legacy format)' },
+  { pattern: /\bWrite:\s/,           description: 'use the Write tool (legacy format)' },
+  { pattern: /\bNotebookEdit:\s/,    description: 'use the NotebookEdit tool (legacy format)' },
+  { pattern: /\bAdded \d+ lines, removed \d+ lines/, description: 'edit files (diff output detected)' },
+  { pattern: /\bWrote \d+ lines to\b/,               description: 'write files (write output detected)' },
+];
+
+// Bash: followed by implementation commands — but NOT legitimate commander actions
+const GENERAL_IMPL_BASH_RE = /\bBash:\s.*?\b(npm|node|python|python3|pip|pip3|sed|awk|gcc|g\+\+|cargo|make|cmake|rustc|javac|go build|go run|tsc|webpack|vite|esbuild|npx playwright|npx jest|pytest)\b/;
+
+// Bash: followed by legitimate commander actions (git, curl, ls, cat, jq, etc.)
+const GENERAL_ALLOWED_BASH_RE = /\bBash:\s.*?\b(git|curl|ls|cat|head|tail|jq|wc|echo|printf|pwd|whoami|date|uptime|df|du|ps|grep|find|which|env|export)\b/;
+
+async function checkGeneralRoleViolation(workerId, output, io) {
+  const worker = workers.get(workerId);
+  if (!worker) return;
+
+  // Only check GENERAL-labeled workers
+  if (!isProtectedWorker(worker)) return;
+
+  const cleaned = stripAnsiCodes(output);
+  const tail = cleaned.slice(-2000);
+
+  // Deduplicate: don't re-trigger on the same output
+  const tailHash = simpleHash(tail);
+  if (tailHash === worker._lastViolationHash) return;
+
+  let violation = null;
+
+  // Check file-modification tool patterns
+  for (const { pattern, description } of GENERAL_VIOLATION_PATTERNS) {
+    if (pattern.test(tail)) {
+      violation = description;
+      break;
+    }
+  }
+
+  // Check implementation bash commands (only flag if NOT also matching allowed patterns)
+  if (!violation && GENERAL_IMPL_BASH_RE.test(tail)) {
+    // Extract the matched bash line to check if it also contains allowed commands
+    const bashLines = tail.split('\n').filter(line => /\bBash:\s/.test(line));
+    for (const line of bashLines) {
+      if (GENERAL_IMPL_BASH_RE.test(line) && !GENERAL_ALLOWED_BASH_RE.test(line)) {
+        violation = 'run implementation commands via Bash';
+        break;
+      }
+    }
+  }
+
+  if (!violation) return;
+
+  // Update dedup hash
+  worker._lastViolationHash = tailHash;
+
+  // Increment counter
+  worker.roleViolations = (worker.roleViolations || 0) + 1;
+
+  const correctionMessage = `ROLE VIOLATION: You are a GENERAL. You just attempted to ${violation}. Generals do NOT write code, edit files, or run implementation commands. Spawn a worker instead: curl -s -X POST http://localhost:38007/api/workers/spawn-from-template -H "Content-Type: application/json" -d '{"template":"impl","label":"IMPL: <task>","projectPath":"<path>","parentWorkerId":"${workerId}","task":{"description":"<what needs doing>"}}'`;
+
+  console.log(`[Sentinel] ROLE VIOLATION detected for GENERAL ${workerId} (${worker.label}): ${violation} (count: ${worker.roleViolations})`);
+
+  // Emit socket event
+  if (io) {
+    io.emit('worker:role:violation', {
+      workerId,
+      label: worker.label,
+      violation,
+      count: worker.roleViolations,
+      timestamp: new Date().toISOString(),
+    });
+    io.emit('worker:updated', normalizeWorker(worker));
+  }
+
+  // Interrupt the worker with correction
+  try {
+    await interruptWorker(workerId, correctionMessage, io);
+    console.log(`[Sentinel] Interrupted GENERAL ${workerId} with correction message`);
+  } catch (err) {
+    console.error(`[Sentinel] Failed to interrupt GENERAL ${workerId}: ${err.message}`);
+  }
+}
+
+// ============================================
 // PTY-BASED REAL-TIME OUTPUT CAPTURE
 // ============================================
 
@@ -108,6 +203,8 @@ async function captureWorkerOutput(workerId, instance, io) {
     if (worker) {
       handleAutoAcceptCheck(workerId, stdout, io).catch(err =>
         console.error(`[PtyCapture] autoAcceptCheck failed for ${workerId}: ${err.message}`));
+      checkGeneralRoleViolation(workerId, stdout, io).catch(err =>
+        console.error(`[PtyCapture] generalRoleViolation check failed for ${workerId}: ${err.message}`));
     }
 
     const MAX_OUTPUT_BUFFER = 2 * 1024 * 1024;

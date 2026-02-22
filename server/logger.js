@@ -259,10 +259,14 @@ class Logger {
         AND timestamp > datetime('now', '-1 hour')
     `);
     this._deleteOldLogs = this.db.prepare('DELETE FROM server_logs WHERE timestamp < ?');
+    this._deleteOldLifecycleEvents = this.db.prepare('DELETE FROM lifecycle_events WHERE timestamp < ?');
 
     // Cleanup old logs at startup (keep 7 days)
     const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
     this._deleteOldLogs.run(cutoff);
+    // Lifecycle events: keep 30 days (longer retention for crash forensics)
+    const lifecycleCutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+    this._deleteOldLifecycleEvents.run(lifecycleCutoff);
 
     // Periodic cleanup every hour during runtime
     this._cleanupInterval = setInterval(() => {
@@ -271,6 +275,12 @@ class Logger {
         const result = this._deleteOldLogs.run(c);
         if (result.changes > 0) {
           console.log(`[Logger] Cleaned up ${result.changes} logs older than 7 days`);
+        }
+        // Prune lifecycle_events older than 30 days
+        const lc = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+        const lcResult = this._deleteOldLifecycleEvents.run(lc);
+        if (lcResult.changes > 0) {
+          console.log(`[Logger] Cleaned up ${lcResult.changes} lifecycle events older than 30 days`);
         }
         // Periodic WAL checkpoint to prevent unbounded WAL growth
         // Try PASSIVE first (non-blocking), escalate to RESTART if WAL is still large
@@ -281,6 +291,14 @@ class Logger {
           if (walInfo && walInfo.log > 1000 && walInfo.checkpointed < walInfo.log) {
             // PASSIVE didn't fully checkpoint — escalate to RESTART (briefly blocks writers)
             this.db.pragma('wal_checkpoint(RESTART)');
+          }
+        } catch { /* best effort */ }
+        // VACUUM when freelist pages exceed threshold
+        try {
+          const freelistCount = this.db.pragma('freelist_count')[0]?.freelist_count ?? 0;
+          if (freelistCount > 500) { // ~2MB of dead pages
+            this.db.exec('VACUUM');
+            console.log(`[Logger] VACUUM reclaimed ${freelistCount} freelist pages`);
           }
         } catch { /* best effort */ }
       } catch (err) {

@@ -69,11 +69,14 @@ export function writeWorkerCheckpoint(workerId, reason = 'unknown') {
       parentWorkerId: worker.parentWorkerId || null,
       parentLabel: worker.parentLabel || null,
       childWorkerIds: worker.childWorkerIds || [],
+      childWorkerHistory: worker.childWorkerHistory || [],
       // Last known output (last 50 lines)
       lastOutput: lastLines,
       // Health at death
       health: worker.health,
       crashReason: worker.crashReason || null,
+      // Delegation tracking (for generals)
+      delegationMetrics: worker.delegationMetrics || null,
     };
 
     const filePath = path.join(CHECKPOINT_DIR, `${workerId}.json`);
@@ -162,6 +165,7 @@ async function _doSaveWorkerState() {
         parentWorkerId: w.parentWorkerId ?? null,
         parentLabel: w.parentLabel ?? null,
         childWorkerIds: w.childWorkerIds || [],
+        childWorkerHistory: w.childWorkerHistory || [],
         // Dependency tracking (for graph reconstruction on restore)
         dependsOn: w.dependsOn || [],
         workflowId: w.workflowId ?? null,
@@ -181,6 +185,7 @@ async function _doSaveWorkerState() {
         ralphOutputs: w.ralphOutputs ?? null,
         ralphArtifacts: w.ralphArtifacts ?? null,
         ralphBlockedReason: w.ralphBlockedReason ?? null,
+        _ralphManuallySignaled: w._ralphManuallySignaled ?? false,
         // Lifecycle timestamps
         completedAt: w.completedAt ?? null,
         awaitingReviewAt: w.awaitingReviewAt ?? null,
@@ -194,6 +199,8 @@ async function _doSaveWorkerState() {
         bulldozeStartedAt: w.bulldozeStartedAt ?? null,
         bulldozeLastCycleAt: w.bulldozeLastCycleAt ?? null,
         bulldozeConsecutiveErrors: w.bulldozeConsecutiveErrors ?? 0,
+        // Delegation metrics (for tracking general behavior)
+        delegationMetrics: w.delegationMetrics ?? null,
       }))
     };
 
@@ -237,6 +244,7 @@ export function saveWorkerStateSync() {
         parentWorkerId: w.parentWorkerId ?? null,
         parentLabel: w.parentLabel ?? null,
         childWorkerIds: w.childWorkerIds || [],
+        childWorkerHistory: w.childWorkerHistory || [],
         dependsOn: w.dependsOn || [],
         workflowId: w.workflowId ?? null,
         taskId: w.taskId ?? null,
@@ -254,6 +262,7 @@ export function saveWorkerStateSync() {
         ralphOutputs: w.ralphOutputs ?? null,
         ralphArtifacts: w.ralphArtifacts ?? null,
         ralphBlockedReason: w.ralphBlockedReason ?? null,
+        _ralphManuallySignaled: w._ralphManuallySignaled ?? false,
         // Lifecycle timestamps
         completedAt: w.completedAt ?? null,
         awaitingReviewAt: w.awaitingReviewAt ?? null,
@@ -267,6 +276,7 @@ export function saveWorkerStateSync() {
         bulldozeStartedAt: w.bulldozeStartedAt ?? null,
         bulldozeLastCycleAt: w.bulldozeLastCycleAt ?? null,
         bulldozeConsecutiveErrors: w.bulldozeConsecutiveErrors ?? 0,
+        delegationMetrics: w.delegationMetrics ?? null,
       }))
     };
 
@@ -453,6 +463,7 @@ export async function restoreWorkerState(io = null) {
           (typeof savedWorker.task === 'object' && savedWorker.task !== null && !Array.isArray(savedWorker.task)))
           ? savedWorker.task : null,
         childWorkerIds: Array.isArray(savedWorker.childWorkerIds) ? savedWorker.childWorkerIds.filter(c => typeof c === 'string') : [],
+        childWorkerHistory: Array.isArray(savedWorker.childWorkerHistory) ? savedWorker.childWorkerHistory.filter(c => typeof c === 'string') : [],
         // Auto-accept settings
         autoAccept: savedWorker.autoAccept !== false, // default true
         autoAcceptPaused: savedWorker.autoAcceptPaused === true,
@@ -474,6 +485,7 @@ export async function restoreWorkerState(io = null) {
           ? savedWorker.ralphArtifacts.filter(a => typeof a === 'string')
           : (typeof savedWorker.ralphArtifacts === 'string' ? savedWorker.ralphArtifacts : null),
         ralphBlockedReason: typeof savedWorker.ralphBlockedReason === 'string' ? savedWorker.ralphBlockedReason : null,
+        _ralphManuallySignaled: savedWorker._ralphManuallySignaled === true,
         ralphSignalCount: typeof savedWorker.ralphSignalCount === 'number' ? savedWorker.ralphSignalCount : 0,
         firstRalphAt: savedWorker.firstRalphAt ? new Date(savedWorker.firstRalphAt) : null,
         lastRalphSignalAt: savedWorker.lastRalphSignalAt ? new Date(savedWorker.lastRalphSignalAt) : null,
@@ -489,6 +501,15 @@ export async function restoreWorkerState(io = null) {
         bulldozeLastCycleAt: savedWorker.bulldozeLastCycleAt ? new Date(savedWorker.bulldozeLastCycleAt) : null,
         bulldozeConsecutiveErrors: typeof savedWorker.bulldozeConsecutiveErrors === 'number' ? savedWorker.bulldozeConsecutiveErrors : 0,
         bulldozeIdleCount: 0, // Runtime-only, reset on restore
+        // Delegation metrics (for tracking general behavior)
+        delegationMetrics: (savedWorker.delegationMetrics && typeof savedWorker.delegationMetrics === 'object')
+          ? {
+            spawnsIssued: typeof savedWorker.delegationMetrics.spawnsIssued === 'number' ? savedWorker.delegationMetrics.spawnsIssued : 0,
+            roleViolations: typeof savedWorker.delegationMetrics.roleViolations === 'number' ? savedWorker.delegationMetrics.roleViolations : 0,
+            filesEdited: typeof savedWorker.delegationMetrics.filesEdited === 'number' ? savedWorker.delegationMetrics.filesEdited : 0,
+            commandsRun: typeof savedWorker.delegationMetrics.commandsRun === 'number' ? savedWorker.delegationMetrics.commandsRun : 0,
+          }
+          : { spawnsIssued: 0, roleViolations: 0, filesEdited: 0, commandsRun: 0 },
       };
 
       // Per-worker try-catch: if one worker fails to initialize, continue restoring others
@@ -549,14 +570,21 @@ export async function restoreWorkerState(io = null) {
       }
     }
 
-    // Clean up childWorkerIds that reference dead workers
+    // Clean up childWorkerIds that reference dead workers — move them to childWorkerHistory
     for (const [workerId, worker] of workers.entries()) {
       if (worker.childWorkerIds && worker.childWorkerIds.length > 0) {
         const before = worker.childWorkerIds.length;
+        const deadChildIds = worker.childWorkerIds.filter(id => !restoredIds.has(id));
         worker.childWorkerIds = worker.childWorkerIds.filter(id => restoredIds.has(id));
-        const removed = before - worker.childWorkerIds.length;
-        if (removed > 0) {
-          console.log(`  Pruned ${removed} dead child reference(s) from ${worker.label}`);
+        // Migrate dead children to history so generals retain their records
+        if (deadChildIds.length > 0) {
+          if (!worker.childWorkerHistory) worker.childWorkerHistory = [];
+          for (const deadId of deadChildIds) {
+            if (!worker.childWorkerHistory.includes(deadId)) {
+              worker.childWorkerHistory.push(deadId);
+            }
+          }
+          console.log(`  Pruned ${deadChildIds.length} dead child reference(s) from ${worker.label} (moved to history)`);
         }
       }
     }

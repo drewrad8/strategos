@@ -417,8 +417,12 @@ export function startPeriodicCleanup(io = null) {
             const child = workers.get(cid);
             return child && (child.status === 'running' || child.status === 'awaiting_review');
           });
+          // Don't auto-dismiss workers that had children (they completed work, may be awaiting orders)
+          const hadChildren = (worker.childWorkerHistory || []).length > 0;
           if (activeChildren.length > 0) {
             console.log(`[PeriodicCleanup] Skipping awaiting_review worker ${id} (${worker.label}) — has ${activeChildren.length} active children`);
+          } else if (hadChildren) {
+            console.log(`[PeriodicCleanup] Skipping awaiting_review worker ${id} (${worker.label}) — has ${worker.childWorkerHistory.length} historical children, awaiting orders`);
           } else {
             console.log(`[PeriodicCleanup] Auto-dismissing worker ${id} (${worker.label}) — awaiting_review for ${Math.round(reviewAge / 60000)}m`);
             workersToClean.push({ id, reason: 'auto-dismissed', label: worker.label });

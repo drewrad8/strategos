@@ -637,6 +637,14 @@ let _periodicCleanupInterval = setInterval(() => {
       db.pragma('wal_checkpoint(RESTART)');
     }
   } catch (e) { /* best effort */ }
+  // VACUUM when freelist pages exceed threshold (dead pages from deletes pile up without this)
+  try {
+    const freelistCount = db.pragma('freelist_count')[0]?.freelist_count ?? 0;
+    if (freelistCount > 1000) { // ~4MB of dead pages
+      db.exec('VACUUM');
+      console.log(`[WorkerOutputDb] VACUUM reclaimed ${freelistCount} freelist pages`);
+    }
+  } catch (e) { /* best effort */ }
 }, 30 * 60 * 1000);
 if (_periodicCleanupInterval.unref) _periodicCleanupInterval.unref();
 

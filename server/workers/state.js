@@ -348,6 +348,7 @@ export function normalizeWorker(worker) {
     parentLabel: worker.parentLabel ?? null,
     task: worker.task ?? null,
     childWorkerIds: Array.isArray(worker.childWorkerIds) ? worker.childWorkerIds : [],
+    childWorkerHistory: Array.isArray(worker.childWorkerHistory) ? worker.childWorkerHistory : [],
     autoAccept: worker.autoAccept ?? true,
     autoAcceptPaused: worker.autoAcceptPaused ?? false,
     ralphMode: worker.ralphMode ?? false,
@@ -370,5 +371,7 @@ export function normalizeWorker(worker) {
     bulldozeStartedAt: worker.bulldozeStartedAt ?? null,
     bulldozeLastCycleAt: worker.bulldozeLastCycleAt ?? null,
     bulldozeMetrics: worker.bulldozeMetrics ?? null,
+    roleViolations: worker.roleViolations ?? 0,
+    delegationMetrics: worker.delegationMetrics ?? null,
   };
 }
