@@ -169,7 +169,7 @@ export function createIntegrationRoutes(theaRoot, io) {
       const worker = getWorker(req.params.id);
 
       if (!worker) {
-        return res.status(404).json({ error: 'Worker not found' });
+        return res.status(404).json({ error: 'Resource not found' });
       }
 
       const includeOutput = req.query.includeOutput === 'true';
