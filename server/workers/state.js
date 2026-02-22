@@ -373,5 +373,9 @@ export function normalizeWorker(worker) {
     bulldozeMetrics: worker.bulldozeMetrics ?? null,
     roleViolations: worker.roleViolations ?? 0,
     delegationMetrics: worker.delegationMetrics ?? null,
+    autoContinue: worker.autoContinue ?? true,
+    autoContinueCount: worker.autoContinueCount ?? 0,
+    rateLimited: worker.rateLimited ?? false,
+    rateLimitResetAt: worker.rateLimitResetAt ?? null,
   };
 }

@@ -149,6 +149,23 @@ export const BULLDOZE_MAX_COMPACTIONS = 3;
 export const BULLDOZE_CONTINUATION_PREFIX = '[BULLDOZE';
 
 // ============================================
+// AUTO-CONTINUE CONSTANTS
+// ============================================
+
+// Detect API rate limit: "You've hit your limit · resets 9am (America/New_York)"
+export const RATE_LIMIT_PATTERN = /You[''\u2019]ve hit your limit/;
+export const RATE_LIMIT_RESET_RE = /resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(([^)]+)\)/i;
+
+// Detect context compaction: "✻ Crunched for 4m 10s" or "✻ Sautéed for 13m 34s"
+export const COMPACTION_PATTERN = /✻ (?:Crunched|Compacted|Sautéed|Seasoning|Flowing|Brewing|Cooking|Beaming|Warping|Reticulating|Levitating) for/;
+
+// Idle cycles (each ~5s) before sending continuation
+export const AUTO_CONTINUE_IDLE_THRESHOLD = 6;        // 30s for post-compaction
+export const AUTO_CONTINUE_RATE_LIMIT_COOLDOWN = 60;  // 5 min between rate-limit retries
+export const AUTO_CONTINUE_MAX_ATTEMPTS = 10;
+export const AUTO_CONTINUE_MESSAGE = 'Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.';
+
+// ============================================
 // STRATEGOS CONTEXT GENERATION
 // ============================================
 
@@ -367,9 +384,9 @@ State file format: "## Current" (active), "## Backlog" (prioritized TODO), "## C
   if (isGeneral) {
     authorityLine = `**Operational Authority:** You command workers. You do NOT implement. You may read files, search code, and run curl commands for Strategos API coordination. You may NOT use Edit, Write, or Bash for implementation (code changes, running tests, installing packages). All implementation work MUST be delegated to specialist workers. Escalate to the Commander (the human operator) ONLY for: missing credentials, required payments, or actions outside ${escapePromptXml(THEA_ROOT)}/. Address the human as "Commander" in all communications.`;
   } else if (isColonel) {
-    authorityLine = `**Operational Authority:** WEAPONS FREE. You have full autonomy to run scripts, install packages, restart services, and manage workers within ${escapePromptXml(THEA_ROOT)}/. Quick investigation is fine; substantial implementation goes to workers. Make decisions and act. Escalate to the human ONLY for: missing credentials, required payments, physical access, or actions outside ${escapePromptXml(THEA_ROOT)}/.`;
+    authorityLine = `**Operational Authority:** WEAPONS FREE. You have full autonomy to run scripts, install packages, and manage workers within ${escapePromptXml(THEA_ROOT)}/. Quick investigation is fine; substantial implementation goes to workers. Make decisions and act. Escalate to the human ONLY for: missing credentials, required payments, physical access, or actions outside ${escapePromptXml(THEA_ROOT)}/. **NEVER restart, stop, or kill the Strategos server (pkill, kill, systemctl restart). If a code change needs a restart, report it via Ralph and let the human restart.**`;
   } else {
-    authorityLine = `**Operational Authority:** You are authorized to run scripts, install packages, restart services, and modify code within ${escapePromptXml(THEA_ROOT)}/. Act within your task scope. Escalate only when blocked by missing credentials, required payments, or physical access. Do NOT ask the user to do things you can do yourself.`;
+    authorityLine = `**Operational Authority:** You are authorized to run scripts, install packages, and modify code within ${escapePromptXml(THEA_ROOT)}/. Act within your task scope. Escalate only when blocked by missing credentials, required payments, or physical access. Do NOT ask the user to do things you can do yourself. **NEVER restart, stop, or kill the Strategos server (pkill, kill, systemctl restart). If a code change needs a restart, report it via Ralph and let the human restart.**`;
   }
 
   return `# Strategos Worker Instructions
