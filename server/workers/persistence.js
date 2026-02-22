@@ -199,6 +199,8 @@ async function _doSaveWorkerState() {
         bulldozeStartedAt: w.bulldozeStartedAt ?? null,
         bulldozeLastCycleAt: w.bulldozeLastCycleAt ?? null,
         bulldozeConsecutiveErrors: w.bulldozeConsecutiveErrors ?? 0,
+        // Sentinel role-violation counter (must survive restart)
+        roleViolations: w.roleViolations ?? 0,
         // Delegation metrics (for tracking general behavior)
         delegationMetrics: w.delegationMetrics ?? null,
       }))
@@ -276,6 +278,7 @@ export function saveWorkerStateSync() {
         bulldozeStartedAt: w.bulldozeStartedAt ?? null,
         bulldozeLastCycleAt: w.bulldozeLastCycleAt ?? null,
         bulldozeConsecutiveErrors: w.bulldozeConsecutiveErrors ?? 0,
+        roleViolations: w.roleViolations ?? 0,
         delegationMetrics: w.delegationMetrics ?? null,
       }))
     };
@@ -501,6 +504,8 @@ export async function restoreWorkerState(io = null) {
         bulldozeLastCycleAt: savedWorker.bulldozeLastCycleAt ? new Date(savedWorker.bulldozeLastCycleAt) : null,
         bulldozeConsecutiveErrors: typeof savedWorker.bulldozeConsecutiveErrors === 'number' ? savedWorker.bulldozeConsecutiveErrors : 0,
         bulldozeIdleCount: 0, // Runtime-only, reset on restore
+        // Sentinel role-violation counter
+        roleViolations: typeof savedWorker.roleViolations === 'number' ? savedWorker.roleViolations : 0,
         // Delegation metrics (for tracking general behavior)
         delegationMetrics: (savedWorker.delegationMetrics && typeof savedWorker.delegationMetrics === 'object')
           ? {
