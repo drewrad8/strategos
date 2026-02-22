@@ -21,7 +21,8 @@ import {
   getRespawnSuggestions,
   removeRespawnSuggestion,
   getCircuitBreakerStatus,
-  resetCircuitBreaker
+  resetCircuitBreaker,
+  getDelegationMetrics
 } from '../workerManager.js';
 import {
   projectExists,
@@ -563,6 +564,25 @@ export function createSystemRoutes(theaRoot, io) {
     }
   });
 
+  // GET /api/metrics/delegation/:workerId - Get delegation metrics for a general
+  router.get('/metrics/delegation/:workerId', (req, res) => {
+    try {
+      const { workerId } = req.params;
+      if (!/^[a-f0-9]{8}$/.test(workerId)) {
+        return res.status(400).json({ error: 'Invalid worker ID format' });
+      }
+
+      const result = getDelegationMetrics(workerId);
+      if (!result) {
+        return res.status(404).json({ error: 'Resource not found' });
+      }
+
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
+    }
+  });
+
   // GET /api/metrics/realtime - Get last 50 data points per metric type
   router.get('/metrics/realtime', (req, res) => {
     try {
@@ -893,11 +913,22 @@ export function createSystemRoutes(theaRoot, io) {
 
       const h = (name) => apiRes.headers.get(name);
 
+      // Only parse usage if the API returned rate limit headers.
+      // On 401/error responses, headers are absent — returning 0% would be wrong.
+      const hasUtilization = h('anthropic-ratelimit-unified-5h-utilization') !== null;
+      if (!hasUtilization) {
+        // Return stale cache if available (better than 0%), otherwise error
+        if (_usageCache) {
+          return res.json({ ..._usageCache, stale: true });
+        }
+        return res.status(502).json({ error: `Anthropic API returned ${apiRes.status} without rate limit headers` });
+      }
+
       const usage = {
         status: h('anthropic-ratelimit-unified-status') || 'unknown',
         session: {
           status: h('anthropic-ratelimit-unified-5h-status'),
-          utilization: parseFloat(h('anthropic-ratelimit-unified-5h-utilization') || '0'),
+          utilization: parseFloat(h('anthropic-ratelimit-unified-5h-utilization')),
           reset: parseInt(h('anthropic-ratelimit-unified-5h-reset') || '0', 10)
         },
         weekly: {

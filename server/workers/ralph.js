@@ -8,6 +8,7 @@ import {
   STRATEGOS_API, MAX_CONCURRENT_WORKERS,
   path, normalizeWorker,
   respawnSuggestions,
+  CHECKPOINT_DIR, readFileSync, existsSync,
 } from './state.js';
 
 import { isProtectedWorker } from './templates.js';
@@ -66,16 +67,23 @@ export function tryAutoPromoteWorker(worker, io, source = 'unknown') {
       outputs: worker.ralphOutputs,
       artifacts: worker.ralphArtifacts,
       parentWorkerId: worker.parentWorkerId,
+      delegationMetrics: worker.delegationMetrics || null,
     });
   }
 
   // Deliver results to parent worker
   if (worker.parentWorkerId) {
+    const dm = worker.delegationMetrics;
+    const delegationLine = dm
+      ? `Delegation: spawned ${dm.spawnsIssued} workers, ${dm.roleViolations} role violations, ${dm.filesEdited} files edited, ${dm.commandsRun} commands run`
+      : null;
+
     const resultSummary = [
       `[RESULTS FROM ${worker.label} (${workerId})]`,
       worker.ralphLearnings ? `Learnings: ${worker.ralphLearnings}` : null,
       worker.ralphOutputs ? `Outputs: ${typeof worker.ralphOutputs === 'string' ? worker.ralphOutputs : JSON.stringify(worker.ralphOutputs)}` : null,
       worker.ralphArtifacts ? `Artifacts: ${Array.isArray(worker.ralphArtifacts) ? worker.ralphArtifacts.join(', ') : worker.ralphArtifacts}` : null,
+      delegationLine,
       `Status: Complete (auto-promoted). Worker is alive for follow-up questions.`,
       `To dismiss: curl -s -X POST ${STRATEGOS_API}/api/workers/${workerId}/dismiss`,
     ].filter(Boolean).join('\n');
@@ -260,17 +268,25 @@ export function updateWorkerRalphStatus(workerId, signalData, io = null) {
         learnings: worker.ralphLearnings,
         outputs: worker.ralphOutputs,
         artifacts: worker.ralphArtifacts,
-        parentWorkerId: worker.parentWorkerId
+        parentWorkerId: worker.parentWorkerId,
+        delegationMetrics: worker.delegationMetrics || null,
       });
     }
 
     // Auto-deliver structured results to parent worker
     if (worker.parentWorkerId) {
+      // Include delegation metrics summary for generals
+      const dm = worker.delegationMetrics;
+      const delegationLine = dm
+        ? `Delegation: spawned ${dm.spawnsIssued} workers, ${dm.roleViolations} role violations, ${dm.filesEdited} files edited, ${dm.commandsRun} commands run`
+        : null;
+
       const resultSummary = [
         `[RESULTS FROM ${worker.label} (${workerId})]`,
         learnings ? `Learnings: ${learnings}` : null,
         outputs ? `Outputs: ${typeof outputs === 'string' ? outputs : JSON.stringify(outputs)}` : null,
         artifacts ? `Artifacts: ${Array.isArray(artifacts) ? artifacts.join(', ') : artifacts}` : null,
+        delegationLine,
         `Status: Complete. Worker is alive for follow-up questions.`,
         `To dismiss: curl -s -X POST ${STRATEGOS_API}/api/workers/${workerId}/dismiss`
       ].filter(Boolean).join('\n');
@@ -323,8 +339,12 @@ function _updateParentAggregation(parentWorkerId, io) {
     .filter(Boolean);
   if (children.length === 0) return;
 
+  // Use childWorkerHistory for total count (includes dismissed children)
+  const historyCount = (parent.childWorkerHistory || []).length;
+  const dismissedCount = historyCount - children.filter(c => (parent.childWorkerHistory || []).includes(c.id)).length;
+
   let totalProgress = 0;
-  let doneCount = 0;
+  let doneCount = dismissedCount; // Dismissed children count as done
   const steps = [];
   for (const child of children) {
     const cp = child.ralphProgress || 0;
@@ -339,10 +359,13 @@ function _updateParentAggregation(parentWorkerId, io) {
       }
     }
   }
-  const avgProgress = Math.round(totalProgress / children.length);
-  const stepSummary = doneCount === children.length
+  // Total includes dismissed (scored at 100%) + live children
+  const totalChildren = Math.max(children.length + dismissedCount, 1);
+  totalProgress += dismissedCount * 100; // Each dismissed child = 100% progress
+  const avgProgress = Math.round(totalProgress / totalChildren);
+  const stepSummary = doneCount === totalChildren
     ? `All ${doneCount} children complete`
-    : `${doneCount}/${children.length} done` + (steps.length > 0 ? ` | ${steps[0]}` : '');
+    : `${doneCount}/${totalChildren} done` + (steps.length > 0 ? ` | ${steps[0]}` : '');
 
   // Only auto-update if parent hasn't manually signaled, OR if aggregate is higher.
   // If the parent has directly signaled via updateWorkerRalphStatus, _ralphManuallySignaled
@@ -367,7 +390,7 @@ function _updateParentAggregation(parentWorkerId, io) {
 
   // Auto-promote parent to done when ALL children are done and parent is at >= 80%
   // Skip persistent tiers (GENERAL/COLONEL) — they manage their own lifecycle
-  if (doneCount === children.length && parent.ralphStatus !== 'done' &&
+  if (doneCount === totalChildren && parent.ralphStatus !== 'done' &&
       parent.status !== 'awaiting_review' && !isPersistentTier(parent) &&
       (parent.ralphProgress >= 80 || avgProgress >= 100)) {
     parent.ralphProgress = 100;
@@ -375,7 +398,7 @@ function _updateParentAggregation(parentWorkerId, io) {
     parent.ralphSignaledAt = new Date();
     parent.status = 'awaiting_review';
     parent.awaitingReviewAt = new Date();
-    getLogger().info(`Auto-promoted parent ${parentWorkerId} (${parent.label}) to done (all ${children.length} children complete)`, { parentWorkerId, label: parent.label, childCount: children.length });
+    getLogger().info(`Auto-promoted parent ${parentWorkerId} (${parent.label}) to done (all ${totalChildren} children complete, ${dismissedCount} dismissed)`, { parentWorkerId, label: parent.label, childCount: totalChildren });
     if (io) {
       io.emit('worker:updated', normalizeWorker(parent));
       io.emit('worker:awaiting_review', {
@@ -453,6 +476,7 @@ export function getWorkerInternal(workerId) {
   return {
     ...worker,
     childWorkerIds: [...(worker.childWorkerIds || [])],
+    childWorkerHistory: [...(worker.childWorkerHistory || [])],
     dependsOn: [...(worker.dependsOn || [])],
     settings: worker.settings ? { ...worker.settings } : {},
   };
@@ -471,7 +495,7 @@ export function getChildWorkers(parentWorkerId) {
   if (!parent) return [];
 
   const childIds = parent.childWorkerIds || [];
-  return childIds.map(childId => {
+  const liveChildren = childIds.map(childId => {
     const child = workers.get(childId);
     if (!child) return null;
     return {
@@ -493,6 +517,42 @@ export function getChildWorkers(parentWorkerId) {
       health: child.health,
     };
   }).filter(Boolean);
+
+  // Include historical children from checkpoints (dismissed/killed)
+  const historyIds = parent.childWorkerHistory || [];
+  const liveIdSet = new Set(childIds);
+  const historicalChildren = historyIds
+    .filter(hid => !liveIdSet.has(hid)) // Only those no longer live
+    .map(hid => {
+      try {
+        const checkpointPath = path.join(CHECKPOINT_DIR, `${hid}.json`);
+        if (!existsSync(checkpointPath)) return null;
+        const checkpoint = JSON.parse(readFileSync(checkpointPath, 'utf-8'));
+        return {
+          id: checkpoint.workerId,
+          label: checkpoint.label || hid,
+          status: 'dismissed',
+          ralphMode: true,
+          ralphStatus: checkpoint.ralphStatus || 'done',
+          ralphSignaledAt: checkpoint.diedAt || null,
+          ralphLearnings: checkpoint.ralphLearnings || null,
+          ralphProgress: checkpoint.ralphProgress ?? 100,
+          ralphCurrentStep: checkpoint.ralphCurrentStep || 'Dismissed',
+          ralphOutputs: checkpoint.ralphOutputs || null,
+          ralphArtifacts: checkpoint.ralphArtifacts || null,
+          taskDescription: checkpoint.task?.description?.substring(0, 200) || null,
+          createdAt: checkpoint.createdAt || null,
+          lastActivity: checkpoint.diedAt || null,
+          durationMs: checkpoint.uptime || 0,
+          health: 'dismissed',
+        };
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+
+  return [...liveChildren, ...historicalChildren];
 }
 
 export function getSiblingWorkers(workerId) {
@@ -577,4 +637,54 @@ export function getWorkerEfficiency() {
       ralphStatus: w.ralphStatus || null,
       uptime: Math.max(0, Date.now() - new Date(w.createdAt).getTime()) || 0,
     }));
+}
+
+// ============================================
+// DELEGATION METRICS (for tracking general behavior)
+// ============================================
+
+const VALID_DELEGATION_FIELDS = ['roleViolations', 'filesEdited', 'commandsRun'];
+
+/**
+ * Increment a delegation metric for a worker.
+ * Called by sentinel role-violation detection to record general misbehavior.
+ * @param {string} workerId - Worker ID
+ * @param {string} field - One of: roleViolations, filesEdited, commandsRun
+ * @param {number} [amount=1] - Amount to increment by
+ * @returns {boolean} True if metric was incremented
+ */
+export function incrementDelegationMetric(workerId, field, amount = 1) {
+  if (!VALID_DELEGATION_FIELDS.includes(field)) {
+    getLogger().warn(`Invalid delegation metric field: ${field}`, { workerId, field });
+    return false;
+  }
+  const worker = workers.get(workerId);
+  if (!worker) return false;
+  if (!worker.delegationMetrics) {
+    worker.delegationMetrics = { spawnsIssued: 0, roleViolations: 0, filesEdited: 0, commandsRun: 0 };
+  }
+  worker.delegationMetrics[field] += amount;
+  getLogger().info(`Delegation metric ${field} incremented for ${workerId} (${worker.label}): now ${worker.delegationMetrics[field]}`, { workerId, field, value: worker.delegationMetrics[field] });
+  return true;
+}
+
+/**
+ * Get delegation metrics for a worker.
+ * Returns null if worker not found.
+ */
+export function getDelegationMetrics(workerId) {
+  const worker = workers.get(workerId);
+  if (!worker) return null;
+  const metrics = worker.delegationMetrics || { spawnsIssued: 0, roleViolations: 0, filesEdited: 0, commandsRun: 0 };
+  const upperLabel = (worker.label || '').toUpperCase();
+  const isGeneral = upperLabel.startsWith('GENERAL:') || upperLabel.startsWith('GENERAL ');
+  return {
+    workerId,
+    label: worker.label,
+    isGeneral,
+    metrics: { ...metrics },
+    status: worker.status,
+    ralphStatus: worker.ralphStatus,
+    childCount: (worker.childWorkerIds || []).length,
+  };
 }

@@ -469,6 +469,14 @@ class MetricsService {
         if (staleTimers > 0) {
           console.log(`[MetricsService] Pruned ${staleTimers} stale timers`);
         }
+        // VACUUM when freelist pages exceed threshold
+        try {
+          const freelistCount = this.db.pragma('freelist_count')[0]?.freelist_count ?? 0;
+          if (freelistCount > 500) { // ~2MB of dead pages
+            this.db.exec('VACUUM');
+            console.log(`[MetricsService] VACUUM reclaimed ${freelistCount} freelist pages`);
+          }
+        } catch { /* best effort */ }
       }
     }, 5 * 60 * 1000);
 

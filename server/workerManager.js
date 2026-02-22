@@ -79,6 +79,8 @@ export {
   getRespawnSuggestions,
   removeRespawnSuggestion,
   getWorkerEfficiency,
+  incrementDelegationMetric,
+  getDelegationMetrics,
 } from './workers/ralph.js';
 
 // From dependencyGraph.js

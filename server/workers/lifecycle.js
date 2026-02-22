@@ -25,6 +25,34 @@ import {
   writeGeminiContext, removeGeminiContext,
 } from './templates.js';
 
+// ============================================
+// TOOL RESTRICTIONS BY ROLE
+// ============================================
+
+// Roles that are read-only / delegation-only — no Edit, Write, NotebookEdit, or Task
+const READ_ONLY_ROLES = new Set(['GENERAL', 'COLONEL', 'REVIEW', 'RESEARCH']);
+
+// --tools flag: comma-separated, restricts which built-in tools EXIST (not just permissions)
+// --allowedTools only controls permission prompts — does NOT prevent usage!
+const READ_ONLY_TOOLS = 'Read,Glob,Grep,Bash,WebSearch,WebFetch';
+
+/**
+ * Returns additional CLI args for `claude` based on worker role.
+ * Read-only roles get --tools to structurally remove Edit/Write/NotebookEdit.
+ * Also --disallowedTools for dangerous Bash patterns.
+ */
+function getToolRestrictionArgs(label) {
+  const { prefix } = detectWorkerType(label);
+  if (prefix && READ_ONLY_ROLES.has(prefix)) {
+    console.log(`[SpawnWorker] Tool restriction (--tools): ${READ_ONLY_TOOLS} for ${label}`);
+    return [
+      '--tools', READ_ONLY_TOOLS,
+      '--disallowedTools', 'Bash(rm *)', 'Bash(rmdir *)',
+    ];
+  }
+  return [];
+}
+
 import {
   startPtyCapture, stopPtyCapture, sendInputDirect, sendInput,
 } from './output.js';
@@ -86,6 +114,7 @@ function initializeWorker(id, config, io) {
     parentLabel,
     task,
     childWorkerIds: [],
+    childWorkerHistory: [],
     autoAccept,
     autoAcceptPaused: false,
     lastAutoAcceptHash: null,
@@ -108,6 +137,14 @@ function initializeWorker(id, config, io) {
     bulldozeConsecutiveErrors: 0,
     bulldozeStartedAt: null,
     bulldozeLastCycleAt: null,
+    // Delegation metrics — only meaningful for generals, but initialized for all
+    // so downstream code doesn't need null checks
+    delegationMetrics: {
+      spawnsIssued: 0,
+      roleViolations: 0,
+      filesEdited: 0,
+      commandsRun: 0,
+    },
   };
 
   workers.set(id, worker);
@@ -124,7 +161,19 @@ function initializeWorker(id, config, io) {
     const parentWorker = workers.get(parentWorkerId);
     if (parentWorker) {
       parentWorker.childWorkerIds = parentWorker.childWorkerIds || [];
-      parentWorker.childWorkerIds.push(id);
+      // Idempotent push: prevent duplicate child IDs (e.g. from retry/re-register)
+      if (!parentWorker.childWorkerIds.includes(id)) {
+        parentWorker.childWorkerIds.push(id);
+      }
+      // Track delegation: parent spawned a child
+      if (parentWorker.delegationMetrics) {
+        parentWorker.delegationMetrics.spawnsIssued++;
+      }
+    } else {
+      // Parent doesn't exist (already killed/dismissed) — don't silently create an orphan
+      console.warn(`[InitWorker] parentWorkerId "${parentWorkerId}" not found for worker ${id} (${label}). Setting parentWorkerId to null.`);
+      worker.parentWorkerId = null;
+      worker.parentLabel = null;
     }
   }
 
@@ -154,7 +203,7 @@ function initializeWorker(id, config, io) {
             stdinMsg = taskMsg;
           }
         } else if (workerType.isGeneral) {
-          stdinMsg = 'Begin autonomous operations. Review the project state, identify issues and improvements, and delegate work to specialist workers as needed.';
+          stdinMsg = 'Awaiting orders. You have no assigned task yet — wait for the human to provide one. Do NOT begin autonomous operations or start scouting.';
         }
 
         if (stdinMsg) {
@@ -361,13 +410,14 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
         'gemini', '--yolo'
       ]);
     } else {
+      const toolArgs = getToolRestrictionArgs(workerLabel);
       await spawnTmux([
         'new-session', '-d',
         '-s', sessionName,
         '-x', String(DEFAULT_COLS),
         '-y', String(DEFAULT_ROWS),
         '-c', projectPath,
-        'claude'
+        'claude', ...toolArgs
       ]);
     }
     console.log(`[SpawnWorker] tmux session ${sessionName} created successfully`);
@@ -499,13 +549,14 @@ async function startPendingWorker(workerId, io = null) {
         'gemini', '--yolo'
       ]);
     } else {
+      const toolArgs = getToolRestrictionArgs(pending.label);
       await spawnTmux([
         'new-session', '-d',
         '-s', sessionName,
         '-x', String(DEFAULT_COLS),
         '-y', String(DEFAULT_ROWS),
         '-c', pending.projectPath,
-        'claude'
+        'claude', ...toolArgs
       ]);
     }
     resetCircuitBreakerOnSuccess();
@@ -613,7 +664,19 @@ async function teardownWorker(workerId, worker, io, { activityMessage, logPrefix
   if (worker.parentWorkerId) {
     const parent = workers.get(worker.parentWorkerId);
     if (parent?.childWorkerIds) {
-      parent.childWorkerIds = parent.childWorkerIds.filter(id => id !== workerId);
+      // Use splice-by-index instead of filter-and-reassign to avoid race condition:
+      // Two concurrent teardowns could both read the same array, filter out their own ID,
+      // and the second write would overwrite the first (re-adding the first child).
+      // Splice mutates in-place on the same array reference, so concurrent removals are safe.
+      const idx = parent.childWorkerIds.indexOf(workerId);
+      if (idx !== -1) {
+        parent.childWorkerIds.splice(idx, 1);
+      }
+      // Preserve history of all children that ever existed
+      if (!parent.childWorkerHistory) parent.childWorkerHistory = [];
+      if (!parent.childWorkerHistory.includes(workerId)) {
+        parent.childWorkerHistory.push(workerId);
+      }
     }
   }
 
@@ -782,6 +845,35 @@ export async function killWorker(workerId, io = null, options = {}) {
     } catch {
       // Ignore
     }
+  }
+
+  // Handle orphaned children: re-parent to grandparent or log warning
+  if (worker.childWorkerIds && worker.childWorkerIds.length > 0) {
+    const grandparentId = worker.parentWorkerId || null;
+    const grandparent = grandparentId ? workers.get(grandparentId) : null;
+
+    for (const childId of [...worker.childWorkerIds]) {
+      const child = workers.get(childId);
+      if (!child) continue;
+
+      if (grandparent) {
+        // Re-parent to grandparent
+        child.parentWorkerId = grandparentId;
+        child.parentLabel = grandparent.label;
+        grandparent.childWorkerIds = grandparent.childWorkerIds || [];
+        if (!grandparent.childWorkerIds.includes(childId)) {
+          grandparent.childWorkerIds.push(childId);
+        }
+        console.log(`[KillWorker] Re-parented orphan ${childId} (${child.label}) to grandparent ${grandparentId} (${grandparent.label})`);
+      } else {
+        // No grandparent — child becomes a root worker
+        child.parentWorkerId = null;
+        child.parentLabel = null;
+        console.warn(`[KillWorker] Orphaned child ${childId} (${child.label}) — no grandparent available, now a root worker`);
+      }
+    }
+    // Clear the dying parent's child list (children have been re-parented)
+    worker.childWorkerIds = [];
   }
 
   await teardownWorker(workerId, worker, io, {
@@ -1154,6 +1246,7 @@ export async function discoverExistingWorkers(io = null) {
         parentWorkerId: null,
         parentLabel: null,
         childWorkerIds: [],
+        childWorkerHistory: [],
         task: null,
         waitingAtPrompt: false,
         autoAccept: false,
