@@ -21,6 +21,9 @@ import {
   GEMINI_IDLE_PATTERNS, GEMINI_ACTIVE_PATTERNS, GEMINI_AUTO_ACCEPT_PATTERNS,
   BULLDOZE_IDLE_THRESHOLD, BULLDOZE_AUDIT_EVERY_N_CYCLES, BULLDOZE_MAX_HOURS,
   BULLDOZE_MAX_COMPACTIONS, BULLDOZE_CONTINUATION_PREFIX,
+  RATE_LIMIT_PATTERN, RATE_LIMIT_RESET_RE, COMPACTION_PATTERN,
+  AUTO_CONTINUE_IDLE_THRESHOLD, AUTO_CONTINUE_RATE_LIMIT_COOLDOWN,
+  AUTO_CONTINUE_MAX_ATTEMPTS, AUTO_CONTINUE_MESSAGE,
   detectWorkerType, isProtectedWorker,
   writeStrategosContext,
   writeGeminiContext,
@@ -138,6 +141,172 @@ async function checkGeneralRoleViolation(workerId, output, io) {
 }
 
 // ============================================
+// AUTO-CONTINUE: Rate Limit + Post-Compaction Recovery
+// ============================================
+
+/**
+ * Parse rate limit reset time from Claude Code output.
+ * Input: "9am", "3pm", "12:30pm" + timezone like "America/New_York"
+ * Returns: Unix timestamp of the reset time, or null if parsing fails.
+ */
+function parseRateLimitResetTime(hours, minutes, ampm, timezone) {
+  try {
+    let h = parseInt(hours);
+    const m = parseInt(minutes || '0');
+    const period = ampm.toLowerCase();
+
+    if (period === 'pm' && h !== 12) h += 12;
+    if (period === 'am' && h === 12) h = 0;
+
+    // Get current time in the target timezone
+    const now = new Date();
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: timezone,
+      hour: 'numeric', minute: 'numeric', hour12: false,
+    });
+    const parts = formatter.formatToParts(now);
+    const currentHour = parseInt(parts.find(p => p.type === 'hour').value);
+    const currentMinute = parseInt(parts.find(p => p.type === 'minute').value);
+
+    let diffMinutes = (h * 60 + m) - (currentHour * 60 + currentMinute);
+    if (diffMinutes <= 0) {
+      if (diffMinutes > -120) {
+        // Reset time was within the last 2 hours — already passed, continue immediately
+        return Date.now();
+      }
+      diffMinutes += 24 * 60; // More than 2 hours ago → must be tomorrow
+    }
+
+    // Add 2-minute buffer so we don't fire the instant the limit resets
+    return Date.now() + (diffMinutes + 2) * 60 * 1000;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Detect rate limits and compaction in worker output (called when output changes).
+ * Sets flags on the worker object for the idle-phase handler to act on.
+ */
+function detectSessionLimits(workerId, stdout, io) {
+  const worker = workers.get(workerId);
+  if (!worker || worker.autoContinue === false) return;
+  if (worker.backend === 'gemini') return; // Gemini patterns TBD
+
+  // trimEnd() strips trailing whitespace from empty tmux pane rows
+  // that can push rate limit text beyond the 1500-char tail window
+  const cleaned = stripAnsiCodes(stdout).trimEnd();
+  const tail = cleaned.slice(-1500);
+
+  // --- Rate limit detection ---
+  const isRateLimited = RATE_LIMIT_PATTERN.test(tail);
+
+  if (isRateLimited && !worker._rateLimitDetected) {
+    // Newly detected rate limit
+    worker._rateLimitDetected = true;
+    worker._sessionLimitDetected = true;
+    worker._rateLimitDetectedAt = Date.now();
+    worker._autoContinueIdleCount = 0;
+    worker._autoContinueAttempts = 0;
+    worker._autoContinueExhausted = false;
+    worker.rateLimited = true;
+
+    // Try to parse reset time
+    const resetMatch = tail.match(RATE_LIMIT_RESET_RE);
+    if (resetMatch) {
+      worker.rateLimitResetAt = parseRateLimitResetTime(
+        resetMatch[1], resetMatch[2], resetMatch[3], resetMatch[4]);
+      console.log(`[AutoContinue] Rate limit detected for ${worker.label} (${workerId}), resets ~${new Date(worker.rateLimitResetAt).toLocaleTimeString()}`);
+    } else {
+      worker.rateLimitResetAt = null;
+      console.log(`[AutoContinue] Rate limit detected for ${worker.label} (${workerId}), reset time unknown`);
+    }
+
+    if (io) {
+      io.emit('worker:rate_limited', { workerId, label: worker.label, resetAt: worker.rateLimitResetAt });
+      io.emit('worker:updated', normalizeWorker(worker));
+    }
+  } else if (!isRateLimited && worker._rateLimitDetected) {
+    // Rate limit cleared — worker output no longer shows rate limit in tail
+    worker._rateLimitDetected = false;
+    worker._sessionLimitDetected = false;
+    worker.rateLimited = false;
+    worker.rateLimitResetAt = null;
+    worker._autoContinueIdleCount = 0;
+    console.log(`[AutoContinue] Rate limit cleared for ${worker.label} (${workerId})`);
+    if (io) io.emit('worker:updated', normalizeWorker(worker));
+  }
+
+  // --- Compaction detection (only when no rate limit) ---
+  if (!worker._rateLimitDetected) {
+    const isCompacted = COMPACTION_PATTERN.test(tail);
+
+    if (isCompacted && !worker._compactionDetected) {
+      worker._compactionDetected = true;
+      worker._sessionLimitDetected = true;
+      worker._autoContinueIdleCount = 0;
+      worker._autoContinueAttempts = 0;
+      worker._autoContinueExhausted = false;
+      console.log(`[AutoContinue] Compaction detected for ${worker.label} (${workerId})`);
+    } else if (!isCompacted && worker._compactionDetected) {
+      // Compaction scrolled off — worker resumed
+      worker._compactionDetected = false;
+      if (!worker._rateLimitDetected) {
+        worker._sessionLimitDetected = false;
+      }
+      worker._autoContinueIdleCount = 0;
+    }
+  }
+}
+
+/**
+ * Send a continuation message to an idle worker after rate limit or compaction.
+ * Called from the idle-detection loop when conditions are met.
+ */
+async function handleAutoContinue(workerId, io) {
+  const worker = workers.get(workerId);
+  if (!worker) return;
+
+  // Guard: don't exceed max attempts
+  if ((worker._autoContinueAttempts || 0) >= AUTO_CONTINUE_MAX_ATTEMPTS) {
+    if (!worker._autoContinueExhausted) {
+      worker._autoContinueExhausted = true;
+      console.warn(`[AutoContinue] Max attempts (${AUTO_CONTINUE_MAX_ATTEMPTS}) reached for ${worker.label} (${workerId})`);
+      if (io) {
+        io.emit('worker:autocontinue:exhausted', { workerId, label: worker.label, attempts: AUTO_CONTINUE_MAX_ATTEMPTS });
+      }
+    }
+    return;
+  }
+
+  // Guard: don't send if already sending input
+  if (_sendingInput.has(workerId)) return;
+
+  // Guard: don't send if queue has pending items
+  const queue = commandQueues.get(workerId) || [];
+  if (queue.length > 0) return;
+
+  worker._autoContinueAttempts = (worker._autoContinueAttempts || 0) + 1;
+
+  try {
+    await sendInput(workerId, AUTO_CONTINUE_MESSAGE, io);
+    worker.autoContinueCount = (worker.autoContinueCount || 0) + 1;
+    worker.lastActivity = new Date();
+    console.log(`[AutoContinue] Sent continuation to ${worker.label} (${workerId}), attempt ${worker._autoContinueAttempts}/${AUTO_CONTINUE_MAX_ATTEMPTS}`);
+    if (io) {
+      io.emit('worker:autocontinue', {
+        workerId, label: worker.label,
+        attempt: worker._autoContinueAttempts,
+        trigger: worker._rateLimitDetected ? 'rate_limit' : 'compaction',
+      });
+      io.emit('worker:updated', normalizeWorker(worker));
+    }
+  } catch (err) {
+    console.error(`[AutoContinue] Failed for ${worker.label} (${workerId}): ${err.message}`);
+  }
+}
+
+// ============================================
 // PTY-BASED REAL-TIME OUTPUT CAPTURE
 // ============================================
 
@@ -222,6 +391,7 @@ async function captureWorkerOutput(workerId, instance, io) {
     outputBuffers.set(workerId, stdout);
 
     if (!outputChanged) {
+      // Bulldoze continuation (existing)
       if (worker && worker.bulldozeMode && !worker.bulldozePaused && worker.status === 'running') {
         worker.bulldozeIdleCount = (worker.bulldozeIdleCount || 0) + 1;
 
@@ -252,12 +422,51 @@ async function captureWorkerOutput(workerId, instance, io) {
           }
         }
       }
+
+      // Auto-continue for rate-limited / post-compaction workers (skip if bulldoze handles it)
+      if (worker && worker.autoContinue !== false && !worker.bulldozeMode &&
+          worker.status === 'running' && worker._sessionLimitDetected &&
+          worker.ralphStatus !== 'done') {
+        worker._autoContinueIdleCount = (worker._autoContinueIdleCount || 0) + 1;
+
+        const threshold = worker._rateLimitDetected
+          ? AUTO_CONTINUE_RATE_LIMIT_COOLDOWN
+          : AUTO_CONTINUE_IDLE_THRESHOLD;
+
+        if (worker._autoContinueIdleCount >= threshold) {
+          // If we know the reset time and haven't reached it yet, skip
+          if (worker.rateLimitResetAt && Date.now() < worker.rateLimitResetAt) {
+            // Still before reset — don't burn attempts
+          } else {
+            const cleaned = stripAnsiCodes(stdout).trimEnd();
+            const tail = cleaned.slice(-1500);
+            const isIdle = CLAUDE_CODE_IDLE_PATTERNS.some(p => p.test(tail));
+            const isActive = CLAUDE_CODE_ACTIVE_PATTERNS.some(p => p.test(cleaned.slice(-200)));
+
+            if (isIdle && !isActive) {
+              handleAutoContinue(workerId, io).catch(err =>
+                console.error(`[AutoContinue] Continuation failed for ${workerId}: ${err.message}`));
+              worker._autoContinueIdleCount = 0;
+            }
+          }
+        }
+      }
+
       return;
     }
+
+    // --- Output changed path ---
 
     if (worker && worker.bulldozeMode) {
       worker.bulldozeIdleCount = 0;
     }
+
+    // Auto-continue: detect rate limits and compaction in fresh output
+    if (worker) {
+      detectSessionLimits(workerId, stdout, io);
+      worker._autoContinueIdleCount = 0;
+    }
+
     instance.lastCaptureHash = hash;
 
     if (worker) {
@@ -844,6 +1053,20 @@ export function updateWorkerSettings(workerId, settings, io = null) {
       worker.lastAutoAcceptHash = null;
     }
     console.log(`[AutoAccept] ${worker.label} autoAcceptPaused set to ${settings.autoAcceptPaused}`);
+  }
+
+  if (settings.autoContinue !== undefined) {
+    if (typeof settings.autoContinue !== 'boolean') {
+      throw new Error('autoContinue must be a boolean');
+    }
+    worker.autoContinue = settings.autoContinue;
+    if (settings.autoContinue) {
+      // Reset counters so it can start fresh
+      worker._autoContinueAttempts = 0;
+      worker._autoContinueExhausted = false;
+      worker._autoContinueIdleCount = 0;
+    }
+    console.log(`[AutoContinue] ${worker.label} autoContinue set to ${settings.autoContinue}`);
   }
 
   if (settings.ralphMode !== undefined) {

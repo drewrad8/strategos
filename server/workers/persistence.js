@@ -203,6 +203,9 @@ async function _doSaveWorkerState() {
         roleViolations: w.roleViolations ?? 0,
         // Delegation metrics (for tracking general behavior)
         delegationMetrics: w.delegationMetrics ?? null,
+        // Auto-continue settings (must survive restart)
+        autoContinue: w.autoContinue ?? true,
+        autoContinueCount: w.autoContinueCount ?? 0,
       }))
     };
 
@@ -280,6 +283,8 @@ export function saveWorkerStateSync() {
         bulldozeConsecutiveErrors: w.bulldozeConsecutiveErrors ?? 0,
         roleViolations: w.roleViolations ?? 0,
         delegationMetrics: w.delegationMetrics ?? null,
+        autoContinue: w.autoContinue ?? true,
+        autoContinueCount: w.autoContinueCount ?? 0,
       }))
     };
 
@@ -515,6 +520,18 @@ export async function restoreWorkerState(io = null) {
             commandsRun: typeof savedWorker.delegationMetrics.commandsRun === 'number' ? savedWorker.delegationMetrics.commandsRun : 0,
           }
           : { spawnsIssued: 0, roleViolations: 0, filesEdited: 0, commandsRun: 0 },
+        // Auto-continue settings
+        autoContinue: savedWorker.autoContinue !== false, // default true
+        autoContinueCount: typeof savedWorker.autoContinueCount === 'number' ? savedWorker.autoContinueCount : 0,
+        // Runtime-only auto-continue state (reset on restore, re-detected from output)
+        _rateLimitDetected: false,
+        _sessionLimitDetected: false,
+        _compactionDetected: false,
+        _autoContinueIdleCount: 0,
+        _autoContinueAttempts: 0,
+        _autoContinueExhausted: false,
+        rateLimited: false,
+        rateLimitResetAt: null,
       };
 
       // Per-worker try-catch: if one worker fails to initialize, continue restoring others
