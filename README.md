@@ -1,25 +1,6 @@
 # Strategos
 
-```
-    ╔═══════════════════════════════════════════════════╗
-    ║  STRATEGOS          5h [████░░] 62%  7d [██░░] 38%  ║
-    ╠═══════════════════════════════════════════════════╣
-    ║                                                   ║
-    ║  GENERAL: system-audit    IMPL: fix-auth-bug      ║
-    ║  ● healthy  65%           ● healthy  100%         ║
-    ║  ├─ COLONEL: backend      awaiting review         ║
-    ║  │  ├─ IMPL: db-migration                         ║
-    ║  │  └─ TEST: integration                          ║
-    ║  └─ RESEARCH: api-docs                            ║
-    ║                                                   ║
-    ║  ┌───────────────────────────────────────────┐    ║
-    ║  │ $ claude                                  │    ║
-    ║  │ Analyzed auth.js — session timeout was    │    ║
-    ║  │ set to 5min on line 84. Changed to 30min. │    ║
-    ║  │ Committed as abc1234.                     │    ║
-    ║  └───────────────────────────────────────────┘    ║
-    ╚═══════════════════════════════════════════════════╝
-```
+![Strategos Dashboard](docs/screenshot.png)
 
 A web dashboard for managing AI coding agents. Spawn Claude Code or Gemini CLI workers in tmux sessions, watch their terminals live, organize them into hierarchies, and let them coordinate autonomously.
 
