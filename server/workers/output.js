@@ -293,11 +293,11 @@ async function handleAutoContinue(workerId, io) {
   try {
     await sendInput(workerId, AUTO_CONTINUE_MESSAGE, io);
 
-    // Clear detection flags so we don't re-fire from stale tail text.
-    // If the worker hits another limit, detectSessionLimits() will re-set these from fresh output.
+    // Clear _sessionLimitDetected to stop the idle handler from re-firing.
+    // Do NOT clear _rateLimitDetected or _compactionDetected — those must stay true
+    // so detectSessionLimits() skips re-detection of the same stale tail text.
+    // They clear naturally when the text scrolls off (lines 229-238, 251-257).
     worker._sessionLimitDetected = false;
-    worker._rateLimitDetected = false;
-    worker._compactionDetected = false;
     worker.rateLimited = false;
     worker.rateLimitResetAt = null;
 
