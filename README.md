@@ -1,8 +1,27 @@
 # Strategos
 
-A web dashboard for orchestrating AI coding agents. Spawn Claude Code or Gemini CLI workers in tmux sessions, watch their terminals live, organize them into hierarchies, and let them coordinate autonomously.
+```
+    ╔═══════════════════════════════════════════════════╗
+    ║  STRATEGOS          5h [████░░] 62%  7d [██░░] 38%  ║
+    ╠═══════════════════════════════════════════════════╣
+    ║                                                   ║
+    ║  GENERAL: system-audit    IMPL: fix-auth-bug      ║
+    ║  ● healthy  65%           ● healthy  100%         ║
+    ║  ├─ COLONEL: backend      awaiting review         ║
+    ║  │  ├─ IMPL: db-migration                         ║
+    ║  │  └─ TEST: integration                          ║
+    ║  └─ RESEARCH: api-docs                            ║
+    ║                                                   ║
+    ║  ┌───────────────────────────────────────────┐    ║
+    ║  │ $ claude                                  │    ║
+    ║  │ Analyzed auth.js — session timeout was    │    ║
+    ║  │ set to 5min on line 84. Changed to 30min. │    ║
+    ║  │ Committed as abc1234.                     │    ║
+    ║  └───────────────────────────────────────────┘    ║
+    ╚═══════════════════════════════════════════════════╝
+```
 
-![Strategos Dashboard](docs/screenshot.png)
+A web dashboard for managing AI coding agents. Spawn Claude Code or Gemini CLI workers in tmux sessions, watch their terminals live, organize them into hierarchies, and let them coordinate autonomously.
 
 ## Install
 
@@ -10,12 +29,11 @@ A web dashboard for orchestrating AI coding agents. Spawn Claude Code or Gemini 
 git clone https://github.com/drewrad8/strategos.git
 cd strategos
 npm install
-npm start
+npm run build
+npm run server
 ```
 
 Open **http://localhost:38007**.
-
-The client is pre-built in `client/dist/`. No build step required.
 
 ## Requirements
 
@@ -29,13 +47,13 @@ You give workers a task. They run in isolated tmux sessions. You see their termi
 
 Workers can be organized into hierarchies — a GENERAL spawns COLONELs who manage IMPL/TEST/RESEARCH specialists. Progress bubbles up automatically via the **Ralph protocol**: workers signal `in_progress`, `done`, or `blocked` with a completion percentage.
 
-**Bulldoze mode** keeps workers going autonomously — when a worker completes a cycle, it gets a continuation prompt. Useful for long-running tasks where you don't want to babysit.
+**Bulldoze mode** keeps workers going autonomously — when a worker stalls, it gets a continuation prompt. Useful for long-running tasks where you don't want to babysit.
 
-The dashboard shows worker cards, a tree view of hierarchies, live terminals, health monitoring, and project organization. Keyboard shortcuts for everything (press `?`).
+The dashboard shows worker cards, a tree view of hierarchies, live terminals, health status, and project organization. Keyboard shortcuts for everything (press `?`).
 
 ## Spawning workers
 
-From the UI, click "New Session" and pick a template.
+From the UI, click "Spawn Worker" and pick a template.
 
 From the API:
 
@@ -59,20 +77,29 @@ All via environment variables. The defaults work out of the box.
 | Variable | Default | What it does |
 |----------|---------|-------------|
 | `PORT` | `38007` | Server port |
-| `THEA_ROOT` | _(auto-detected)_ | Parent directory to scan for projects. Auto-derives from install location. |
-| `STRATEGOS_API_KEY` | _(none)_ | Set to require API key authentication (min 16 chars) |
+| `THEA_ROOT` | `/thea` | Where to scan for projects |
+| `STRATEGOS_API_KEY` | _(none)_ | Set this to require auth (min 16 chars) |
 | `ENABLE_OLLAMA_SUMMARIES` | `false` | AI-powered worker summaries via local Ollama |
 
 See [docs/STRATEGOS_USAGE_GUIDE.md](docs/STRATEGOS_USAGE_GUIDE.md) for the full API reference.
+
+## Running as a service
+
+```bash
+cp strategos.service ~/.config/systemd/user/strategos.service
+# Edit paths in the file to match your setup
+systemctl --user enable --now strategos
+```
+
+Uses `KillMode=process` so server restarts don't kill your running workers.
 
 ## Development
 
 ```bash
 npm run dev    # Server on :38007, Vite HMR on :38008
-npm run build  # Rebuild client
 npm test       # Playwright e2e tests
 ```
 
 ## License
 
-MIT
+ISC
