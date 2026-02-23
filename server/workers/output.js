@@ -288,8 +288,19 @@ async function handleAutoContinue(workerId, io) {
 
   worker._autoContinueAttempts = (worker._autoContinueAttempts || 0) + 1;
 
+  const trigger = worker._rateLimitDetected ? 'rate_limit' : 'compaction';
+
   try {
     await sendInput(workerId, AUTO_CONTINUE_MESSAGE, io);
+
+    // Clear detection flags so we don't re-fire from stale tail text.
+    // If the worker hits another limit, detectSessionLimits() will re-set these from fresh output.
+    worker._sessionLimitDetected = false;
+    worker._rateLimitDetected = false;
+    worker._compactionDetected = false;
+    worker.rateLimited = false;
+    worker.rateLimitResetAt = null;
+
     worker.autoContinueCount = (worker.autoContinueCount || 0) + 1;
     worker.lastActivity = new Date();
     console.log(`[AutoContinue] Sent continuation to ${worker.label} (${workerId}), attempt ${worker._autoContinueAttempts}/${AUTO_CONTINUE_MAX_ATTEMPTS}`);
@@ -297,7 +308,7 @@ async function handleAutoContinue(workerId, io) {
       io.emit('worker:autocontinue', {
         workerId, label: worker.label,
         attempt: worker._autoContinueAttempts,
-        trigger: worker._rateLimitDetected ? 'rate_limit' : 'compaction',
+        trigger,
       });
       io.emit('worker:updated', normalizeWorker(worker));
     }
