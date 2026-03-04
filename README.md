@@ -1,7 +1,5 @@
 # Strategos
 
-![Strategos Dashboard](docs/screenshot.png)
-
 A web dashboard for managing AI coding agents. Spawn Claude Code or Gemini CLI workers in tmux sessions, watch their terminals live, organize them into hierarchies, and let them coordinate autonomously.
 
 ## Install
