@@ -1,6 +1,6 @@
 import express from 'express';
 import { sanitizeErrorMessage } from '../errorUtils.js';
-import { getWorkerInternal } from '../workerManager.js';
+import { getWorkerInternal, updateWorkerRalphStatus } from '../workerManager.js';
 
 /**
  * Ralph routes for worker completion signaling
@@ -80,17 +80,8 @@ export function createRalphRoutes(ralphService) {
 
   /**
    * POST /api/ralph/signal/:token
-   * Signal status from a worker (progress, completion, or blocked)
-   * Workers call this endpoint to signal their status
-   *
-   * Body:
-   *   - status: 'in_progress' | 'done' | 'blocked' (required)
-   *   - progress: number 0-100 (optional, for in_progress)
-   *   - currentStep: string (optional, describes current activity)
-   *   - reason: string (optional, for blocked status)
-   *   - learnings: string (optional, summary/notes)
-   *   - outputs: object (optional, structured outputs { key: value })
-   *   - artifacts: array (optional, file paths created)
+   * Signal status from a worker using completion token (legacy path).
+   * The by-worker/:workerId route below is preferred.
    */
   router.post('/signal/:token', async (req, res) => {
     try {
@@ -120,8 +111,8 @@ export function createRalphRoutes(ralphService) {
 
   /**
    * POST /api/ralph/signal/by-worker/:workerId
-   * Signal status using worker ID instead of ralph token.
-   * Looks up the worker's ralph token and forwards to the signal handler.
+   * Signal status using worker ID directly — primary signaling path.
+   * Skips token lookup and calls updateWorkerRalphStatus directly.
    */
   router.post('/signal/by-worker/:workerId', async (req, res) => {
     try {
@@ -141,15 +132,13 @@ export function createRalphRoutes(ralphService) {
         return res.status(400).json({ error: 'Worker does not have Ralph mode enabled' });
       }
 
-      // Ensure token is registered (may be lost after server restart)
-      ralphService.registerStandaloneWorker(worker.ralphToken, workerId);
-
       const validation = validateSignalBody(req.body);
       if (validation.error) {
         return res.status(400).json({ error: validation.error });
       }
 
-      const result = await ralphService.handleCompletionSignal(worker.ralphToken, validation.signalData);
+      // Call updateWorkerRalphStatus directly — skip token roundtrip
+      const result = updateWorkerRalphStatus(workerId, validation.signalData, ralphService.io);
 
       if (!result) {
         return res.status(500).json({ error: 'Signal handling failed' });

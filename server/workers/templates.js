@@ -131,6 +131,36 @@ export const GEMINI_AUTO_ACCEPT_PATTERNS = [
   /Do you trust this folder/i,
 ];
 
+// ============================================
+// AIDER CLI PATTERNS
+// ============================================
+
+export const AIDER_IDLE_PATTERNS = [
+  /aider>\s*$/m,                   // Aider's standard interactive prompt
+  />\s*$/m,                        // Minimal prompt variant
+];
+
+export const AIDER_ACTIVE_PATTERNS = [
+  /Thinking/i,
+  /Sending/i,                      // "Sending message to model..."
+  /Applying/i,                     // "Applying edit..."
+  /Scanning/i,                     // "Scanning repo..."
+  /Committing/i,
+  /Tokens:/,                       // Token usage line during response
+  /▌/,                             // Streaming cursor
+];
+
+// With --yes, aider auto-accepts most prompts, but git-related prompts may appear
+export const AIDER_AUTO_ACCEPT_PATTERNS = [
+  /\[Y\/n\]/i,                    // Generic yes/no prompt
+  /\[y\/N\]/i,                    // Inverted default yes/no
+  /Create new file\?/i,           // New file creation prompt
+  /Add .+ to the chat\?/i,        // File addition prompt
+  /Do you want to run/i,          // Shell command execution prompt
+  /Allow edits to/i,              // Edit permission prompt
+];
+
+
 export const AUTO_ACCEPT_PAUSE_KEYWORDS = [
   'plan mode',
   'ExitPlanMode',
@@ -156,11 +186,7 @@ export const BULLDOZE_CONTINUATION_PREFIX = '[BULLDOZE';
 export const RATE_LIMIT_PATTERN = /You[''\u2019]ve hit your limit/;
 export const RATE_LIMIT_RESET_RE = /resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(([^)]+)\)/i;
 
-// Detect context compaction: "✻ Crunched for 4m 10s" or "✻ Sautéed for 13m 34s"
-export const COMPACTION_PATTERN = /✻ (?:Crunched|Compacted|Sautéed|Seasoning|Flowing|Brewing|Cooking|Beaming|Warping|Reticulating|Levitating) for/;
-
 // Idle cycles (each ~5s) before sending continuation
-export const AUTO_CONTINUE_IDLE_THRESHOLD = 6;        // 30s for post-compaction
 export const AUTO_CONTINUE_RATE_LIMIT_COOLDOWN = 60;  // 5 min between rate-limit retries
 export const AUTO_CONTINUE_MAX_ATTEMPTS = 10;
 export const AUTO_CONTINUE_MESSAGE = 'Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.';
@@ -225,23 +251,10 @@ COMMANDER'S INTENT (required for every spawn):
   KEY TASKS: What must be accomplished (2-4 verifiable bullets — NOT how-to steps)
   END STATE: What success looks like (observable condition)
 
-FORCE STRUCTURE — Use the Right Tier:
-
-  COLONEL (template: "colonel") — Operational commander. Use when:
-    • A domain has 3+ related tasks that need sequencing (research → design → impl → test)
-    • Work spans multiple projects and needs a dedicated supervisor per project
-    • You have 10+ findings/fixes — batch them under 2-3 COLONELs instead of spawning 10 workers directly
-    • A complex feature requires coordinating multiple specialists with dependencies
-    COLONELs can read AND write code for quick fixes, but delegate substantial work to their own workers.
-    Example: "COLONEL: Auth System Overhaul" who spawns RESEARCH, IMPL, and TEST workers in sequence.
-
-  Specialists (templates: impl, research, test, fix, review) — Direct execution. Use when:
-    • The task is self-contained and takes one worker to complete
-    • No sequencing or coordination needed between tasks
-    • You have ≤5 independent tasks — spawn specialists directly
-
-  RULE: If you find yourself spawning >5 workers directly, STOP. Group related tasks under COLONELs instead.
-  RULE: If a task requires "do X, then based on the result do Y" — that's a COLONEL, not two independent workers.
+FORCE STRUCTURE:
+- COLONEL: 3+ related tasks needing sequencing, multi-project, or 10+ items to batch. Can quick-fix but delegates heavy work.
+- Specialists (impl, research, test, fix, review): Self-contained single tasks, no coordination needed.
+- >5 direct workers? Group under COLONELs. Sequential dependency? Use a COLONEL.
 
 EXAMPLES OF CORRECT GENERAL BEHAVIOR:
   - Task says "fix the auth bug" → Spawn "IMPL: fix auth bug" with description of the bug
@@ -408,53 +421,30 @@ State file format: "## Current" (active), "## Backlog" (prioritized TODO), "## C
     authorityLine = `**Operational Authority:** You are authorized to run scripts, install packages, and modify code within ${escapePromptXml(THEA_ROOT)}/. Act within your task scope. Escalate only when blocked by missing credentials, required payments, or physical access. Do NOT ask the user to do things you can do yourself. **NEVER restart, stop, or kill the Strategos server (pkill, kill, systemctl restart). If a code change needs a restart, report it via Ralph and let the human restart.**`;
   }
 
-  return `# Strategos Worker Instructions
-
-> **IDENTITY: You are worker \`${workerId}\`.** This file is ONLY for worker ${workerId}. If you see other strategos-worker-*.md files with different worker IDs in .claude/rules/, IGNORE THEM COMPLETELY — they belong to sibling workers sharing this project directory. Only follow instructions matching YOUR worker ID: ${workerId}.
+  return `# Worker ${workerId} — ${escapePromptXml(workerLabel)}
 
 ${authorityLine}
 
 **Use Strategos API (\`curl\`) for spawning/coordination. NEVER use Claude Code's Task tool.**
 
-Worker ID: ${workerId} | Label: ${escapePromptXml(workerLabel)} | Role: ${workerRole}
+Worker ID: ${workerId} | Role: ${workerRole}
 Project: ${escapePromptXml(projectName)} | Dir: ${escapePromptXml(projectPath)}
 ${missionSection}${parentSection}${bulldozeSection}${ralphSection}
-## API Best Practices
+## API Tips
+Save curl output to file: \`curl -s URL -o tmp/result.json\` (never pipe to python).
+Plain-text endpoints: /api/workers/:id/status, /api/workers/:id/output?strip_ansi=true&lines=N
 
-When calling Strategos API endpoints with curl, ALWAYS save to a temp file first:
-\`\`\`bash
-curl -s URL -o tmp/result.json && python3 -c "import json; data=json.load(open('tmp/result.json')); ..."
-\`\`\`
-NEVER pipe curl directly to python (\`curl -s URL | python3 ...\`) — this fails intermittently due to buffering.
-Create the tmp directory if needed: \`mkdir -p tmp\`
-
-Convenience endpoints (no JSON parsing needed):
-- \`GET /api/workers/:id/status\` — returns plain text: \`status health progress% step\`
-- \`GET /api/workers/:id/output?strip_ansi=true\` — clean output without ANSI codes
-- \`GET /api/workers/:id/output?strip_ansi=true&lines=N\` — last N lines only
-- \`POST /api/ralph/signal/by-worker/:workerId\` — signal by worker ID (no token needed)
-- \`GET /api/workers?status=running&fields=id,label\` — filtered worker list
-
-## API Quick Reference (base: ${STRATEGOS_API})
-
-| Action | Method | Endpoint |
-|--------|--------|----------|
-| List workers | GET | \`/api/workers\` |
-| Worker status | GET | \`/api/workers/{id}/status\` |
-| My siblings | GET | \`/api/workers/${workerId}/siblings\` |
-| My children | GET | \`/api/workers/${workerId}/children\` |
-| Spawn | POST | \`/api/workers/spawn-from-template\` |
-| Send input | POST | \`/api/workers/{id}/input\` |
-| Get output | GET | \`/api/workers/{id}/output?strip_ansi=true\` |
-| Delete worker | DELETE | \`/api/workers/{id}\` |
-
-Spawn body: \`{"template":"TYPE","label":"NAME","projectPath":"${escapeJsonValue(projectPath)}","parentWorkerId":"${workerId}","task":{"description":"..."}}\`
-
-Templates: research, impl, test, review, fix, colonel, general (all enable ralphMode + autoAccept)
-
-Prefixes: GENERAL/COLONEL (rank) | RESEARCH/IMPL/TEST/REVIEW/FIX (role)
-
-**Spawn >60s tasks. Check siblings first. Include parentWorkerId: "${workerId}" in ALL spawns.**
+${isGeneral || isColonel ? `## API (base: ${STRATEGOS_API})
+- List: GET /api/workers | Children: GET /api/workers/${workerId}/children
+- Spawn: POST /api/workers/spawn-from-template — body: {"template":"TYPE","label":"NAME","projectPath":"${escapeJsonValue(projectPath)}","parentWorkerId":"${workerId}","task":{"description":"..."}}
+- Input: POST /api/workers/{id}/input | Output: GET /api/workers/{id}/output?strip_ansi=true
+- Signal: POST /api/ralph/signal/by-worker/${workerId}
+Templates: research, impl, test, fix, review, colonel, general` : `## API (base: ${STRATEGOS_API})
+- Status: GET /api/workers/{id}/status
+- Siblings: GET /api/workers/${workerId}/siblings
+- Output: GET /api/workers/{id}/output?strip_ansi=true&lines=N
+- Input: POST /api/workers/{id}/input
+- Signal: POST /api/ralph/signal/by-worker/${workerId}`}
 
 ## Work Practices
 
@@ -470,16 +460,7 @@ Before signaling done:
 1. Verify outputs match task requirements
 2. Git commit all changes with descriptive messages
 3. Write brief AAR in Ralph done signal \`learnings\` field: what worked, what didn't, what you'd do differently
-${isGeneral ? `
-## FINAL REMINDER — GENERALS DO NOT CODE
-
-If at any point during this session you are about to:
-- Use the Edit or Write tool on any file
-- Run a command that modifies code (sed, awk, node script, npm install, etc.)
-- Write implementation code in any form
-
-STOP IMMEDIATELY. Spawn an appropriate worker instead. There are no exceptions. The 60 seconds to spawn a worker is always worth it. A general who codes has failed at their primary duty: delegation.
-` : ''}`;
+`;
 }
 
 export async function writeStrategosContext(workerId, workerLabel, projectPath, ralphToken = null, options = {}) {
@@ -496,16 +477,21 @@ export async function writeStrategosContext(workerId, workerLabel, projectPath, 
 
 async function _doWriteStrategosContext(workerId, workerLabel, projectPath, ralphToken, options = {}) {
   const rulesDir = path.join(projectPath, '.claude', 'rules');
+  const stashDir = path.join(rulesDir, '.stashed');
   const contextPath = path.join(rulesDir, `strategos-worker-${workerId}.md`);
   const tmpPath = contextPath + '.tmp';
   const content = generateStrategosContext(workerId, workerLabel, projectPath, ralphToken, options);
 
+  // Track stashed files so we can restore them even if write fails
+  const stashedFiles = [];
+
   try {
     await fs.mkdir(rulesDir, { recursive: true });
+    await fs.mkdir(stashDir, { recursive: true });
 
-    // Clean up stale rules files for workers no longer running in this project.
-    // Claude Code loads ALL .md files from .claude/rules/, so multiple per-worker
-    // files cause identity confusion (workers adopt the wrong worker ID).
+    // Stash ALL other worker rules files so Claude Code only sees the new worker's file.
+    // Claude Code loads all .md from .claude/rules/ at session start. By temporarily
+    // moving other files to .stashed/, the new worker gets isolated context.
     try {
       const { workers } = await import('./state.js');
       const files = await fs.readdir(rulesDir);
@@ -515,19 +501,26 @@ async function _doWriteStrategosContext(workerId, workerLabel, projectPath, ralp
           if (fileWorkerId !== workerId) {
             const existing = workers.get(fileWorkerId);
             if (!existing || existing.status !== 'running') {
+              // Dead/stopped worker — delete permanently
               await fs.unlink(path.join(rulesDir, file));
               console.log(`[StrategosContext] Cleaned stale rules file: ${file} (worker ${existing ? existing.status : 'not found'})`);
+            } else {
+              // Running worker — stash temporarily for isolation
+              const src = path.join(rulesDir, file);
+              const dst = path.join(stashDir, file);
+              await fs.rename(src, dst);
+              stashedFiles.push({ src, dst, file });
+              console.log(`[StrategosContext] Stashed ${file} for isolation`);
             }
           }
         }
       }
     } catch (cleanupErr) {
       // Non-fatal — log and continue with the write
-      console.warn(`[StrategosContext] Stale rules cleanup failed: ${cleanupErr.message}`);
+      console.warn(`[StrategosContext] Stash/cleanup failed: ${cleanupErr.message}`);
     }
 
     // Ensure .gitignore prevents git from tracking per-worker rules files.
-    // Workers running "git add -A" would otherwise commit/rename each other's files.
     const gitignorePath = path.join(rulesDir, '.gitignore');
     try {
       let gitignore = '';
@@ -553,6 +546,21 @@ async function _doWriteStrategosContext(workerId, workerLabel, projectPath, ralp
     console.error(`[StrategosContext] Failed to write rules file: ${error.message}`);
     try { await fs.unlink(tmpPath); } catch { /* ignore */ }
     return null;
+  } finally {
+    // Restore stashed files after a delay. The 5s window ensures Claude Code
+    // reads rules/ and only finds the new worker's file at session start.
+    if (stashedFiles.length > 0) {
+      setTimeout(async () => {
+        for (const { src, dst, file } of stashedFiles) {
+          try {
+            await fs.rename(dst, src);
+            console.log(`[StrategosContext] Restored stashed ${file}`);
+          } catch (restoreErr) {
+            console.warn(`[StrategosContext] Failed to restore ${file}: ${restoreErr.message}`);
+          }
+        }
+      }, 5000);
+    }
   }
 }
 
@@ -561,13 +569,18 @@ export async function removeStrategosContext(projectPath, excludeWorkerId = null
   const { workers } = await import('./state.js');
 
   if (excludeWorkerId) {
-    const workerRulesPath = path.join(projectPath, '.claude', 'rules', `strategos-worker-${excludeWorkerId}.md`);
-    try {
-      await fs.unlink(workerRulesPath);
-      console.log(`[StrategosContext] Removed rules file for ${excludeWorkerId} at ${workerRulesPath}`);
-    } catch (error) {
-      if (error.code !== 'ENOENT') {
-        console.error(`[StrategosContext] Failed to remove rules file: ${error.message}`);
+    const fileName = `strategos-worker-${excludeWorkerId}.md`;
+    const rulesPath = path.join(projectPath, '.claude', 'rules', fileName);
+    const stashedPath = path.join(projectPath, '.claude', 'rules', '.stashed', fileName);
+    // Remove from both locations — file may be stashed during isolation window
+    for (const filePath of [rulesPath, stashedPath]) {
+      try {
+        await fs.unlink(filePath);
+        console.log(`[StrategosContext] Removed rules file for ${excludeWorkerId} at ${filePath}`);
+      } catch (error) {
+        if (error.code !== 'ENOENT') {
+          console.error(`[StrategosContext] Failed to remove rules file: ${error.message}`);
+        }
       }
     }
     return;
@@ -581,17 +594,21 @@ export async function removeStrategosContext(projectPath, excludeWorkerId = null
   }
 
   const rulesDir = path.join(projectPath, '.claude', 'rules');
-  try {
-    const files = await fs.readdir(rulesDir);
-    for (const file of files) {
-      if (file.startsWith('strategos-worker-') && file.endsWith('.md')) {
-        await fs.unlink(path.join(rulesDir, file));
-        console.log(`[StrategosContext] Cleaned up orphaned rules file: ${file}`);
+  const stashDir = path.join(rulesDir, '.stashed');
+  // Clean both rules/ and .stashed/ directories
+  for (const dir of [rulesDir, stashDir]) {
+    try {
+      const files = await fs.readdir(dir);
+      for (const file of files) {
+        if (file.startsWith('strategos-worker-') && file.endsWith('.md')) {
+          await fs.unlink(path.join(dir, file));
+          console.log(`[StrategosContext] Cleaned up orphaned rules file: ${file} (from ${dir === stashDir ? '.stashed' : 'rules'})`);
+        }
       }
-    }
-  } catch (error) {
-    if (error.code !== 'ENOENT') {
-      console.error(`[StrategosContext] Failed to clean up rules files: ${error.message}`);
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        console.error(`[StrategosContext] Failed to clean up rules files in ${dir}: ${error.message}`);
+      }
     }
   }
 
@@ -848,6 +865,17 @@ async function _doWriteGeminiContext(workerId, workerLabel, projectPath, ralphTo
       console.warn(`[GeminiContext] Stale cleanup failed: ${cleanupErr.message}`);
     }
 
+    // Ensure .gitignore prevents git from tracking Gemini context files
+    const gitignorePath = path.join(projectPath, '.gitignore');
+    try {
+      let gitignore = '';
+      try { gitignore = await fs.readFile(gitignorePath, 'utf-8'); } catch { /* ENOENT */ }
+      if (!gitignore.includes('GEMINI-strategos-worker-')) {
+        const entry = '\n# Auto-generated: Gemini per-worker context files should not be committed\nGEMINI.md\nGEMINI-strategos-worker-*.md\n';
+        await fs.writeFile(gitignorePath, gitignore + entry, 'utf-8');
+      }
+    } catch { /* non-fatal */ }
+
     await fs.writeFile(tmpPath, content, 'utf-8');
     await fs.rename(tmpPath, contextPath);
     console.log(`[GeminiContext] Wrote context file for ${workerLabel} at ${contextPath}`);
@@ -952,4 +980,95 @@ export async function removeGeminiContext(projectPath, excludeWorkerId = null) {
       console.log(`[GeminiContext] Removed master GEMINI.md`);
     }
   } catch { /* ENOENT is fine */ }
+}
+
+// ============================================
+// AIDER CONTEXT GENERATION
+// ============================================
+
+/**
+ * Generate aider initial message content for a worker.
+ * Unlike Claude (.claude/rules/) and Gemini (GEMINI.md), aider doesn't load
+ * context files automatically. Instead, the task instructions are sent as the
+ * first message via tmux send-keys after aider starts.
+ */
+export function generateAiderContext(workerId, workerLabel, projectPath, ralphToken = null, options = {}) {
+  const upperLabel = workerLabel.toUpperCase();
+  const isGeneral = upperLabel.startsWith('GENERAL:');
+  const isColonel = upperLabel.startsWith('COLONEL:') || upperLabel.startsWith('COL-') || upperLabel.startsWith('COL:');
+  const projectName = path.basename(projectPath);
+
+  let workerRole;
+  if (isGeneral) {
+    workerRole = 'Strategic Commander (GENERAL)';
+  } else if (isColonel) {
+    workerRole = 'Operational Commander (COLONEL)';
+  } else {
+    workerRole = 'Specialist Worker';
+  }
+
+  const workerType = detectWorkerType(workerLabel);
+  const { parentWorkerId } = options;
+
+  let roleInstruction = '';
+  if (workerType.role === 'implementer' || workerType.role === 'fixer') {
+    roleInstruction = 'You write code, test it, and commit it. Change only what the task requires.';
+  } else if (workerType.role === 'researcher') {
+    roleInstruction = 'You investigate and report. Focus on analysis, not code changes.';
+  } else if (workerType.role === 'tester') {
+    roleInstruction = 'You write tests and report results.';
+  } else if (workerType.role === 'reviewer') {
+    roleInstruction = 'You review code and report findings.';
+  } else {
+    roleInstruction = 'Execute your assigned task to completion.';
+  }
+
+  const ralphSection = ralphToken ? `\n\nSignal progress via Ralph:\ncurl -s -X POST ${STRATEGOS_API}/api/ralph/signal/by-worker/${workerId} -H "Content-Type: application/json" -d '{"status":"in_progress","progress":50,"currentStep":"what you are doing"}'` : '';
+
+  const parentSection = parentWorkerId ? `\nReport to parent: curl -s -X POST ${STRATEGOS_API}/api/workers/${escapePromptXml(parentWorkerId)}/input -H "Content-Type: application/json" -d '{"input":"your message","fromWorkerId":"${escapePromptXml(workerId)}"}'` : '';
+
+  return `Worker ${workerId} | ${escapePromptXml(workerLabel)} | ${workerRole}
+Project: ${escapePromptXml(projectName)} | Dir: ${escapePromptXml(projectPath)}
+
+${roleInstruction}
+
+Git commit frequently. Stay within ${escapePromptXml(THEA_ROOT)}/.${parentSection}${ralphSection}`;
+}
+
+/**
+ * Write aider context — writes a .aider.strategos-{workerId}.md file
+ * that aider loads via --read flag for persistent context.
+ * Task is sent separately as an interactive message.
+ */
+export async function writeAiderContext(workerId, workerLabel, projectPath, ralphToken = null, options = {}) {
+  const contextContent = generateAiderContext(workerId, workerLabel, projectPath, ralphToken, options);
+  const contextPath = path.join(projectPath, `.aider.strategos-${workerId}.md`);
+  try {
+    await fs.writeFile(contextPath, contextContent, 'utf8');
+    console.log(`[AiderContext] Wrote context to ${contextPath}`);
+    return contextPath;
+  } catch (err) {
+    console.error(`[AiderContext] Failed to write ${contextPath}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Remove aider context — cleans up .aider.strategos-*.md files.
+ */
+export async function removeAiderContext(projectPath, excludeWorkerId = null) {
+  // Clean up .aider.strategos-*.md files
+  try {
+    const dir = await fs.readdir(projectPath);
+    for (const file of dir) {
+      if (file.startsWith('.aider.strategos-') && file.endsWith('.md')) {
+        const fileWorkerId = file.replace('.aider.strategos-', '').replace('.md', '');
+        if (excludeWorkerId && fileWorkerId === excludeWorkerId) continue;
+        await fs.unlink(path.join(projectPath, file)).catch(() => {});
+      }
+    }
+  } catch {
+    // Directory may not exist
+  }
+  return;
 }

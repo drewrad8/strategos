@@ -27,7 +27,7 @@ let metricsBroadcastInterval = null;
 
 // Shared validation constants (single source of truth)
 import {
-  VALID_WORKER_ID, VALID_SIMPLE_ID, CONTROL_CHAR_RE,
+  VALID_WORKER_ID, VALID_SIMPLE_ID, CONTROL_CHAR_RE, MULTILINE_CONTROL_CHAR_RE,
   MAX_TASK_LENGTH, MAX_LABEL_LENGTH, MAX_INPUT_LENGTH
 } from './validation.js';
 
@@ -143,7 +143,8 @@ export function setupSocketHandlers(io, theaRoot) {
       // Worker settings
       autoAccept,
       ralphMode,
-      backend
+      backend,
+      model
     }) => {
       try {
         // SECURITY: Safely resolve project path with traversal prevention
@@ -190,7 +191,7 @@ export function setupSocketHandlers(io, theaRoot) {
 
         // Validate pass-through spawn fields (defense-in-depth: strip invalid, don't reject)
         const validTask = (task !== undefined && task !== null) ?
-          (typeof task === 'string' && task.length <= MAX_TASK_LENGTH && !CONTROL_CHAR_RE.test(task) ? task : undefined) : undefined;
+          (typeof task === 'string' && task.length <= MAX_TASK_LENGTH && !MULTILINE_CONTROL_CHAR_RE.test(task) ? task : undefined) : undefined;
         const validWorkflowId = (workflowId !== undefined && workflowId !== null) ?
           (typeof workflowId === 'string' && workflowId.length <= 100 && VALID_SIMPLE_ID.test(workflowId) ? workflowId : undefined) : undefined;
         const validTaskId = (taskId !== undefined && taskId !== null) ?
@@ -212,6 +213,8 @@ export function setupSocketHandlers(io, theaRoot) {
           } catch { return undefined; }
           return { type: onComplete.type, config: onComplete.config || {} };
         })();
+        // Validate model name (defense-in-depth: strip invalid, match routes.js pattern)
+        const validModel = (model !== undefined && typeof model === 'string' && model.length <= 100 && /^[a-zA-Z0-9._:/-]+$/.test(model)) ? model : undefined;
 
         // Build options object
         const options = {};
@@ -228,11 +231,15 @@ export function setupSocketHandlers(io, theaRoot) {
         options.autoAccept = autoAccept !== false; // true unless explicitly false
         options.ralphMode = ralphMode !== false;   // true unless explicitly false
         // Backend selection: explicit > parent inheritance > 'claude' default
-        if (backend === 'gemini') {
-          options.backend = 'gemini';
+        if (backend === 'gemini' || backend === 'aider') {
+          options.backend = backend;
+          if (backend === 'aider' && validModel) options.model = validModel;
         } else if (!backend && validParentWorkerId) {
           const parentWorker = getWorkerInternal(validParentWorkerId);
-          if (parentWorker?.backend === 'gemini') options.backend = 'gemini';
+          if (parentWorker?.backend && parentWorker.backend !== 'claude') {
+            options.backend = parentWorker.backend;
+            if (parentWorker.backend === 'aider' && parentWorker.model) options.model = parentWorker.model;
+          }
         }
 
         const worker = await spawnWorker(resolvedPath, label, io, options);
@@ -279,7 +286,7 @@ export function setupSocketHandlers(io, theaRoot) {
         if (typeof input !== 'string' || input.length > MAX_INPUT_LENGTH) {
           return socket.emit('error', { message: 'Input too large or invalid', workerId });
         }
-        await sendInput(workerId, input);
+        await sendInput(workerId, input, null, { source: 'web_ui' });
       } catch (error) {
         socket.emit('error', { message: sanitizeErrorMessage(error), workerId });
       }
@@ -357,7 +364,7 @@ curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Co
 ===========================
 
 `;
-              await sendInput(workerId, instructions);
+              await sendInput(workerId, instructions, null, { source: 'ralph_enable' });
             }
           } else if (!settings.ralphMode && wasRalphEnabled) {
             // Ralph mode just disabled - unregister

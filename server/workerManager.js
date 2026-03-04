@@ -12,7 +12,9 @@
  *   server/workers/health.js      — health monitoring, crash recovery, periodic cleanup
  *   server/workers/lifecycle.js   — spawn, kill, complete, dismiss, discover
  *   server/workers/persistence.js — save/restore, checkpoints
- *   server/workers/ralph.js       — Ralph status updates, auto-promotion, getters
+ *   server/workers/ralph.js       — Ralph signal handling, auto-promotion
+ *   server/workers/queries.js     — read-only getters for worker state
+ *   server/workers/delegation.js  — delegation metrics tracking
  */
 
 // From state.js — shared state utilities
@@ -63,10 +65,14 @@ export {
   restoreWorkerState,
 } from './workers/persistence.js';
 
-// From ralph.js — Ralph status updates, getters, resource stats
+// From ralph.js — Ralph signal handling, auto-promotion
 export {
   tryAutoPromoteWorker,
   updateWorkerRalphStatus,
+} from './workers/ralph.js';
+
+// From queries.js — read-only getters for worker state
+export {
   getWorkers,
   getWorker,
   getWorkerInternal,
@@ -79,9 +85,13 @@ export {
   getRespawnSuggestions,
   removeRespawnSuggestion,
   getWorkerEfficiency,
+} from './workers/queries.js';
+
+// From delegation.js — delegation metrics tracking
+export {
   incrementDelegationMetric,
   getDelegationMetrics,
-} from './workers/ralph.js';
+} from './workers/delegation.js';
 
 // From dependencyGraph.js
 export { getDependencyStats, getWorkerDependencies } from './dependencyGraph.js';

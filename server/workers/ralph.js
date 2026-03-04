@@ -1,17 +1,15 @@
 /**
- * Ralph status updates: signal handling, auto-promotion, parent aggregation.
+ * Ralph signal handling: status updates, auto-promotion, parent aggregation.
  * Called when workers signal progress via the Ralph protocol.
+ *
+ * Query functions (getWorkers, getWorker, etc.) → queries.js
+ * Delegation metrics (incrementDelegationMetric, etc.) → delegation.js
  */
 
 import {
-  workers, outputBuffers, pendingWorkers, inFlightSpawns,
-  STRATEGOS_API, MAX_CONCURRENT_WORKERS,
-  path, normalizeWorker,
-  respawnSuggestions,
-  CHECKPOINT_DIR, readFileSync, existsSync,
+  workers, STRATEGOS_API, normalizeWorker,
 } from './state.js';
 
-import { isProtectedWorker } from './templates.js';
 import { sendInputDirect } from './output.js';
 import { getLogger } from '../logger.js';
 
@@ -27,6 +25,79 @@ function isPersistentTier(worker) {
   const upperLabel = (worker.label || '').toUpperCase();
   return upperLabel.startsWith('GENERAL:') || upperLabel.startsWith('GENERAL ') ||
     upperLabel.startsWith('COLONEL:') || upperLabel.startsWith('COL-') || upperLabel.startsWith('COL:');
+}
+
+/**
+ * Build and deliver a structured result summary to a parent worker.
+ * Centralizes the result formatting that was previously duplicated in
+ * tryAutoPromoteWorker, updateWorkerRalphStatus, and _updateParentAggregation.
+ *
+ * @param {Object} worker - The completed worker object
+ * @param {string} workerId - Worker ID
+ * @param {string} statusNote - Status line (e.g. "Complete", "Complete (auto-promoted)")
+ */
+function deliverResultsToParent(worker, workerId, statusNote) {
+  if (!worker.parentWorkerId) return;
+
+  const dm = worker.delegationMetrics;
+  const delegationLine = dm
+    ? `Delegation: spawned ${dm.spawnsIssued} workers, ${dm.roleViolations} role violations, ${dm.filesEdited} files edited, ${dm.commandsRun} commands run`
+    : null;
+
+  const resultSummary = [
+    `[RESULTS FROM ${worker.label} (${workerId})]`,
+    worker.ralphLearnings ? `Learnings: ${worker.ralphLearnings}` : null,
+    worker.ralphOutputs ? `Outputs: ${typeof worker.ralphOutputs === 'string' ? worker.ralphOutputs : JSON.stringify(worker.ralphOutputs)}` : null,
+    worker.ralphArtifacts ? `Artifacts: ${Array.isArray(worker.ralphArtifacts) ? worker.ralphArtifacts.join(', ') : worker.ralphArtifacts}` : null,
+    delegationLine,
+    `Status: ${statusNote}. Worker is alive for follow-up questions.`,
+    `To dismiss: curl -s -X POST ${STRATEGOS_API}/api/workers/${workerId}/dismiss`,
+  ].filter(Boolean).join('\n');
+
+  sendInputDirect(worker.parentWorkerId, resultSummary, 'ralph:result_delivery').catch(e => {
+    getLogger().warn(`Could not deliver results to parent ${worker.parentWorkerId}`, { workerId, parentWorkerId: worker.parentWorkerId, error: e.message });
+  });
+}
+
+/**
+ * Emit the standard awaiting_review socket events for a completed worker.
+ *
+ * @param {Object} worker - The worker object
+ * @param {string} workerId - Worker ID
+ * @param {Object} io - Socket.io instance (nullable)
+ */
+function emitDoneEvents(worker, workerId, io) {
+  if (!io) return;
+  io.emit('worker:updated', normalizeWorker(worker));
+  io.emit('worker:awaiting_review', {
+    workerId,
+    label: worker.label,
+    learnings: worker.ralphLearnings,
+    outputs: worker.ralphOutputs,
+    artifacts: worker.ralphArtifacts,
+    parentWorkerId: worker.parentWorkerId,
+    delegationMetrics: worker.delegationMetrics || null,
+  });
+}
+
+/**
+ * Transition a worker to awaiting_review (done state).
+ * Sets status fields, emits events, delivers results to parent.
+ *
+ * @param {Object} worker - The worker object
+ * @param {string} workerId - Worker ID
+ * @param {Object} io - Socket.io instance (nullable)
+ * @param {string} statusNote - Status note for parent delivery
+ */
+function transitionToDone(worker, workerId, io, statusNote) {
+  worker.ralphProgress = 100;
+  worker.ralphStatus = 'done';
+  worker.ralphSignaledAt = new Date();
+  worker.status = 'awaiting_review';
+  worker.awaitingReviewAt = new Date();
+
+  emitDoneEvents(worker, workerId, io);
+  deliverResultsToParent(worker, workerId, statusNote);
 }
 
 /**
@@ -52,46 +123,7 @@ export function tryAutoPromoteWorker(worker, io, source = 'unknown') {
   const workerId = worker.id;
   getLogger().info(`Auto-promoted worker ${workerId} (${worker.label}) to done [${source}]`, { workerId, label: worker.label, source, currentStep: worker.ralphCurrentStep?.slice(0, 100) });
 
-  worker.ralphProgress = 100;
-  worker.ralphStatus = 'done';
-  worker.ralphSignaledAt = new Date();
-  worker.status = 'awaiting_review';
-  worker.awaitingReviewAt = new Date();
-
-  if (io) {
-    io.emit('worker:updated', normalizeWorker(worker));
-    io.emit('worker:awaiting_review', {
-      workerId,
-      label: worker.label,
-      learnings: worker.ralphLearnings,
-      outputs: worker.ralphOutputs,
-      artifacts: worker.ralphArtifacts,
-      parentWorkerId: worker.parentWorkerId,
-      delegationMetrics: worker.delegationMetrics || null,
-    });
-  }
-
-  // Deliver results to parent worker
-  if (worker.parentWorkerId) {
-    const dm = worker.delegationMetrics;
-    const delegationLine = dm
-      ? `Delegation: spawned ${dm.spawnsIssued} workers, ${dm.roleViolations} role violations, ${dm.filesEdited} files edited, ${dm.commandsRun} commands run`
-      : null;
-
-    const resultSummary = [
-      `[RESULTS FROM ${worker.label} (${workerId})]`,
-      worker.ralphLearnings ? `Learnings: ${worker.ralphLearnings}` : null,
-      worker.ralphOutputs ? `Outputs: ${typeof worker.ralphOutputs === 'string' ? worker.ralphOutputs : JSON.stringify(worker.ralphOutputs)}` : null,
-      worker.ralphArtifacts ? `Artifacts: ${Array.isArray(worker.ralphArtifacts) ? worker.ralphArtifacts.join(', ') : worker.ralphArtifacts}` : null,
-      delegationLine,
-      `Status: Complete (auto-promoted). Worker is alive for follow-up questions.`,
-      `To dismiss: curl -s -X POST ${STRATEGOS_API}/api/workers/${workerId}/dismiss`,
-    ].filter(Boolean).join('\n');
-
-    sendInputDirect(worker.parentWorkerId, resultSummary).catch(e => {
-      getLogger().warn(`Could not deliver auto-promoted results to parent ${worker.parentWorkerId}`, { workerId, parentWorkerId: worker.parentWorkerId, error: e.message });
-    });
-  }
+  transitionToDone(worker, workerId, io, 'Complete (auto-promoted)');
 
   // Update parent progress aggregation
   if (worker.parentWorkerId) {
@@ -122,22 +154,9 @@ export function updateWorkerRalphStatus(workerId, signalData, io = null) {
 
   const { status, progress, currentStep, learnings, outputs, artifacts, reason } = data;
 
-  // Validate status — only known values are accepted
-  const VALID_STATUSES = ['in_progress', 'done', 'blocked', 'pending'];
-  if (!status || !VALID_STATUSES.includes(status)) {
-    getLogger().warn(`Worker ${workerId} sent invalid Ralph status`, { workerId, status });
-    return false;
-  }
-
-  // Validate progress range if provided
-  if (progress !== undefined && (typeof progress !== 'number' || progress < 0 || progress > 100)) {
-    getLogger().warn(`Worker ${workerId} sent invalid Ralph progress`, { workerId, progress });
-    return false;
-  }
-
-  // Validate currentStep type if provided
-  if (currentStep !== undefined && typeof currentStep !== 'string') {
-    getLogger().warn(`Worker ${workerId} sent non-string Ralph currentStep`, { workerId });
+  // Minimal guard — route layer validates fully via validateSignalBody
+  if (!status) {
+    getLogger().warn(`Worker ${workerId} sent empty Ralph status`, { workerId });
     return false;
   }
 
@@ -240,11 +259,9 @@ export function updateWorkerRalphStatus(workerId, signalData, io = null) {
         c.ralphStatus === 'done' || c.status === 'awaiting_review' || c.status === 'completed'
       );
       if (allChildrenDone) {
-        worker.ralphProgress = 100;
-        worker.ralphStatus = 'done';
-        worker.ralphSignaledAt = new Date();
         autoPromoted = true;
         getLogger().info(`Auto-promoted worker ${workerId} (${worker.label}) to done (all ${children.length} children complete)`, { workerId, label: worker.label, childCount: children.length });
+        transitionToDone(worker, workerId, io, `Complete (all ${children.length} children done)`);
       }
     }
   }
@@ -255,47 +272,16 @@ export function updateWorkerRalphStatus(workerId, signalData, io = null) {
     io.emit('worker:updated', normalizeWorker(worker));
   }
 
-  // On "done": transition to awaiting_review (only if not already handled by tryAutoPromoteWorker)
+  // On "done": transition to awaiting_review (only if not already handled by auto-promotion)
   if ((status === 'done' || autoPromoted) && worker.status !== 'awaiting_review') {
     worker.status = 'awaiting_review';
     worker.awaitingReviewAt = new Date();
     getLogger().info(`Worker ${workerId} (${worker.label}) → awaiting_review`, { workerId, label: worker.label });
 
-    if (io) {
-      io.emit('worker:updated', normalizeWorker(worker));
-      io.emit('worker:awaiting_review', {
-        workerId,
-        label: worker.label,
-        learnings: worker.ralphLearnings,
-        outputs: worker.ralphOutputs,
-        artifacts: worker.ralphArtifacts,
-        parentWorkerId: worker.parentWorkerId,
-        delegationMetrics: worker.delegationMetrics || null,
-      });
-    }
+    emitDoneEvents(worker, workerId, io);
 
     // Auto-deliver structured results to parent worker
-    if (worker.parentWorkerId) {
-      // Include delegation metrics summary for generals
-      const dm = worker.delegationMetrics;
-      const delegationLine = dm
-        ? `Delegation: spawned ${dm.spawnsIssued} workers, ${dm.roleViolations} role violations, ${dm.filesEdited} files edited, ${dm.commandsRun} commands run`
-        : null;
-
-      const resultSummary = [
-        `[RESULTS FROM ${worker.label} (${workerId})]`,
-        learnings ? `Learnings: ${learnings}` : null,
-        outputs ? `Outputs: ${typeof outputs === 'string' ? outputs : JSON.stringify(outputs)}` : null,
-        artifacts ? `Artifacts: ${Array.isArray(artifacts) ? artifacts.join(', ') : artifacts}` : null,
-        delegationLine,
-        `Status: Complete. Worker is alive for follow-up questions.`,
-        `To dismiss: curl -s -X POST ${STRATEGOS_API}/api/workers/${workerId}/dismiss`
-      ].filter(Boolean).join('\n');
-
-      sendInputDirect(worker.parentWorkerId, resultSummary).catch(e => {
-        getLogger().warn(`Could not deliver results to parent ${worker.parentWorkerId}`, { workerId, parentWorkerId: worker.parentWorkerId, error: e.message });
-      });
-    }
+    deliverResultsToParent(worker, workerId, 'Complete');
   }
 
   // Also notify parent worker if exists (for non-done signals)
@@ -329,7 +315,6 @@ export function updateWorkerRalphStatus(workerId, signalData, io = null) {
 
 /**
  * Internal helper: update parent's aggregate progress from children's progress.
- * Extracted to avoid duplication between signal handler and tryAutoPromoteWorker.
  */
 function _updateParentAggregation(parentWorkerId, io) {
   const parent = workers.get(parentWorkerId);
@@ -369,8 +354,6 @@ function _updateParentAggregation(parentWorkerId, io) {
     : `${doneCount}/${totalChildren} done` + (steps.length > 0 ? ` | ${steps[0]}` : '');
 
   // Only auto-update if parent hasn't manually signaled, OR if aggregate is higher.
-  // If the parent has directly signaled via updateWorkerRalphStatus, _ralphManuallySignaled
-  // is true — in that case, child aggregate should never DOWNGRADE parent progress.
   if (parent._ralphManuallySignaled) {
     // Parent has manually signaled — only update if aggregate is higher
     if (avgProgress > (parent.ralphProgress || 0)) {
@@ -394,298 +377,7 @@ function _updateParentAggregation(parentWorkerId, io) {
   if (doneCount === totalChildren && parent.ralphStatus !== 'done' &&
       parent.status !== 'awaiting_review' && !isPersistentTier(parent) &&
       (parent.ralphProgress >= 80 || avgProgress >= 100)) {
-    parent.ralphProgress = 100;
-    parent.ralphStatus = 'done';
-    parent.ralphSignaledAt = new Date();
-    parent.status = 'awaiting_review';
-    parent.awaitingReviewAt = new Date();
     getLogger().info(`Auto-promoted parent ${parentWorkerId} (${parent.label}) to done (all ${totalChildren} children complete, ${dismissedCount} dismissed)`, { parentWorkerId, label: parent.label, childCount: totalChildren });
-    if (io) {
-      io.emit('worker:updated', normalizeWorker(parent));
-      io.emit('worker:awaiting_review', {
-        workerId: parentWorkerId,
-        label: parent.label,
-        learnings: parent.ralphLearnings,
-        outputs: parent.ralphOutputs,
-        artifacts: parent.ralphArtifacts,
-        parentWorkerId: parent.parentWorkerId
-      });
-    }
-    // Deliver results to grandparent if exists
-    if (parent.parentWorkerId) {
-      const resultSummary = [
-        `[RESULTS FROM ${parent.label} (${parentWorkerId})]`,
-        parent.ralphLearnings ? `Learnings: ${parent.ralphLearnings}` : null,
-        parent.ralphOutputs ? `Outputs: ${typeof parent.ralphOutputs === 'string' ? parent.ralphOutputs : JSON.stringify(parent.ralphOutputs)}` : null,
-        `Status: Complete (auto-promoted — all children done). Worker is alive for follow-up.`,
-        `To dismiss: curl -s -X POST ${STRATEGOS_API}/api/workers/${parentWorkerId}/dismiss`
-      ].filter(Boolean).join('\n');
-      sendInputDirect(parent.parentWorkerId, resultSummary).catch(e => {
-        getLogger().warn(`Could not deliver auto-promoted results to grandparent ${parent.parentWorkerId}`, { parentWorkerId, grandparentWorkerId: parent.parentWorkerId, error: e.message });
-      });
-    }
+    transitionToDone(parent, parentWorkerId, io, `Complete (auto-promoted — all children done)`);
   }
-}
-
-// ============================================
-// GETTER FUNCTIONS (read-only views of worker state)
-// ============================================
-
-let _cachedWorkers = null;
-let _cacheTime = 0;
-const CACHE_TTL_MS = 1000;
-
-export function getWorkers() {
-  const now = Date.now();
-  if (_cachedWorkers && (now - _cacheTime < CACHE_TTL_MS)) {
-    return _cachedWorkers;
-  }
-  const active = Array.from(workers.values()).map(normalizeWorker);
-  const pending = getPendingWorkers();
-  _cachedWorkers = [...active, ...pending];
-  _cacheTime = now;
-  return _cachedWorkers;
-}
-
-export function getWorker(workerId) {
-  const worker = workers.get(workerId);
-  if (worker) return normalizeWorker(worker);
-  const pending = pendingWorkers.get(workerId);
-  if (pending) {
-    return {
-      id: workerId,
-      label: pending.label,
-      project: path.basename(pending.projectPath),
-      workingDir: pending.projectPath,
-      status: 'pending',
-      dependsOn: pending.dependsOn,
-      workflowId: pending.workflowId,
-      taskId: pending.taskId,
-      createdAt: pending.createdAt ? new Date(pending.createdAt).toISOString() : null,
-    };
-  }
-  return null;
-}
-
-/**
- * Get raw worker with internal fields (ralphToken etc.) — for server-side use only.
- * NEVER send this to clients.
- */
-export function getWorkerInternal(workerId) {
-  const worker = workers.get(workerId);
-  if (!worker) return null;
-  return {
-    ...worker,
-    childWorkerIds: [...(worker.childWorkerIds || [])],
-    childWorkerHistory: [...(worker.childWorkerHistory || [])],
-    dependsOn: [...(worker.dependsOn || [])],
-    settings: worker.settings ? { ...worker.settings } : {},
-  };
-}
-
-export function getWorkersByProject(projectName) {
-  return getWorkers().filter(w => w.project === projectName);
-}
-
-export function getWorkerOutput(workerId) {
-  return outputBuffers.get(workerId) || '';
-}
-
-export function getChildWorkers(parentWorkerId) {
-  const parent = workers.get(parentWorkerId);
-  if (!parent) return [];
-
-  const childIds = parent.childWorkerIds || [];
-  const liveChildren = childIds.map(childId => {
-    const child = workers.get(childId);
-    if (!child) return null;
-    return {
-      id: child.id,
-      label: child.label,
-      status: child.status,
-      ralphMode: child.ralphMode,
-      ralphStatus: child.ralphStatus,
-      ralphSignaledAt: child.ralphSignaledAt,
-      ralphLearnings: child.ralphLearnings,
-      ralphProgress: child.ralphProgress,
-      ralphCurrentStep: child.ralphCurrentStep,
-      ralphOutputs: child.ralphOutputs,
-      ralphArtifacts: child.ralphArtifacts,
-      taskDescription: child.task?.description?.substring(0, 200) || null,
-      createdAt: child.createdAt,
-      lastActivity: child.lastActivity,
-      durationMs: Math.max(0, Date.now() - new Date(child.createdAt).getTime()) || 0,
-      health: child.health,
-    };
-  }).filter(Boolean);
-
-  // Include historical children from checkpoints (dismissed/killed)
-  const historyIds = parent.childWorkerHistory || [];
-  const liveIdSet = new Set(childIds);
-  const historicalChildren = historyIds
-    .filter(hid => !liveIdSet.has(hid)) // Only those no longer live
-    .map(hid => {
-      try {
-        const checkpointPath = path.join(CHECKPOINT_DIR, `${hid}.json`);
-        if (!existsSync(checkpointPath)) return null;
-        const checkpoint = JSON.parse(readFileSync(checkpointPath, 'utf-8'));
-        return {
-          id: checkpoint.workerId,
-          label: checkpoint.label || hid,
-          status: 'dismissed',
-          ralphMode: true,
-          ralphStatus: checkpoint.ralphStatus || 'done',
-          ralphSignaledAt: checkpoint.diedAt || null,
-          ralphLearnings: checkpoint.ralphLearnings || null,
-          ralphProgress: checkpoint.ralphProgress ?? 100,
-          ralphCurrentStep: checkpoint.ralphCurrentStep || 'Dismissed',
-          ralphOutputs: checkpoint.ralphOutputs || null,
-          ralphArtifacts: checkpoint.ralphArtifacts || null,
-          taskDescription: checkpoint.task?.description?.substring(0, 200) || null,
-          createdAt: checkpoint.createdAt || null,
-          lastActivity: checkpoint.diedAt || null,
-          durationMs: checkpoint.uptime || 0,
-          health: 'dismissed',
-        };
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean);
-
-  return [...liveChildren, ...historicalChildren];
-}
-
-export function getSiblingWorkers(workerId) {
-  const worker = workers.get(workerId);
-  if (!worker || !worker.parentWorkerId) return [];
-
-  const parent = workers.get(worker.parentWorkerId);
-  if (!parent) return [];
-
-  const siblingIds = (parent.childWorkerIds || []).filter(id => id !== workerId);
-  return siblingIds.map(siblingId => {
-    const sibling = workers.get(siblingId);
-    if (!sibling) return null;
-    return {
-      id: sibling.id,
-      label: sibling.label,
-      status: sibling.status,
-      ralphStatus: sibling.ralphStatus,
-      ralphProgress: sibling.ralphProgress,
-      ralphCurrentStep: sibling.ralphCurrentStep,
-      taskDescription: sibling.task?.description?.substring(0, 100) || null,
-    };
-  }).filter(Boolean);
-}
-
-export function getPendingWorkers() {
-  return Array.from(pendingWorkers.entries()).map(([id, pending]) => ({
-    id,
-    label: pending.label,
-    project: path.basename(pending.projectPath),
-    workingDir: pending.projectPath,
-    status: 'pending',
-    dependsOn: pending.dependsOn,
-    workflowId: pending.workflowId,
-    taskId: pending.taskId,
-    createdAt: pending.createdAt ? new Date(pending.createdAt).toISOString() : null,
-    waitTimeMs: pending.createdAt ? Date.now() - pending.createdAt : null
-  }));
-}
-
-export function getResourceStats() {
-  const allWorkers = Array.from(workers.values());
-  const running = allWorkers.filter(w => w.status === 'running').length;
-  const completed = allWorkers.filter(w => w.status === 'completed').length;
-  const error = allWorkers.filter(w => w.status === 'error').length;
-  const pending = pendingWorkers.size;
-  const spawning = inFlightSpawns.size;
-
-  return {
-    running,
-    completed,
-    error,
-    pending,
-    spawning,
-    total: allWorkers.length + pending,
-    maxConcurrent: MAX_CONCURRENT_WORKERS,
-    availableSlots: Math.max(0, MAX_CONCURRENT_WORKERS - running - pending - spawning)
-  };
-}
-
-export function getRespawnSuggestions() {
-  return [...respawnSuggestions];
-}
-
-export function removeRespawnSuggestion(workerId) {
-  const idx = respawnSuggestions.findIndex(s => s.workerId === workerId);
-  if (idx === -1) return false;
-  respawnSuggestions.splice(idx, 1);
-  return true;
-}
-
-export function getWorkerEfficiency() {
-  return Array.from(workers.values())
-    .filter(w => w.status === 'running')
-    .map(w => ({
-      id: w.id,
-      label: w.label,
-      spawnedAt: w.createdAt,
-      firstRalphAt: w.firstRalphAt || null,
-      timeToFirstRalph: w.firstRalphAt ? (Math.max(0, new Date(w.firstRalphAt).getTime() - new Date(w.createdAt).getTime()) || 0) : null,
-      ralphSignalCount: w.ralphSignalCount || 0,
-      ralphStatus: w.ralphStatus || null,
-      uptime: Math.max(0, Date.now() - new Date(w.createdAt).getTime()) || 0,
-    }));
-}
-
-// ============================================
-// DELEGATION METRICS (for tracking general behavior)
-// ============================================
-
-const VALID_DELEGATION_FIELDS = ['roleViolations', 'filesEdited', 'commandsRun'];
-
-/**
- * Increment a delegation metric for a worker.
- * Called by sentinel role-violation detection to record general misbehavior.
- * @param {string} workerId - Worker ID
- * @param {string} field - One of: roleViolations, filesEdited, commandsRun
- * @param {number} [amount=1] - Amount to increment by
- * @returns {boolean} True if metric was incremented
- */
-export function incrementDelegationMetric(workerId, field, amount = 1) {
-  if (!VALID_DELEGATION_FIELDS.includes(field)) {
-    getLogger().warn(`Invalid delegation metric field: ${field}`, { workerId, field });
-    return false;
-  }
-  const worker = workers.get(workerId);
-  if (!worker) return false;
-  if (!worker.delegationMetrics) {
-    worker.delegationMetrics = { spawnsIssued: 0, roleViolations: 0, filesEdited: 0, commandsRun: 0 };
-  }
-  worker.delegationMetrics[field] += amount;
-  getLogger().info(`Delegation metric ${field} incremented for ${workerId} (${worker.label}): now ${worker.delegationMetrics[field]}`, { workerId, field, value: worker.delegationMetrics[field] });
-  return true;
-}
-
-/**
- * Get delegation metrics for a worker.
- * Returns null if worker not found.
- */
-export function getDelegationMetrics(workerId) {
-  const worker = workers.get(workerId);
-  if (!worker) return null;
-  const metrics = worker.delegationMetrics || { spawnsIssued: 0, roleViolations: 0, filesEdited: 0, commandsRun: 0 };
-  const upperLabel = (worker.label || '').toUpperCase();
-  const isGeneral = upperLabel.startsWith('GENERAL:') || upperLabel.startsWith('GENERAL ');
-  return {
-    workerId,
-    label: worker.label,
-    isGeneral,
-    metrics: { ...metrics },
-    status: worker.status,
-    ralphStatus: worker.ralphStatus,
-    childCount: (worker.childWorkerIds || []).length,
-  };
 }

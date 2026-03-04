@@ -64,6 +64,73 @@ All via environment variables. The defaults work out of the box.
 
 See [docs/STRATEGOS_USAGE_GUIDE.md](docs/STRATEGOS_USAGE_GUIDE.md) for the full API reference.
 
+## IDE Integration (MCP)
+
+Strategos includes an [MCP server](https://modelcontextprotocol.io/) that lets AI assistants in your IDE manage workers directly. Works with VSCode Copilot, Claude Code, Claude Desktop, Cursor, Cline, and Continue.
+
+**18 tools** (spawn, kill, monitor, signal), **3 resources** (workers, health, tree), and **3 prompts** (deploy, briefing, review).
+
+### VSCode (Copilot Chat)
+
+The repo includes `.vscode/mcp.json` — open the project in VSCode and the Strategos MCP server is available automatically. If connecting via Remote-SSH, stdio transport works since the MCP process runs on the remote machine.
+
+Edit `.vscode/mcp.json` to adjust the path if your install location differs:
+
+```json
+{
+  "servers": {
+    "strategos": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/path/to/mcps/strategos/dist/server.js"],
+      "env": {
+        "STRATEGOS_URL": "http://localhost:38007"
+      }
+    }
+  }
+}
+```
+
+### Claude Code / Claude Desktop
+
+Copy `.mcp.example.json` to `.mcp.json` and update the path:
+
+```json
+{
+  "mcpServers": {
+    "strategos": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["/path/to/mcps/strategos/dist/server.js"],
+      "env": {
+        "STRATEGOS_URL": "http://localhost:38007"
+      }
+    }
+  }
+}
+```
+
+### Cursor
+
+Add to `.cursor/mcp.json` (project) or `~/.cursor/mcp.json` (global) using the same `mcpServers` format as above.
+
+### Using MCP Prompts
+
+Once connected, use slash commands in your AI chat:
+
+- `/strategos.deploy` — Spawn a new worker with Commander's Intent
+- `/strategos.briefing` — Get a full operational overview
+- `/strategos.review` — Review a worker's output and dismiss it
+
+### MCP Resources
+
+Attach live data as context in your chat via "Add Context > MCP Resources":
+
+- **Active Workers** — all running workers with status and progress
+- **System Health** — server health, worker counts by status/health
+- **Worker Hierarchy** — parent-child tree view
+- **Worker Output** — terminal output from any specific worker
+
 ## Running as a service
 
 ```bash

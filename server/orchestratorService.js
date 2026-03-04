@@ -376,7 +376,7 @@ async function executeAction(decision, theaRoot, io) {
             spoken: `I couldn't find a worker matching "${workerId}". Which worker did you mean?`
           };
         }
-        await sendInput(worker.id, safeSendMessage);
+        await sendInput(worker.id, safeSendMessage, null, { source: 'orchestrator:send_input' });
         return {
           success: true,
           action,
@@ -416,7 +416,7 @@ async function executeAction(decision, theaRoot, io) {
         if (task && typeof task === 'string') {
           const safeTask = task.slice(0, MAX_TASK_LENGTH);
           // Give Claude a moment to start up
-          setTimeout(() => sendInput(worker.id, safeTask).catch(e => console.warn('[Orchestrator] Failed to send initial task:', e.message)), 2000);
+          setTimeout(() => sendInput(worker.id, safeTask, null, { source: 'orchestrator:spawn_task' }).catch(e => console.warn('[Orchestrator] Failed to send initial task:', e.message)), 2000);
         }
 
         return {
@@ -470,7 +470,7 @@ async function executeAction(decision, theaRoot, io) {
           };
         }
         // Send "1" to select "Yes" option
-        await sendInput(worker.id, '1');
+        await sendInput(worker.id, '1', null, { source: 'orchestrator:approve' });
         return {
           success: true,
           action,
@@ -490,7 +490,7 @@ async function executeAction(decision, theaRoot, io) {
           };
         }
         // Send Escape key
-        await sendInput(worker.id, '\x1b');
+        await sendInput(worker.id, '\x1b', null, { source: 'orchestrator:reject' });
         return {
           success: true,
           action,

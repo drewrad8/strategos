@@ -23,7 +23,11 @@ import {
   detectWorkerType, isProtectedWorker,
   writeStrategosContext, removeStrategosContext,
   writeGeminiContext, removeGeminiContext,
+  writeAiderContext, removeAiderContext,
+  generateAiderContext,
 } from './templates.js';
+
+import { checkSpawnResources } from './resources.js';
 
 // ============================================
 // TOOL RESTRICTIONS BY ROLE
@@ -39,16 +43,13 @@ const READ_ONLY_TOOLS = 'Read,Glob,Grep,Bash,WebSearch,WebFetch';
 /**
  * Returns additional CLI args for `claude` based on worker role.
  * Read-only roles get --tools to structurally remove Edit/Write/NotebookEdit.
- * Also --disallowedTools for dangerous Bash patterns.
+ * --tools is the real enforcement; --disallowedTools was removed (security theater).
  */
 function getToolRestrictionArgs(label) {
   const { prefix } = detectWorkerType(label);
   if (prefix && READ_ONLY_ROLES.has(prefix)) {
     console.log(`[SpawnWorker] Tool restriction (--tools): ${READ_ONLY_TOOLS} for ${label}`);
-    return [
-      '--tools', READ_ONLY_TOOLS,
-      '--disallowedTools', 'Bash(rm *)', 'Bash(rmdir *)',
-    ];
+    return ['--tools', READ_ONLY_TOOLS];
   }
   return [];
 }
@@ -89,7 +90,7 @@ function initializeWorker(id, config, io) {
     label, projectName, projectPath, sessionName, ralphToken,
     dependsOn, workflowId, taskId,
     parentWorkerId, parentLabel, task, initialInput,
-    autoAccept, ralphMode, backend,
+    autoAccept, ralphMode, backend, model,
   } = config;
 
   const worker = {
@@ -101,6 +102,7 @@ function initializeWorker(id, config, io) {
     status: 'running',
     mode: 'tmux',
     backend: backend || 'claude',
+    model: model || null,
     createdAt: new Date(),
     lastActivity: new Date(),
     lastOutput: new Date(),
@@ -207,7 +209,12 @@ function initializeWorker(id, config, io) {
         }
 
         if (stdinMsg) {
-          await sendInputDirect(id, stdinMsg);
+          // Aider treats each newline as a prompt submission, so collapse
+          // multi-line task messages into a single line for aider workers
+          if (currentWorker.backend === 'aider') {
+            stdinMsg = stdinMsg.replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim();
+          }
+          await sendInputDirect(id, stdinMsg, 'lifecycle:stdin');
           console.log(`Sent initial task to ${label}`);
         }
       }
@@ -221,9 +228,9 @@ function initializeWorker(id, config, io) {
     setTimeout(() => {
       const w = workers.get(id);
       if (w && w.ralphMode && w.status === 'running' && (!w.ralphStatus || w.ralphStatus === 'pending')) {
-        const rulesLocation = worker.backend === 'gemini' ? 'GEMINI.md' : '.claude/rules/';
+        const rulesLocation = worker.backend === 'gemini' ? 'GEMINI.md' : worker.backend === 'aider' ? 'initial message' : '.claude/rules/';
         const reminderMsg = `Reminder: Signal your progress via Ralph. The curl command is in your rules file (${rulesLocation}).`;
-        sendInputDirect(id, reminderMsg).catch(err => { console.warn(`[Ralph] Failed to send reminder: ${err.message}`); });
+        sendInputDirect(id, reminderMsg, 'lifecycle:ralph_reminder').catch(err => { console.warn(`[Ralph] Failed to send reminder: ${err.message}`); });
         console.log(`[Ralph] Sent 60s reminder to ${label}`);
       }
     }, 60000);
@@ -260,6 +267,7 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
     allowDuplicate = false,
     externalRalphToken = null,
     backend = 'claude',
+    model = null,
   } = options;
 
   const id = uuidv4().slice(0, 8);
@@ -275,6 +283,15 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
   if (totalActive >= MAX_CONCURRENT_WORKERS) {
     throw new Error(`Cannot spawn worker: maximum concurrent workers (${MAX_CONCURRENT_WORKERS}) reached. ` +
       `Currently running: ${runningWorkers.length}, pending: ${pendingWorkers.size}, spawning: ${inFlightSpawns.size}. Kill some workers or wait for completion.`);
+  }
+
+  // System resource check — prevent spawning when memory/swap is critically low
+  const resourceCheck = await checkSpawnResources();
+  if (!resourceCheck.allowed) {
+    throw new Error(`Cannot spawn worker: ${resourceCheck.reason}`);
+  }
+  if (resourceCheck.warnings) {
+    console.warn(`[SpawnWorker] Resource warnings for ${workerLabel}: ${resourceCheck.warnings.join(", ")}`);
   }
 
   const spawnKey = `${workerLabel}::${projectName}`;
@@ -345,6 +362,7 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
       ralphMode,
       externalRalphToken,
       backend,
+      model,
       createdAt: Date.now()
     });
 
@@ -384,6 +402,12 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
         parentLabel,
         bulldozeMode: false,
       });
+    } else if (backend === 'aider') {
+      await writeAiderContext(id, workerLabel, projectPath, ralphToken, {
+        parentWorkerId,
+        parentLabel,
+        bulldozeMode: false,
+      });
     } else {
       await writeStrategosContext(id, workerLabel, projectPath, ralphToken, {
         parentWorkerId,
@@ -408,6 +432,20 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
         ...geminiEnvArgs,
         '-c', projectPath,
         'gemini', '--yolo'
+      ]);
+    } else if (backend === 'aider') {
+      // Spawn Aider with Ollama model via remote Ollama server
+      const aiderModel = model || 'ollama_chat/qwen2.5-coder:32b-instruct';
+      const aiderContextFile = `.aider.strategos-${id}.md`;
+      await spawnTmux([
+        'new-session', '-d',
+        '-s', sessionName,
+        '-x', String(DEFAULT_COLS),
+        '-y', String(DEFAULT_ROWS),
+        '-e', 'OLLAMA_API_BASE=http://10.10.0.55:11434',
+        '-c', projectPath,
+        'aider', '--model', aiderModel, '--yes', '--no-auto-commits',
+        '--read', aiderContextFile
       ]);
     } else {
       const toolArgs = getToolRestrictionArgs(workerLabel);
@@ -434,7 +472,7 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
       label: workerLabel, projectName, projectPath, sessionName, ralphToken,
       dependsOn, workflowId, taskId,
       parentWorkerId, parentLabel, task, initialInput,
-      autoAccept, ralphMode, backend,
+      autoAccept, ralphMode, backend, model,
     }, io);
 
     inFlightSpawns.delete(spawnKey);
@@ -480,6 +518,8 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
 
     if (backend === 'gemini') {
       await removeGeminiContext(projectPath, id);
+    } else if (backend === 'aider') {
+      await removeAiderContext(projectPath, id);
     } else {
       await removeStrategosContext(projectPath, id);
     }
@@ -530,6 +570,8 @@ async function startPendingWorker(workerId, io = null) {
     const pendingBackend = pending.backend || 'claude';
     if (pendingBackend === 'gemini') {
       await writeGeminiContext(workerId, pending.label, pending.projectPath, ralphToken);
+    } else if (pendingBackend === 'aider') {
+      await writeAiderContext(workerId, pending.label, pending.projectPath, ralphToken);
     } else {
       await writeStrategosContext(workerId, pending.label, pending.projectPath, ralphToken);
     }
@@ -547,6 +589,19 @@ async function startPendingWorker(workerId, io = null) {
         ...geminiEnvArgs,
         '-c', pending.projectPath,
         'gemini', '--yolo'
+      ]);
+    } else if (pendingBackend === 'aider') {
+      const aiderModel = pending.model || 'ollama_chat/qwen2.5-coder:32b-instruct';
+      const aiderContextFile = `.aider.strategos-${workerId}.md`;
+      await spawnTmux([
+        'new-session', '-d',
+        '-s', sessionName,
+        '-x', String(DEFAULT_COLS),
+        '-y', String(DEFAULT_ROWS),
+        '-e', 'OLLAMA_API_BASE=http://10.10.0.55:11434',
+        '-c', pending.projectPath,
+        'aider', '--model', aiderModel, '--yes', '--no-auto-commits',
+        '--read', aiderContextFile
       ]);
     } else {
       const toolArgs = getToolRestrictionArgs(pending.label);
@@ -567,7 +622,7 @@ async function startPendingWorker(workerId, io = null) {
       parentWorkerId: pending.parentWorkerId, parentLabel: pending.parentLabel,
       task: pending.task, initialInput: pending.initialInput,
       autoAccept: pending.autoAccept ?? true, ralphMode: pending.ralphMode || false,
-      backend: pending.backend || 'claude',
+      backend: pending.backend || 'claude', model: pending.model || null,
     }, effectiveIo);
 
     const activity = addActivity('worker_started', workerId, pending.label, projectName,
@@ -605,6 +660,8 @@ async function startPendingWorker(workerId, io = null) {
 
     if (pendingBackend === 'gemini') {
       await removeGeminiContext(pending.projectPath, workerId);
+    } else if (pendingBackend === 'aider') {
+      await removeAiderContext(pending.projectPath, workerId);
     } else {
       await removeStrategosContext(pending.projectPath, workerId);
     }
@@ -644,6 +701,8 @@ async function teardownWorker(workerId, worker, io, { activityMessage, logPrefix
   if (worker.workingDir) {
     if (worker.backend === 'gemini') {
       await removeGeminiContext(worker.workingDir, workerId);
+    } else if (worker.backend === 'aider') {
+      await removeAiderContext(worker.workingDir, workerId);
     } else {
       await removeStrategosContext(worker.workingDir, workerId);
     }
@@ -908,7 +967,7 @@ export async function dismissWorker(workerId, io = null) {
   }
 
   console.log(`[Dismiss] Dismissing worker ${workerId} (${worker.label})`);
-  await killWorker(workerId, io, { reason: 'dismissed' });
+  await killWorker(workerId, io, { reason: 'dismissed', force: true });
 
   return { dismissed: true, uncommittedWarning };
 }
@@ -1164,7 +1223,7 @@ export async function broadcastToProject(projectName, input) {
   const projectWorkers = getWorkersByProject(projectName);
 
   const results = await Promise.allSettled(
-    projectWorkers.map(w => sendInput(w.id, input))
+    projectWorkers.map(w => sendInput(w.id, input, null, { source: 'project_broadcast' }))
   );
 
   return results;
@@ -1221,8 +1280,11 @@ export async function discoverExistingWorkers(io = null) {
       let detectedBackend = 'claude';
       try {
         const { stdout: paneCmd } = await spawnTmux(['list-panes', '-t', sessionName, '-F', '#{pane_current_command}']);
-        if ((paneCmd || '').trim().includes('gemini')) {
+        const paneCmdTrimmed = (paneCmd || '').trim();
+        if (paneCmdTrimmed.includes('gemini')) {
           detectedBackend = 'gemini';
+        } else if (paneCmdTrimmed.includes('aider')) {
+          detectedBackend = 'aider';
         }
       } catch { /* default to claude */ }
 

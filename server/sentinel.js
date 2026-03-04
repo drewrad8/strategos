@@ -159,8 +159,9 @@ export async function runDiagnostics() {
     const paneResult = await tmuxCheck(['list-panes', '-t', w.tmuxSession, '-F', '#{pane_current_command}']);
     const cmd = paneResult.code === 0 ? paneResult.stdout.trim() : 'DEAD';
     processChecks.push({ id: w.id, label: w.label, paneCommand: cmd });
-    if (cmd !== 'claude' && cmd !== 'DEAD') {
-      warnings.push(`Worker ${w.id}(${w.label}) pane running '${cmd}' instead of 'claude'`);
+    const expectedCmd = w.backend === 'gemini' ? 'gemini' : w.backend === 'aider' ? 'aider' : 'claude';
+    if (cmd !== expectedCmd && cmd !== 'DEAD') {
+      warnings.push(`Worker ${w.id}(${w.label}) pane running '${cmd}' instead of '${expectedCmd}'`);
     }
     if (cmd === 'DEAD') {
       issues.push(`Worker ${w.id}(${w.label}) tmux session dead`);
