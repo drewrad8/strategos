@@ -19,14 +19,16 @@ import {
   AUTO_ACCEPT_PATTERNS, CLAUDE_CODE_IDLE_PATTERNS, CLAUDE_CODE_ACTIVE_PATTERNS,
   AUTO_COMMAND_PATTERNS, AUTO_ACCEPT_PAUSE_KEYWORDS,
   GEMINI_IDLE_PATTERNS, GEMINI_ACTIVE_PATTERNS, GEMINI_AUTO_ACCEPT_PATTERNS,
+  AIDER_IDLE_PATTERNS, AIDER_ACTIVE_PATTERNS, AIDER_AUTO_ACCEPT_PATTERNS,
   BULLDOZE_IDLE_THRESHOLD, BULLDOZE_AUDIT_EVERY_N_CYCLES, BULLDOZE_MAX_HOURS,
   BULLDOZE_MAX_COMPACTIONS, BULLDOZE_CONTINUATION_PREFIX,
-  RATE_LIMIT_PATTERN, RATE_LIMIT_RESET_RE, COMPACTION_PATTERN,
-  AUTO_CONTINUE_IDLE_THRESHOLD, AUTO_CONTINUE_RATE_LIMIT_COOLDOWN,
+  RATE_LIMIT_PATTERN, RATE_LIMIT_RESET_RE,
+  AUTO_CONTINUE_RATE_LIMIT_COOLDOWN,
   AUTO_CONTINUE_MAX_ATTEMPTS, AUTO_CONTINUE_MESSAGE,
   detectWorkerType, isProtectedWorker,
   writeStrategosContext,
   writeGeminiContext,
+  writeAiderContext,
 } from './templates.js';
 
 import {
@@ -42,30 +44,68 @@ import {
 let globalCaptureInterval = null;
 
 // ============================================
+// BACKEND-AWARE PATTERN HELPERS
+// ============================================
+
+function getIdlePatterns(backend) {
+  if (backend === 'gemini') return GEMINI_IDLE_PATTERNS;
+  if (backend === 'aider') return AIDER_IDLE_PATTERNS;
+  return CLAUDE_CODE_IDLE_PATTERNS;
+}
+
+function getActivePatterns(backend) {
+  if (backend === 'gemini') return GEMINI_ACTIVE_PATTERNS;
+  if (backend === 'aider') return AIDER_ACTIVE_PATTERNS;
+  return CLAUDE_CODE_ACTIVE_PATTERNS;
+}
+
+function getAcceptPatterns(backend) {
+  if (backend === 'gemini') return GEMINI_AUTO_ACCEPT_PATTERNS;
+  if (backend === 'aider') return AIDER_AUTO_ACCEPT_PATTERNS;
+  return AUTO_ACCEPT_PATTERNS;
+}
+
+function getBackendTailSize(backend, type) {
+  // 'wide' for bulldoze/auto-accept wide tail, 'narrow' for active check, 'prompt' for prompt detection
+  if (backend === 'gemini') return type === 'narrow' ? 5000 : type === 'prompt' ? 5000 : 8000;
+  if (backend === 'aider') return type === 'narrow' ? 300 : type === 'prompt' ? 300 : 2000;
+  return type === 'narrow' ? 200 : type === 'prompt' ? 150 : 1500;
+}
+
+
+// ============================================
 // GENERAL ROLE-VIOLATION DETECTION (SENTINEL)
 // ============================================
 
-// Claude Code v2.1.50 renders tools as:
-//   Write(filename)  — file creation
-//   Update(filename) — file edit (the Edit tool)
-//   Edit(filename)   — also possible in some versions
-// Match both the internal names (Edit:/Write:) and the rendered names (Update(/Write()
+// Claude Code renders tool invocations at the LEFT MARGIN as:
+//   ● Write(filename)       — file creation
+//   ● Update(filename)      — file edit (the Edit tool)
+//   ● Edit(filename)        — also possible in some versions
+//   ● NotebookEdit(filename) — notebook modification
+// Legacy format (colon):
+//   Edit: filename
+//   Write: filename
+//
+// ALL patterns are ^-anchored and tested against trimmed lines (leading whitespace removed).
+// This prevents false positives from prose text that MENTIONS tool patterns mid-sentence
+// and from child output displayed inside tool result blocks.
 const GENERAL_VIOLATION_PATTERNS = [
-  { pattern: /● (?:Edit|Update)\(/,  description: 'use the Edit tool (file modification)' },
-  { pattern: /● Write\(/,            description: 'use the Write tool (file creation)' },
-  { pattern: /● NotebookEdit\(/,     description: 'use the NotebookEdit tool (notebook modification)' },
-  { pattern: /\bEdit:\s/,            description: 'use the Edit tool (legacy format)' },
-  { pattern: /\bWrite:\s/,           description: 'use the Write tool (legacy format)' },
-  { pattern: /\bNotebookEdit:\s/,    description: 'use the NotebookEdit tool (legacy format)' },
-  { pattern: /\bAdded \d+ lines, removed \d+ lines/, description: 'edit files (diff output detected)' },
-  { pattern: /\bWrote \d+ lines to\b/,               description: 'write files (write output detected)' },
+  { pattern: /^● (?:Edit|Update)\(/,  description: 'use the Edit tool (file modification)' },
+  { pattern: /^● Write\(/,            description: 'use the Write tool (file creation)' },
+  { pattern: /^● NotebookEdit\(/,     description: 'use the NotebookEdit tool (notebook modification)' },
+  { pattern: /^Edit:\s/,              description: 'use the Edit tool (legacy format)' },
+  { pattern: /^Write:\s/,             description: 'use the Write tool (legacy format)' },
+  { pattern: /^NotebookEdit:\s/,      description: 'use the NotebookEdit tool (legacy format)' },
+  { pattern: /^Added \d+ lines, removed \d+ lines/, description: 'edit files (diff output detected)' },
+  { pattern: /^Wrote \d+ lines to\b/,               description: 'write files (write output detected)' },
 ];
 
-// Bash: followed by implementation commands — but NOT legitimate commander actions
-const GENERAL_IMPL_BASH_RE = /\bBash:\s.*?\b(npm|node|python|python3|pip|pip3|sed|awk|gcc|g\+\+|cargo|make|cmake|rustc|javac|go build|go run|tsc|webpack|vite|esbuild|npx playwright|npx jest|pytest)\b/;
+// Bash tool invocations — anchored to line start (● Bash( or legacy Bash: format)
+// Implementation commands that GENERAL should delegate, not run directly
+const GENERAL_IMPL_BASH_RE = /^(?:● )?Bash[:(]\s?.*?\b(npm|node|python|python3|pip|pip3|sed|awk|gcc|g\+\+|cargo|make|cmake|rustc|javac|go build|go run|tsc|webpack|vite|esbuild|npx playwright|npx jest|pytest)\b/;
 
 // Bash: followed by legitimate commander actions (git, curl, ls, cat, jq, etc.)
-const GENERAL_ALLOWED_BASH_RE = /\bBash:\s.*?\b(git|curl|ls|cat|head|tail|jq|wc|echo|printf|pwd|whoami|date|uptime|df|du|ps|grep|find|which|env|export)\b/;
+const GENERAL_ALLOWED_BASH_RE = /^(?:● )?Bash[:(]\s?.*?\b(git|curl|ls|cat|head|tail|jq|wc|echo|printf|pwd|whoami|date|uptime|df|du|ps|grep|find|which|env|export)\b/;
 
 async function checkGeneralRoleViolation(workerId, output, io) {
   const worker = workers.get(workerId);
@@ -83,22 +123,56 @@ async function checkGeneralRoleViolation(workerId, output, io) {
 
   let violation = null;
 
-  // Check file-modification tool patterns
+  // Split into lines for per-line analysis.
+  // Only match patterns on lines that look like the GENERAL's own tool invocations,
+  // NOT child worker output displayed via strategos_output/curl.
+  //
+  // The GENERAL's own tool calls appear at the left margin:
+  //   ● Edit(filename)     — 0-3 chars of leading whitespace before ●
+  //   Bash: command         — 0-3 chars of leading whitespace
+  //
+  // Child output displayed in tool results appears:
+  //   - Indented 4+ spaces (inside tool result blocks)
+  //   - After ⎿ prefix (tool result continuation lines)
+  //   - Inside JSON strings (curl output)
+  const lines = tail.split('\n');
+
+  // A line is "own output" if it starts at the left margin (0-3 chars indent)
+  // and is NOT inside a tool result block (no ⎿ prefix).
+  const isOwnOutputLine = (line) => {
+    const trimmed = line.trimStart();
+    const indent = line.length - trimmed.length;
+    // Skip lines inside tool result blocks (⎿ prefix) or deeply indented
+    if (indent > 3) return false;
+    if (trimmed.startsWith('⎿')) return false;
+    return true;
+  };
+
+  // Check file-modification tool patterns — only on own-output lines.
+  // Patterns are ^-anchored, so test against trimmed line (whitespace already validated by isOwnOutputLine).
   for (const { pattern, description } of GENERAL_VIOLATION_PATTERNS) {
-    if (pattern.test(tail)) {
-      violation = description;
-      break;
+    for (const line of lines) {
+      if (!isOwnOutputLine(line)) continue;
+      const trimmed = line.trimStart();
+      if (pattern.test(trimmed)) {
+        violation = description;
+        break;
+      }
     }
+    if (violation) break;
   }
 
   // Check implementation bash commands (only flag if NOT also matching allowed patterns)
-  if (!violation && GENERAL_IMPL_BASH_RE.test(tail)) {
-    // Extract the matched bash line to check if it also contains allowed commands
-    const bashLines = tail.split('\n').filter(line => /\bBash:\s/.test(line));
-    for (const line of bashLines) {
-      if (GENERAL_IMPL_BASH_RE.test(line) && !GENERAL_ALLOWED_BASH_RE.test(line)) {
-        violation = 'run implementation commands via Bash';
-        break;
+  if (!violation) {
+    for (const line of lines) {
+      if (!isOwnOutputLine(line)) continue;
+      const trimmed = line.trimStart();
+      // Line must start with a Bash tool invocation (● Bash( or legacy Bash:)
+      if (/^(?:● )?Bash[:(]/.test(trimmed)) {
+        if (GENERAL_IMPL_BASH_RE.test(trimmed) && !GENERAL_ALLOWED_BASH_RE.test(trimmed)) {
+          violation = 'run implementation commands via Bash';
+          break;
+        }
       }
     }
   }
@@ -191,7 +265,7 @@ function parseRateLimitResetTime(hours, minutes, ampm, timezone) {
 function detectSessionLimits(workerId, stdout, io) {
   const worker = workers.get(workerId);
   if (!worker || worker.autoContinue === false) return;
-  if (worker.backend === 'gemini') return; // Gemini patterns TBD
+  if (worker.backend === 'gemini' || worker.backend === 'aider') return; // Non-Claude rate limit patterns TBD
 
   // trimEnd() strips trailing whitespace from empty tmux pane rows
   // that can push rate limit text beyond the 1500-char tail window
@@ -237,30 +311,10 @@ function detectSessionLimits(workerId, stdout, io) {
     if (io) io.emit('worker:updated', normalizeWorker(worker));
   }
 
-  // --- Compaction detection (only when no rate limit) ---
-  if (!worker._rateLimitDetected) {
-    const isCompacted = COMPACTION_PATTERN.test(tail);
-
-    if (isCompacted && !worker._compactionDetected) {
-      worker._compactionDetected = true;
-      worker._sessionLimitDetected = true;
-      worker._autoContinueIdleCount = 0;
-      worker._autoContinueAttempts = 0;
-      worker._autoContinueExhausted = false;
-      console.log(`[AutoContinue] Compaction detected for ${worker.label} (${workerId})`);
-    } else if (!isCompacted && worker._compactionDetected) {
-      // Compaction scrolled off — worker resumed
-      worker._compactionDetected = false;
-      if (!worker._rateLimitDetected) {
-        worker._sessionLimitDetected = false;
-      }
-      worker._autoContinueIdleCount = 0;
-    }
-  }
 }
 
 /**
- * Send a continuation message to an idle worker after rate limit or compaction.
+ * Send a continuation message to an idle worker after rate limit.
  * Called from the idle-detection loop when conditions are met.
  */
 async function handleAutoContinue(workerId, io) {
@@ -288,15 +342,15 @@ async function handleAutoContinue(workerId, io) {
 
   worker._autoContinueAttempts = (worker._autoContinueAttempts || 0) + 1;
 
-  const trigger = worker._rateLimitDetected ? 'rate_limit' : 'compaction';
+  const trigger = 'rate_limit';
 
   try {
-    await sendInput(workerId, AUTO_CONTINUE_MESSAGE, io);
+    await sendInput(workerId, AUTO_CONTINUE_MESSAGE, io, { source: 'auto_continue' });
 
     // Clear _sessionLimitDetected to stop the idle handler from re-firing.
-    // Do NOT clear _rateLimitDetected or _compactionDetected — those must stay true
-    // so detectSessionLimits() skips re-detection of the same stale tail text.
-    // They clear naturally when the text scrolls off (lines 229-238, 251-257).
+    // Do NOT clear _rateLimitDetected — it must stay true so detectSessionLimits()
+    // skips re-detection of the same stale tail text. It clears naturally when
+    // the rate limit text scrolls off.
     worker._sessionLimitDetected = false;
     worker.rateLimited = false;
     worker.rateLimitResetAt = null;
@@ -408,13 +462,13 @@ async function captureWorkerOutput(workerId, instance, io) {
 
         if (worker.bulldozeIdleCount >= BULLDOZE_IDLE_THRESHOLD) {
           const cleaned = stripAnsiCodes(stdout);
-          const bulldozeTailSize = worker.backend === 'gemini' ? 8000 : 1500;
+          const bulldozeTailSize = getBackendTailSize(worker.backend, 'wide');
           const tail = cleaned.slice(-bulldozeTailSize);
 
-          const idlePatterns = worker.backend === 'gemini' ? GEMINI_IDLE_PATTERNS : CLAUDE_CODE_IDLE_PATTERNS;
-          const activePatterns = worker.backend === 'gemini' ? GEMINI_ACTIVE_PATTERNS : CLAUDE_CODE_ACTIVE_PATTERNS;
+          const idlePatterns = getIdlePatterns(worker.backend);
+          const activePatterns = getActivePatterns(worker.backend);
           const isAtIdlePrompt = idlePatterns.some(p => p.test(tail));
-          const narrowTailSize = worker.backend === 'gemini' ? 5000 : 200;
+          const narrowTailSize = getBackendTailSize(worker.backend, 'narrow');
           const narrowTail = cleaned.slice(-narrowTailSize);
           const isActivelyWorking = activePatterns.some(p => p.test(narrowTail));
 
@@ -434,15 +488,13 @@ async function captureWorkerOutput(workerId, instance, io) {
         }
       }
 
-      // Auto-continue for rate-limited / post-compaction workers (skip if bulldoze handles it)
+      // Auto-continue for rate-limited workers (skip if bulldoze handles it)
       if (worker && worker.autoContinue !== false && !worker.bulldozeMode &&
           worker.status === 'running' && worker._sessionLimitDetected &&
           worker.ralphStatus !== 'done') {
         worker._autoContinueIdleCount = (worker._autoContinueIdleCount || 0) + 1;
 
-        const threshold = worker._rateLimitDetected
-          ? AUTO_CONTINUE_RATE_LIMIT_COOLDOWN
-          : AUTO_CONTINUE_IDLE_THRESHOLD;
+        const threshold = AUTO_CONTINUE_RATE_LIMIT_COOLDOWN;
 
         if (worker._autoContinueIdleCount >= threshold) {
           // If we know the reset time and haven't reached it yet, skip
@@ -472,7 +524,7 @@ async function captureWorkerOutput(workerId, instance, io) {
       worker.bulldozeIdleCount = 0;
     }
 
-    // Auto-continue: detect rate limits and compaction in fresh output
+    // Auto-continue: detect rate limits in fresh output
     if (worker) {
       detectSessionLimits(workerId, stdout, io);
       worker._autoContinueIdleCount = 0;
@@ -589,6 +641,10 @@ async function captureWorkerOutput(workerId, instance, io) {
         const { removeGeminiContext } = await import('./templates.js');
         removeGeminiContext(w.workingDir, workerId).catch(err =>
           console.error(`[PtyCapture] Failed to remove gemini context for ${workerId}: ${err.message}`));
+      } else if (w.backend === 'aider') {
+        const { removeAiderContext } = await import('./templates.js');
+        removeAiderContext(w.workingDir, workerId).catch(err =>
+          console.error(`[PtyCapture] Failed to remove aider context for ${workerId}: ${err.message}`));
       } else {
         const { removeStrategosContext } = await import('./templates.js');
         removeStrategosContext(w.workingDir, workerId).catch(err =>
@@ -641,26 +697,34 @@ async function handleAutoAcceptCheck(workerId, output, io) {
 
   const cleaned = stripAnsiCodes(output);
   // Gemini CLI renders large TUI boxes with padding — prompt text can be 3000+ chars from end
-  const tailSize = worker.backend === 'gemini' ? 5000 : 500;
+  const tailSize = worker.backend === 'gemini' ? 5000 : worker.backend === 'aider' ? 1000 : 500;
   const tail = cleaned.slice(-tailSize);
+
+  // PROMPT ZONE: Extract only the last ~5 non-empty lines of output.
+  // Permission prompts (e.g. "[Y/n]", "❯ 1. Yes, allow this") always appear at the
+  // very end of the terminal. Matching against the full 500-char tail risks false positives
+  // when LLM response text contains prompt-like words (e.g. "Do you want me to..." or
+  // regex patterns like "❯.{0,8}(Yes..." written as discussion text).
+  // Gemini uses wider prompt zones due to TUI box rendering.
+  const promptZoneLines = worker.backend === 'gemini' ? 20 : worker.backend === 'aider' ? 8 : 5;
+  const promptZone = cleaned.split('\n').filter(l => l.trim()).slice(-promptZoneLines).join('\n');
 
   let promptDetected = false;
   let matchedPattern = null;
 
   // Select accept patterns based on worker backend
-  const acceptPatterns = worker.backend === 'gemini'
-    ? GEMINI_AUTO_ACCEPT_PATTERNS
-    : AUTO_ACCEPT_PATTERNS;
+  const acceptPatterns = getAcceptPatterns(worker.backend);
 
-  const tailLower = tail.toLowerCase();
-  const hasPromptChars = tail.includes('[') || tail.includes('(') || tail.includes('❯') ||
-    tail.includes('●') || tail.includes('>') ||
-    tailLower.includes('want') || tailLower.includes('allow') ||
-    tailLower.includes('press') || tailLower.includes('yes') ||
-    tailLower.includes('trust');
+  // Use prompt zone (not full tail) for pattern matching to prevent self-match on LLM text
+  const zoneLower = promptZone.toLowerCase();
+  const hasPromptChars = promptZone.includes('[') || promptZone.includes('(') || promptZone.includes('\u276f') ||
+    promptZone.includes('\u25cf') || promptZone.includes('>') ||
+    zoneLower.includes('want') || zoneLower.includes('allow') ||
+    zoneLower.includes('press') || zoneLower.includes('yes') ||
+    zoneLower.includes('trust');
   if (hasPromptChars) {
     for (const pattern of acceptPatterns) {
-      if (pattern.test(tail)) {
+      if (pattern.test(promptZone)) {
         promptDetected = true;
         matchedPattern = pattern;
         break;
@@ -674,10 +738,10 @@ async function handleAutoAcceptCheck(workerId, output, io) {
   }
 
   if (worker.autoAccept && !worker.autoAcceptPaused) {
-    const wideTailSize = worker.backend === 'gemini' ? 8000 : 1500;
+    const wideTailSize = getBackendTailSize(worker.backend, 'wide');
     const wideTail = cleaned.slice(-wideTailSize);
-    const idlePats = worker.backend === 'gemini' ? GEMINI_IDLE_PATTERNS : CLAUDE_CODE_IDLE_PATTERNS;
-    const activePats = worker.backend === 'gemini' ? GEMINI_ACTIVE_PATTERNS : CLAUDE_CODE_ACTIVE_PATTERNS;
+    const idlePats = getIdlePatterns(worker.backend);
+    const activePats = getActivePatterns(worker.backend);
     const isIdle = idlePats.some(p => p.test(wideTail)) &&
                    !activePats.some(p => p.test(wideTail));
     if (isIdle) {
@@ -703,7 +767,7 @@ async function handleAutoAcceptCheck(workerId, output, io) {
 
   if (!worker.autoAccept) return;
 
-  const promptLineSize = worker.backend === 'gemini' ? 5000 : 150;
+  const promptLineSize = getBackendTailSize(worker.backend, 'prompt');
   const promptLine = cleaned.slice(-promptLineSize).toLowerCase();
 
   let pauseKeywordFound = false;
@@ -733,7 +797,7 @@ async function handleAutoAcceptCheck(workerId, output, io) {
   if (worker.autoAcceptPaused) return;
   if (!promptDetected) return;
 
-  const hash = simpleHash(tail);
+  const hash = simpleHash(promptZone);
   if (hash === worker.lastAutoAcceptHash) {
     return;
   }
@@ -1004,7 +1068,7 @@ async function handleBulldozeContinuation(workerId, io) {
   const prompt = generateBulldozeContinuation(worker);
 
   try {
-    await sendInput(workerId, prompt, io);
+    await sendInput(workerId, prompt, io, { source: 'bulldoze' });
     worker.bulldozeCyclesCompleted = (worker.bulldozeCyclesCompleted || 0) + 1;
     worker.bulldozeLastCycleAt = new Date();
     worker.lastActivity = new Date();
@@ -1123,17 +1187,26 @@ export function updateWorkerSettings(workerId, settings, io = null) {
     } else {
       console.log(`[Bulldoze] ${worker.label} bulldoze mode DISABLED (${worker.bulldozeCyclesCompleted || 0} cycles completed)`);
       // Rewrite rules file without <bulldoze> section
-      const rewriteContext = worker.backend === 'gemini'
-        ? writeGeminiContext(worker.id, worker.label, worker.workingDir, worker.ralphToken, {
-            parentWorkerId: worker.parentWorkerId,
-            parentLabel: worker.parentLabel,
-            bulldozeMode: false,
-          })
-        : writeStrategosContext(worker.id, worker.label, worker.workingDir, worker.ralphToken, {
+      let rewriteContext;
+      if (worker.backend === 'gemini') {
+        rewriteContext = writeGeminiContext(worker.id, worker.label, worker.workingDir, worker.ralphToken, {
             parentWorkerId: worker.parentWorkerId,
             parentLabel: worker.parentLabel,
             bulldozeMode: false,
           });
+      } else if (worker.backend === 'aider') {
+        rewriteContext = writeAiderContext(worker.id, worker.label, worker.workingDir, worker.ralphToken, {
+            parentWorkerId: worker.parentWorkerId,
+            parentLabel: worker.parentLabel,
+            bulldozeMode: false,
+          });
+      } else {
+        rewriteContext = writeStrategosContext(worker.id, worker.label, worker.workingDir, worker.ralphToken, {
+            parentWorkerId: worker.parentWorkerId,
+            parentLabel: worker.parentLabel,
+            bulldozeMode: false,
+          });
+      }
       rewriteContext.catch(err => console.error(`[Bulldoze] Failed to rewrite rules for ${workerId}: ${err.message}`));
     }
   }
@@ -1164,7 +1237,7 @@ export function updateWorkerSettings(workerId, settings, io = null) {
 // COMMAND QUEUING / INPUT
 // ============================================
 
-export async function sendInput(workerId, input, io = null, { fromWorkerId } = {}) {
+export async function sendInput(workerId, input, io = null, { fromWorkerId, source } = {}) {
   const worker = workers.get(workerId);
 
   if (!worker) {
@@ -1189,6 +1262,11 @@ export async function sendInput(workerId, input, io = null, { fromWorkerId } = {
     const { saveWorkerState } = await import('./persistence.js');
     saveWorkerState().catch(err => console.error(`[Bulldoze] State save failed: ${err.message}`));
   }
+
+  // --- Input Audit Log ---
+  const truncated = typeof input === 'string' ? input.slice(0, 200) : '(non-string)';
+  const src = source || (fromWorkerId ? `worker:${fromWorkerId}` : 'unknown');
+  console.log(`[InputAudit] to=${workerId} (${worker.label}) from=${src} len=${typeof input === 'string' ? input.length : 0} text="${truncated.replace(/[\n\r]/g, ' ')}"`);
 
   const queue = commandQueues.get(workerId) || [];
 
@@ -1216,9 +1294,15 @@ export async function sendInput(workerId, input, io = null, { fromWorkerId } = {
   return true;
 }
 
-export async function sendInputDirect(workerId, input) {
+export async function sendInputDirect(workerId, input, source = null) {
   const worker = workers.get(workerId);
   if (!worker) return;
+
+  // Log when called directly (not via sendInput, which has its own audit log)
+  if (source) {
+    const truncated = typeof input === 'string' ? input.slice(0, 200) : '(non-string)';
+    console.log(`[InputAudit] to=${workerId} (${worker.label}) from=${source} len=${typeof input === 'string' ? input.length : 0} text="${truncated.replace(/[\n\r]/g, ' ')}"`);
+  }
 
   const sanitized = input.replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, '');
 
@@ -1265,7 +1349,7 @@ export async function interruptWorker(workerId, followUp = null, io = null) {
 
     if (followUp && typeof followUp === 'string') {
       await new Promise(resolve => setTimeout(resolve, 500));
-      await sendInput(workerId, followUp, io);
+      await sendInput(workerId, followUp, io, { source: 'interrupt_followup' });
       console.log(`[InterruptWorker] Sent follow-up input to worker ${workerId}`);
     }
 

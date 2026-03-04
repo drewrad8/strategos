@@ -12,6 +12,7 @@ import { createIntegrationRoutes } from './routes/integration.js';
 import { createADRRoutes } from './routes/adrs.js';
 import { createRalphRoutes } from './routes/ralph.js';
 import { createRalphService } from './services/ralphService.js';
+import { createRetestService } from './retestService.js';
 import { setupSocketHandlers, stopMetricsBroadcast } from './socketHandler.js';
 import { checkTmux, discoverExistingWorkers, restoreWorkerState, saveWorkerState, saveWorkerStateSync, getWorkers, getWorkerInternal, spawnWorker, killWorker, startPeriodicCleanup, stopPeriodicCleanup, stopAllHealthMonitors, stopAllPtyCaptures, getResourceStats, closeOutputDb, setWorkerDeathCallback } from './workerManager.js';
 import { THEA_ROOT } from './workers/state.js';
@@ -185,6 +186,10 @@ async function main() {
   app.locals.ralphService = ralphService;
   globalRalphService = ralphService;
 
+  // Initialize Retest Service
+  const retestService = createRetestService(io);
+  app.locals.retestService = retestService;
+
   // Wire up worker death callback for Ralph unregistration
   setWorkerDeathCallback((worker) => {
     if (worker.ralphToken) {
@@ -193,7 +198,7 @@ async function main() {
   });
 
   // API routes
-  app.use('/api', createRoutes(THEA_ROOT, io));
+  app.use('/api', createRoutes(THEA_ROOT, io, { retestService }));
   app.use('/api/integration', createIntegrationRoutes(THEA_ROOT, io));
   app.use('/api/adrs', createADRRoutes());
   app.use('/api/ralph', createRalphRoutes(ralphService));

@@ -151,6 +151,7 @@ async function _doSaveWorkerState() {
         workingDir: w.workingDir,
         tmuxSession: w.tmuxSession,
         backend: w.backend || 'claude',
+        model: w.model || null,
         createdAt: w.createdAt,
         // Timestamps for stalled/crash detection
         lastOutput: w.lastOutput,
@@ -238,6 +239,7 @@ export function saveWorkerStateSync() {
         workingDir: w.workingDir,
         tmuxSession: w.tmuxSession,
         backend: w.backend || 'claude',
+        model: w.model || null,
         createdAt: w.createdAt,
         lastOutput: w.lastOutput,
         lastActivity: w.lastActivity,
@@ -447,7 +449,8 @@ export async function restoreWorkerState(io = null) {
         workingDir: savedWorker.workingDir,
         tmuxSession: savedWorker.tmuxSession,
         // Backend ('claude' or 'gemini')
-        backend: (savedWorker.backend === 'gemini') ? 'gemini' : 'claude',
+        backend: ['gemini', 'aider'].includes(savedWorker.backend) ? savedWorker.backend : 'claude',
+        model: savedWorker.model || null,
         // State (coerce status/health to prevent object/array injection from tampered persistence)
         status: typeof savedWorker.status === 'string' ? savedWorker.status : 'running',
         mode: 'tmux',
@@ -526,7 +529,6 @@ export async function restoreWorkerState(io = null) {
         // Runtime-only auto-continue state (reset on restore, re-detected from output)
         _rateLimitDetected: false,
         _sessionLimitDetected: false,
-        _compactionDetected: false,
         _autoContinueIdleCount: 0,
         _autoContinueAttempts: 0,
         _autoContinueExhausted: false,
@@ -569,10 +571,10 @@ export async function restoreWorkerState(io = null) {
           setTimeout(() => {
             const w = workers.get(wId);
             if (w && w.ralphMode && w.status === 'running' && (!w.ralphStatus || w.ralphStatus === 'pending')) {
-              const restoreMsg = w.backend === 'gemini'
+              const restoreMsg = (w.backend === 'gemini' || w.backend === 'aider')
                 ? `Signal your progress via Ralph. Run: curl -s -X POST http://localhost:38007/api/ralph/signal/by-worker/${wId} -H "Content-Type: application/json" -d '{"status":"in_progress","progress":10,"currentStep":"what you are doing"}'`
                 : `Signal your progress via the strategos_signal MCP tool: strategos_signal(status: "in_progress", progress: 10, currentStep: "what you are doing"). Your worker ID is ${wId} (auto-detected if omitted). Use strategos_whoami if unsure of your identity.`;
-              sendInputDirect(wId, restoreMsg).catch(err => { console.warn(`[Ralph] Failed to send restore reminder: ${err.message}`); });
+              sendInputDirect(wId, restoreMsg, 'persistence:restore_reminder').catch(err => { console.warn(`[Ralph] Failed to send restore reminder: ${err.message}`); });
               console.log(`[Ralph] Sent post-restore reminder to ${worker.label}`);
             }
           }, 30000); // 30s after restore (shorter than 60s spawn delay since worker already running)

@@ -17,6 +17,10 @@ import {
 import { isProtectedWorker } from './templates.js';
 import { stopPtyCapture, sendInputDirect } from './output.js';
 import { tryAutoPromoteWorker } from './ralph.js';
+import {
+  getSystemResources, checkWorkerAges,
+  CRITICAL_AVAILABLE_MB, SWAP_CRITICAL_PERCENT,
+} from './resources.js';
 import { clearWorkerContext } from '../summaryService.js';
 import { getLogger } from '../logger.js';
 import {
@@ -34,6 +38,9 @@ let globalHealthInterval = null;
 
 // Periodic cleanup interval
 let cleanupInterval = null;
+
+// Resource monitoring interval (60s)
+let resourceMonitorInterval = null;
 
 // ============================================
 // CRASH PATTERNS
@@ -125,7 +132,18 @@ function checkWorkerHealth(workerId, io) {
   if (!crashDetected) {
     const timeSinceOutput = Date.now() - new Date(worker.lastOutput).getTime();
     const outputStalled = timeSinceOutput > 10 * 60 * 1000;
-    if (outputStalled) {
+
+    // Determine if Ralph is recently active (within 30 min)
+    const ralphRecentlyActive = worker.lastRalphSignalAt &&
+      (Date.now() - new Date(worker.lastRalphSignalAt).getTime()) < 30 * 60 * 1000;
+
+    if (!outputStalled) {
+      worker.health = 'healthy';
+    } else if (ralphRecentlyActive) {
+      // Output stalled but Ralph recently signaled — worker is alive, just no terminal output
+      worker.health = 'healthy';
+    } else {
+      // Output stalled AND no recent Ralph signal — truly stalled
       const stalledMinutes = Math.round(timeSinceOutput / 60000);
       if (worker.health !== 'stalled') {
         console.warn(`[HealthMonitor] Worker ${workerId} (${worker.label}) stalled for ${stalledMinutes}m`);
@@ -134,8 +152,6 @@ function checkWorkerHealth(workerId, io) {
           io.emit('worker:stalled', { workerId, label: worker.label, stalledMinutes });
         }
       }
-    } else {
-      worker.health = 'healthy';
     }
 
     if (worker.ralphStatus === 'blocked' && !worker._blockedEmitted) {
@@ -146,20 +162,6 @@ function checkWorkerHealth(workerId, io) {
       }
     } else if (worker.ralphStatus !== 'blocked') {
       worker._blockedEmitted = false;
-    }
-
-    if (!outputStalled) {
-      // Worker is producing output — not stalled
-    } else if (worker.ralphStatus === 'in_progress' && worker.lastRalphSignalAt && worker.health !== 'stalled') {
-      const msSinceRalph = Date.now() - new Date(worker.lastRalphSignalAt).getTime();
-      const minutesSinceUpdate = Math.round(msSinceRalph / 60000);
-      if (msSinceRalph > 30 * 60 * 1000) {
-        console.warn(`[HEALTH] Worker ${workerId} (${worker.label}) stalled - no Ralph update in ${minutesSinceUpdate} min`);
-        worker.health = 'stalled';
-        if (io) {
-          io.emit('worker:stalled', { workerId, label: worker.label, stalledMinutes: minutesSinceUpdate });
-        }
-      }
     }
   }
 
@@ -318,7 +320,7 @@ export async function handleCrashedWorker(workerId, worker, io) {
       if (parentWorker) {
         const msg = `[CrashRecovery] Your child worker "${worker.label}" (${workerId}) crashed and was respawned as ${newWorker.id}. Use GET /api/workers/${newWorker.id} to retrieve updated details.`;
         try {
-          await sendInputDirect(worker.parentWorkerId, msg);
+          await sendInputDirect(worker.parentWorkerId, msg, 'health:death_notification');
         } catch (e) {
           console.warn(`[CrashRecovery] Could not notify parent ${worker.parentWorkerId}: ${e.message}`);
         }
@@ -376,6 +378,9 @@ export function startPeriodicCleanup(io = null) {
   }
 
   console.log('[PeriodicCleanup] Starting periodic cleanup sweep (every 60s)');
+
+  // Start resource monitor alongside periodic cleanup
+  startResourceMonitor(io);
 
   let _cleanupRunning = false;
   cleanupInterval = setInterval(async () => {
@@ -554,5 +559,83 @@ export function stopPeriodicCleanup() {
     clearInterval(cleanupInterval);
     cleanupInterval = null;
     console.log('[PeriodicCleanup] Stopped');
+  }
+  stopResourceMonitor();
+}
+
+// ============================================
+// RESOURCE MONITORING (every 60s)
+// ============================================
+
+/**
+ * Periodic system resource check.
+ * Emits socket events when memory is critically low or workers exceed age thresholds.
+ */
+export function startResourceMonitor(io) {
+  if (resourceMonitorInterval) return;
+  console.log('[ResourceMonitor] Starting periodic resource monitoring (every 60s)');
+
+  resourceMonitorInterval = setInterval(async () => {
+    try {
+      // Check system memory/swap
+      const resources = await getSystemResources();
+
+      if (resources.availableMB < CRITICAL_AVAILABLE_MB) {
+        console.error(`[ResourceMonitor] CRITICAL: Only ${resources.availableMB}MB memory available (threshold: ${CRITICAL_AVAILABLE_MB}MB)`);
+        if (io) {
+          io.emit('system:resource:critical', {
+            type: 'memory',
+            availableMB: resources.availableMB,
+            thresholdMB: CRITICAL_AVAILABLE_MB,
+            message: `System memory critically low: ${resources.availableMB}MB available`,
+            timestamp: new Date().toISOString(),
+          });
+        }
+      }
+
+      if (resources.swapUsedPercent > 90) {
+        console.error(`[ResourceMonitor] CRITICAL: Swap ${resources.swapUsedPercent}% used (${resources.swapUsedMB}MB/${resources.swapTotalMB}MB)`);
+        if (io) {
+          io.emit('system:resource:critical', {
+            type: 'swap',
+            swapUsedPercent: resources.swapUsedPercent,
+            swapUsedMB: resources.swapUsedMB,
+            swapTotalMB: resources.swapTotalMB,
+            message: `Swap critically full: ${resources.swapUsedPercent}% used`,
+            timestamp: new Date().toISOString(),
+          });
+        }
+      }
+
+      // Check worker ages
+      const agedWorkers = checkWorkerAges();
+      for (const aged of agedWorkers) {
+        console.warn(`[ResourceMonitor] Worker age ${aged.severity}: ${aged.id} (${aged.label}) — ${aged.message}`);
+        if (io) {
+          io.emit('worker:age:warning', {
+            workerId: aged.id,
+            label: aged.label,
+            ageHours: aged.ageHours,
+            severity: aged.severity,
+            message: aged.message,
+            timestamp: new Date().toISOString(),
+          });
+        }
+      }
+    } catch (err) {
+      console.error(`[ResourceMonitor] Error during resource check: ${err.message}`);
+    }
+  }, 60000);
+
+  if (resourceMonitorInterval.unref) {
+    resourceMonitorInterval.unref();
+  }
+}
+
+export function stopResourceMonitor() {
+  if (resourceMonitorInterval) {
+    clearInterval(resourceMonitorInterval);
+    resourceMonitorInterval = null;
+    console.log('[ResourceMonitor] Stopped');
   }
 }

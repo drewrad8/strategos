@@ -17,6 +17,10 @@ export const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/;
 /** Global variant for .replace() calls that need to strip all control chars */
 export const CONTROL_CHAR_RE_G = /[\x00-\x1f\x7f]/g;
 
+/** Multiline-safe variant: allows \t (0x09), \n (0x0a), \r (0x0d) but blocks all other control chars.
+ *  Use for fields that legitimately contain newlines (task descriptions, prompts). */
+export const MULTILINE_CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/;
+
 /** Max label length for workers, templates, etc. */
 export const MAX_LABEL_LENGTH = 200;
 

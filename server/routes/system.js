@@ -47,6 +47,7 @@ import {
   getMetricsService,
   MetricTypes
 } from '../metricsService.js';
+import { getResourceReport } from '../workers/resources.js';
 import { sanitizeErrorMessage } from '../errorUtils.js';
 import {
   CONTROL_CHAR_RE, isValidSessionId,
@@ -683,6 +684,16 @@ export function createSystemRoutes(theaRoot, io) {
         ...stats,
         timestamp: new Date().toISOString()
       });
+    } catch (error) {
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
+    }
+  });
+
+  // GET /api/system/resources - Full system resource report (memory, swap, worker RSS, aged workers)
+  router.get('/system/resources', async (req, res) => {
+    try {
+      const report = await getResourceReport();
+      res.json(report);
     } catch (error) {
       res.status(500).json({ error: sanitizeErrorMessage(error) });
     }

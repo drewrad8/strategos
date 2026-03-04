@@ -132,7 +132,7 @@ export function createIntegrationRoutes(theaRoot, io) {
       }
 
       // Send the prompt to the worker
-      await sendInput(worker.id, prompt);
+      await sendInput(worker.id, prompt, null, { source: 'integration_api' });
 
       res.json({
         success: true,

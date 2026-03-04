@@ -75,7 +75,7 @@ export const SESSION_PREFIX = 'thea-worker-';
 // Auto-derive THEA_ROOT from file location: state.js is at THEA_ROOT/<project>/server/workers/state.js
 const _stateFileDir = path.dirname(new URL(import.meta.url).pathname);
 export const THEA_ROOT = process.env.THEA_ROOT || path.resolve(_stateFileDir, '..', '..', '..');
-export const MAX_CONCURRENT_WORKERS = 100;
+export const MAX_CONCURRENT_WORKERS = 50;
 export const AUTO_CLEANUP_DELAY_MS = 30000;
 export const STALE_WORKER_THRESHOLD_MS = 30 * 60 * 1000;
 
@@ -332,6 +332,7 @@ export function normalizeWorker(worker) {
     status: worker.status,
     mode: worker.mode,
     backend: worker.backend || 'claude',
+    model: worker.model || null,
     health: worker.health,
     queuedCommands: worker.queuedCommands ?? 0,
     waitingAtPrompt: worker.waitingAtPrompt ?? false,

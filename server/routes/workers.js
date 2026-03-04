@@ -41,7 +41,7 @@ import {
 } from '../workerOutputDb.js';
 import { sanitizeErrorMessage } from '../errorUtils.js';
 import {
-  VALID_WORKER_ID, VALID_SIMPLE_ID, CONTROL_CHAR_RE,
+  VALID_WORKER_ID, VALID_SIMPLE_ID, CONTROL_CHAR_RE, MULTILINE_CONTROL_CHAR_RE,
   MAX_TASK_LENGTH, MAX_LABEL_LENGTH, MAX_INPUT_LENGTH, MAX_PROMPT_LENGTH,
   isValidSessionId
 } from '../validation.js';
@@ -133,6 +133,49 @@ const SPAWN_TEMPLATES = {
     autoAccept: true,
     ralphMode: true,
     backend: 'gemini'
+  },
+  // Aider (Ollama) backend templates
+  'aider-research': {
+    prefix: 'RESEARCH',
+    autoAccept: true,
+    ralphMode: true,
+    backend: 'aider'
+  },
+  'aider-impl': {
+    prefix: 'IMPL',
+    autoAccept: true,
+    ralphMode: true,
+    backend: 'aider'
+  },
+  'aider-test': {
+    prefix: 'TEST',
+    autoAccept: true,
+    ralphMode: true,
+    backend: 'aider'
+  },
+  'aider-review': {
+    prefix: 'REVIEW',
+    autoAccept: true,
+    ralphMode: true,
+    backend: 'aider'
+  },
+  'aider-fix': {
+    prefix: 'FIX',
+    autoAccept: true,
+    ralphMode: true,
+    backend: 'aider'
+  },
+  'aider-general': {
+    prefix: 'GENERAL',
+    autoAccept: true,
+    ralphMode: true,
+    backend: 'aider'
+  },
+  'aider-colonel': {
+    prefix: 'COLONEL',
+    autoAccept: true,
+    ralphMode: true,
+    backend: 'aider'
   }
 };
 
@@ -331,7 +374,8 @@ export function createWorkerRoutes(theaRoot, io) {
         autoAccept,     // Auto-accept permission prompts (default false)
         ralphMode,      // Enable Ralph autonomous completion signaling (default false)
         allowDuplicate, // Allow spawning duplicate label+project workers (default false)
-        backend,        // 'claude' (default) or 'gemini'
+        backend,        // 'claude' (default), 'gemini', or 'aider'
+        model,          // Model name for aider backend (e.g. 'ollama_chat/qwen2.5-coder:7b')
       } = req.body;
 
       if (!projectPath) {
@@ -377,33 +421,33 @@ export function createWorkerRoutes(theaRoot, io) {
       const validTask = (() => {
         if (task === undefined || task === null) return undefined;
         if (typeof task === 'string') {
-          return (task.length <= MAX_TASK_LENGTH && !CONTROL_CHAR_RE.test(task)) ? task : undefined;
+          return (task.length <= MAX_TASK_LENGTH && !MULTILINE_CONTROL_CHAR_RE.test(task)) ? task : undefined;
         }
         if (typeof task === 'object' && !Array.isArray(task)) {
           // Validate object task sub-fields (parity with spawn-from-template)
           const obj = {};
           if (task.description !== undefined) {
-            if (typeof task.description !== 'string' || task.description.length > MAX_TASK_LENGTH || CONTROL_CHAR_RE.test(task.description)) return undefined;
+            if (typeof task.description !== 'string' || task.description.length > MAX_TASK_LENGTH || MULTILINE_CONTROL_CHAR_RE.test(task.description)) return undefined;
             obj.description = task.description;
           }
           for (const field of ['type', 'context', 'purpose', 'endState', 'riskTolerance', 'detailLevel']) {
             if (task[field] !== undefined) {
-              if (typeof task[field] !== 'string' || task[field].length > MAX_TASK_LENGTH || CONTROL_CHAR_RE.test(task[field])) return undefined;
+              if (typeof task[field] !== 'string' || task[field].length > MAX_TASK_LENGTH || MULTILINE_CONTROL_CHAR_RE.test(task[field])) return undefined;
               obj[field] = task[field];
             }
           }
           if (task.keyTasks !== undefined) {
             if (!Array.isArray(task.keyTasks) || task.keyTasks.length > 20) return undefined;
-            if (!task.keyTasks.every(kt => typeof kt === 'string' && kt.length <= 500 && !CONTROL_CHAR_RE.test(kt))) return undefined;
+            if (!task.keyTasks.every(kt => typeof kt === 'string' && kt.length <= 500 && !MULTILINE_CONTROL_CHAR_RE.test(kt))) return undefined;
             obj.keyTasks = task.keyTasks;
           }
           if (task.constraints !== undefined) {
             if (typeof task.constraints === 'string') {
-              if (task.constraints.length > 500 || CONTROL_CHAR_RE.test(task.constraints)) return undefined;
+              if (task.constraints.length > 500 || MULTILINE_CONTROL_CHAR_RE.test(task.constraints)) return undefined;
               obj.constraints = [task.constraints];
             } else if (Array.isArray(task.constraints)) {
               if (task.constraints.length > 20) return undefined;
-              if (!task.constraints.every(c => typeof c === 'string' && c.length <= 500 && !CONTROL_CHAR_RE.test(c))) return undefined;
+              if (!task.constraints.every(c => typeof c === 'string' && c.length <= 500 && !MULTILINE_CONTROL_CHAR_RE.test(c))) return undefined;
               obj.constraints = task.constraints;
             } else {
               return undefined;
@@ -454,11 +498,15 @@ export function createWorkerRoutes(theaRoot, io) {
       options.autoAccept = autoAccept !== false; // true unless explicitly false
       options.ralphMode = ralphMode !== false;   // true unless explicitly false
       // Backend selection: explicit > parent inheritance > 'claude' default
-      if (backend === 'gemini') {
-        options.backend = 'gemini';
+      if (backend === 'gemini' || backend === 'aider') {
+        options.backend = backend;
+        if (backend === 'aider' && model) options.model = model;
       } else if (!backend && validParentWorkerId) {
         const parentWorker = getWorker(validParentWorkerId);
-        if (parentWorker?.backend === 'gemini') options.backend = 'gemini';
+        if (parentWorker?.backend && parentWorker.backend !== 'claude') {
+          options.backend = parentWorker.backend;
+          if (parentWorker.backend === 'aider' && parentWorker.model) options.model = parentWorker.model;
+        }
       }
       // Duplicate detection is ON by default — callers must opt-in to duplicates
       options.allowDuplicate = allowDuplicate === true;
@@ -499,7 +547,7 @@ export function createWorkerRoutes(theaRoot, io) {
    */
   router.post('/spawn-from-template', async (req, res) => {
     try {
-      const { template: templateField, role, label, projectPath, task, parentWorkerId, allowDuplicate } = req.body;
+      const { template: templateField, role, label, projectPath, task, parentWorkerId, allowDuplicate, model } = req.body;
 
       // Accept 'role' as alias for 'template'
       const template = templateField || role;
@@ -531,12 +579,12 @@ export function createWorkerRoutes(theaRoot, io) {
         return res.status(400).json({ error: 'task is required' });
       }
 
-      // Validate task — same rules as main spawn route (string: size + control chars; object: validate description)
+      // Validate task — same rules as main spawn route (string: size + multiline control chars; object: validate description)
       if (typeof task === 'string') {
         if (task.length > MAX_TASK_LENGTH) {
           return res.status(400).json({ error: `task must be under ${MAX_TASK_LENGTH} characters` });
         }
-        if (CONTROL_CHAR_RE.test(task)) {
+        if (MULTILINE_CONTROL_CHAR_RE.test(task)) {
           return res.status(400).json({ error: 'task must not contain control characters' });
         }
       } else if (task && typeof task === 'object' && !Array.isArray(task)) {
@@ -548,7 +596,7 @@ export function createWorkerRoutes(theaRoot, io) {
           if (task.description.length > MAX_TASK_LENGTH) {
             return res.status(400).json({ error: `task.description must be under ${MAX_TASK_LENGTH} characters` });
           }
-          if (CONTROL_CHAR_RE.test(task.description)) {
+          if (MULTILINE_CONTROL_CHAR_RE.test(task.description)) {
             return res.status(400).json({ error: 'task.description must not contain control characters' });
           }
         }
@@ -558,7 +606,7 @@ export function createWorkerRoutes(theaRoot, io) {
             if (typeof task[field] !== 'string' || task[field].length > MAX_TASK_LENGTH) {
               return res.status(400).json({ error: `task.${field} must be a string under ${MAX_TASK_LENGTH} characters` });
             }
-            if (CONTROL_CHAR_RE.test(task[field])) {
+            if (MULTILINE_CONTROL_CHAR_RE.test(task[field])) {
               return res.status(400).json({ error: `task.${field} must not contain control characters` });
             }
           }
@@ -569,7 +617,7 @@ export function createWorkerRoutes(theaRoot, io) {
             return res.status(400).json({ error: 'task.keyTasks must be an array with at most 20 items' });
           }
           for (const kt of task.keyTasks) {
-            if (typeof kt !== 'string' || kt.length > 500 || CONTROL_CHAR_RE.test(kt)) {
+            if (typeof kt !== 'string' || kt.length > 500 || MULTILINE_CONTROL_CHAR_RE.test(kt)) {
               return res.status(400).json({ error: 'task.keyTasks items must be strings under 500 chars without control characters' });
             }
           }
@@ -578,7 +626,7 @@ export function createWorkerRoutes(theaRoot, io) {
         if (task.constraints !== undefined) {
           if (typeof task.constraints === 'string') {
             // Convert string to single-item array for consistency with initializeWorker()
-            if (task.constraints.length > 500 || CONTROL_CHAR_RE.test(task.constraints)) {
+            if (task.constraints.length > 500 || MULTILINE_CONTROL_CHAR_RE.test(task.constraints)) {
               return res.status(400).json({ error: 'task.constraints must not contain control characters and be under 500 chars' });
             }
             task.constraints = [task.constraints];
@@ -587,7 +635,7 @@ export function createWorkerRoutes(theaRoot, io) {
               return res.status(400).json({ error: 'task.constraints must be an array with at most 20 items' });
             }
             for (const c of task.constraints) {
-              if (typeof c !== 'string' || c.length > 500 || CONTROL_CHAR_RE.test(c)) {
+              if (typeof c !== 'string' || c.length > 500 || MULTILINE_CONTROL_CHAR_RE.test(c)) {
                 return res.status(400).json({ error: 'task.constraints items must be strings under 500 chars without control characters' });
               }
             }
@@ -647,11 +695,13 @@ export function createWorkerRoutes(theaRoot, io) {
 
       // Spawn with template settings
       // Backend priority: template explicit > parent inheritance > 'claude' default
-      const resolvedBackend = tmpl.backend || (parent?.backend === 'gemini' ? 'gemini' : 'claude');
+      // Backend priority: template explicit > parent inheritance > 'claude' default
+      const resolvedBackend = tmpl.backend || (parent?.backend && parent.backend !== 'claude' ? parent.backend : 'claude');
       const options = {
         autoAccept: tmpl.autoAccept,
         ralphMode: tmpl.ralphMode,
         backend: resolvedBackend,
+        model: resolvedBackend === 'aider' ? (model || null) : null,
         task: taskObj,
         parentWorkerId,
         parentLabel: parent?.label,
@@ -788,8 +838,7 @@ export function createWorkerRoutes(theaRoot, io) {
         if (typeof bulldozePaused !== 'boolean') return res.status(400).json({ error: 'bulldozePaused must be a boolean' });
         settings.bulldozePaused = bulldozePaused;
       }
-      // Bulldoze text fields are multiline — allow \n \r \t but reject other control chars
-      const MULTILINE_CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/;
+      // Bulldoze text fields are multiline — use shared MULTILINE_CONTROL_CHAR_RE from validation.js
       if (bulldozeMission !== undefined) {
         if (typeof bulldozeMission !== 'string' || bulldozeMission.length > 10000) {
           return res.status(400).json({ error: 'bulldozeMission must be a string under 10000 chars' });
@@ -851,7 +900,7 @@ curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Co
 ===========================
 
 `;
-            await sendInput(req.params.id, instructions);
+            await sendInput(req.params.id, instructions, null, { source: 'complete_instructions' });
           }
         } else if (!ralphMode && wasRalphEnabled) {
           // Ralph mode just disabled - unregister
@@ -898,7 +947,7 @@ curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Co
         return res.status(400).json({ error: 'Input too large (max 1MB)' });
       }
 
-      await sendInput(req.params.id, input, null, { fromWorkerId });
+      await sendInput(req.params.id, input, null, { fromWorkerId, source: fromWorkerId ? `rest_api:worker:${fromWorkerId}` : 'rest_api' });
       res.json({ success: true });
     } catch (error) {
       if (error.message.includes('not found')) {

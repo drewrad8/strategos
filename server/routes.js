@@ -19,14 +19,20 @@ import { createWorkerRoutes } from './routes/workers.js';
 import { createProjectRoutes } from './routes/projects.js';
 import { createSystemRoutes } from './routes/system.js';
 import { createSettingsRoutes } from './routes/settings.js';
+import { createRetestRoutes } from './routes/retest.js';
 
-export function createRoutes(theaRoot, io) {
+export function createRoutes(theaRoot, io, { retestService } = {}) {
   const router = express.Router();
 
   // Domain-specific sub-routers
   router.use('/workers', createWorkerRoutes(theaRoot, io));
   router.use('/projects', createProjectRoutes(theaRoot));
   router.use('/settings', createSettingsRoutes());
+
+  // Retest routes (optional — only mounted if service is provided)
+  if (retestService) {
+    router.use('/retest', createRetestRoutes(retestService));
+  }
 
   // System routes have no shared prefix — mounted at root
   router.use('/', createSystemRoutes(theaRoot, io));
