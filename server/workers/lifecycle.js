@@ -442,7 +442,7 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
         '-s', sessionName,
         '-x', String(DEFAULT_COLS),
         '-y', String(DEFAULT_ROWS),
-        '-e', 'OLLAMA_API_BASE=http://10.10.0.55:11434',
+        '-e', `OLLAMA_API_BASE=${process.env.OLLAMA_API_BASE || 'http://localhost:11434'}`,
         '-c', projectPath,
         'aider', '--model', aiderModel, '--yes', '--no-auto-commits',
         '--read', aiderContextFile
@@ -598,7 +598,7 @@ async function startPendingWorker(workerId, io = null) {
         '-s', sessionName,
         '-x', String(DEFAULT_COLS),
         '-y', String(DEFAULT_ROWS),
-        '-e', 'OLLAMA_API_BASE=http://10.10.0.55:11434',
+        '-e', `OLLAMA_API_BASE=${process.env.OLLAMA_API_BASE || 'http://localhost:11434'}`,
         '-c', pending.projectPath,
         'aider', '--model', aiderModel, '--yes', '--no-auto-commits',
         '--read', aiderContextFile

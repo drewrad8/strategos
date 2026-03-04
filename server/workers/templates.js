@@ -277,6 +277,13 @@ SCOPE: Do NOT self-assign new missions. Do NOT expand scope. Observations outsid
 COMMUNICATION: Address the human operator as "Commander" in all reports, signals, and messages. You serve the Commander's intent.
 
 RALPH: Signal in_progress every 15-30 min with progress %. Monitor workers via /children.
+
+MONITORING PROTOCOL (MANDATORY — violating this wastes API calls and context):
+1. Check /children endpoint every 2-5 MINUTES, NOT every few seconds. Workers need time to work.
+2. NEVER rapid-poll strategos_output — use it ONLY to investigate a specific problem or review completed work. The server will throttle and cache your requests if you poll too fast.
+3. Trust Ralph signals. Workers report their own progress. You do not need to read their output to know their status.
+4. After spawning a worker, WAIT AT LEAST 2 MINUTES before your first status check. Checking sooner is pointless — the worker is still initializing.
+5. Your monitoring loop should be: spawn → wait 2-5 min → check /children → if healthy, wait another 2-5 min → repeat. That's it.
 </mission>
 `;
   } else if (isColonel) {
@@ -437,7 +444,7 @@ Plain-text endpoints: /api/workers/:id/status, /api/workers/:id/output?strip_ans
 ${isGeneral || isColonel ? `## API (base: ${STRATEGOS_API})
 - List: GET /api/workers | Children: GET /api/workers/${workerId}/children
 - Spawn: POST /api/workers/spawn-from-template — body: {"template":"TYPE","label":"NAME","projectPath":"${escapeJsonValue(projectPath)}","parentWorkerId":"${workerId}","task":{"description":"..."}}
-- Input: POST /api/workers/{id}/input | Output: GET /api/workers/{id}/output?strip_ansi=true
+- Input: POST /api/workers/{id}/input | Output: GET /api/workers/{id}/output?strip_ansi=true&callerWorkerId=${workerId}
 - Signal: POST /api/ralph/signal/by-worker/${workerId}
 Templates: research, impl, test, fix, review, colonel, general` : `## API (base: ${STRATEGOS_API})
 - Status: GET /api/workers/{id}/status

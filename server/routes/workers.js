@@ -1061,12 +1061,32 @@ curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Co
 
   // GET /api/workers/:id/output - Get worker output buffer
   // Query params: ?strip_ansi=true to remove ANSI escape codes, ?lines=N for last N lines
+  // Per-caller throttling: if callerWorkerId is provided, caches output for 30s to prevent rapid polling
+  const _outputCache = new Map(); // key: "caller:target" -> { output, timestamp }
+  const OUTPUT_CACHE_TTL_MS = 30_000;
+  const OUTPUT_CACHE_MAX_ENTRIES = 500;
+  const OUTPUT_THROTTLE_HINT = '\n[Strategos] Output cached — polling too fast. Check every 2+ minutes. Use Ralph signals for monitoring.';
+
   router.get('/:id/output', (req, res) => {
     try {
       const worker = getWorker(req.params.id);
 
       if (!worker) {
         return res.status(404).json({ error: 'Resource not found' });
+      }
+
+      const callerWorkerId = req.query.callerWorkerId || null;
+
+      // Per-caller throttling: if a worker fetches the same target within 30s, return cached result
+      if (callerWorkerId) {
+        const cacheKey = `${callerWorkerId}:${req.params.id}`;
+        const cached = _outputCache.get(cacheKey);
+        const now = Date.now();
+
+        if (cached && (now - cached.timestamp) < OUTPUT_CACHE_TTL_MS) {
+          // Return cached output with throttle hint appended
+          return res.json({ output: cached.output + OUTPUT_THROTTLE_HINT, cached: true });
+        }
       }
 
       let output = getWorkerOutput(req.params.id) || '';
@@ -1081,6 +1101,26 @@ curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Co
       if (lines > 0) {
         const allLines = output.split('\n');
         output = allLines.slice(-lines).join('\n');
+      }
+
+      // Cache result for caller-based throttling
+      if (callerWorkerId) {
+        const cacheKey = `${callerWorkerId}:${req.params.id}`;
+
+        // Evict oldest entries if cache is full
+        if (_outputCache.size >= OUTPUT_CACHE_MAX_ENTRIES) {
+          let oldestKey = null;
+          let oldestTime = Infinity;
+          for (const [key, entry] of _outputCache) {
+            if (entry.timestamp < oldestTime) {
+              oldestTime = entry.timestamp;
+              oldestKey = key;
+            }
+          }
+          if (oldestKey) _outputCache.delete(oldestKey);
+        }
+
+        _outputCache.set(cacheKey, { output, timestamp: Date.now() });
       }
 
       res.json({ output });

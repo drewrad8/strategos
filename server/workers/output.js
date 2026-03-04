@@ -301,14 +301,11 @@ function detectSessionLimits(workerId, stdout, io) {
       io.emit('worker:updated', normalizeWorker(worker));
     }
   } else if (!isRateLimited && worker._rateLimitDetected) {
-    // Rate limit cleared — worker output no longer shows rate limit in tail
+    // Rate limit text scrolled off terminal tail — clear the detection guard only.
+    // Do NOT clear _sessionLimitDetected, rateLimited, or rateLimitResetAt;
+    // those clear only when auto-continue actually succeeds (in handleAutoContinue).
     worker._rateLimitDetected = false;
-    worker._sessionLimitDetected = false;
-    worker.rateLimited = false;
-    worker.rateLimitResetAt = null;
-    worker._autoContinueIdleCount = 0;
-    console.log(`[AutoContinue] Rate limit cleared for ${worker.label} (${workerId})`);
-    if (io) io.emit('worker:updated', normalizeWorker(worker));
+    console.log(`[AutoContinue] Rate limit text scrolled off for ${worker.label} (${workerId}), keeping rate limit state until auto-continue`);
   }
 
 }
@@ -347,11 +344,11 @@ async function handleAutoContinue(workerId, io) {
   try {
     await sendInput(workerId, AUTO_CONTINUE_MESSAGE, io, { source: 'auto_continue' });
 
-    // Clear _sessionLimitDetected to stop the idle handler from re-firing.
-    // Do NOT clear _rateLimitDetected — it must stay true so detectSessionLimits()
-    // skips re-detection of the same stale tail text. It clears naturally when
-    // the rate limit text scrolls off.
+    // Clear all rate limit state after successful auto-continue.
+    // _rateLimitDetected is now also cleared here (not on text scroll-off)
+    // so detectSessionLimits() can detect a fresh rate limit if it recurs.
     worker._sessionLimitDetected = false;
+    worker._rateLimitDetected = false;
     worker.rateLimited = false;
     worker.rateLimitResetAt = null;
 
@@ -492,15 +489,20 @@ async function captureWorkerOutput(workerId, instance, io) {
       if (worker && worker.autoContinue !== false && !worker.bulldozeMode &&
           worker.status === 'running' && worker._sessionLimitDetected &&
           worker.ralphStatus !== 'done') {
-        worker._autoContinueIdleCount = (worker._autoContinueIdleCount || 0) + 1;
 
-        const threshold = AUTO_CONTINUE_RATE_LIMIT_COOLDOWN;
+        if (worker.rateLimitResetAt && Date.now() >= worker.rateLimitResetAt) {
+          // Time-driven: reset time reached — fire immediately, no idle pattern check needed.
+          // The parsed reset time IS the trigger.
+          handleAutoContinue(workerId, io).catch(err =>
+            console.error(`[AutoContinue] Continuation failed for ${workerId}: ${err.message}`));
+          worker._autoContinueIdleCount = 0;
+        } else if (!worker.rateLimitResetAt) {
+          // No reset time known — fall back to idle-pattern detection
+          worker._autoContinueIdleCount = (worker._autoContinueIdleCount || 0) + 1;
 
-        if (worker._autoContinueIdleCount >= threshold) {
-          // If we know the reset time and haven't reached it yet, skip
-          if (worker.rateLimitResetAt && Date.now() < worker.rateLimitResetAt) {
-            // Still before reset — don't burn attempts
-          } else {
+          const threshold = AUTO_CONTINUE_RATE_LIMIT_COOLDOWN;
+
+          if (worker._autoContinueIdleCount >= threshold) {
             const cleaned = stripAnsiCodes(stdout).trimEnd();
             const tail = cleaned.slice(-1500);
             const isIdle = CLAUDE_CODE_IDLE_PATTERNS.some(p => p.test(tail));
@@ -513,6 +515,7 @@ async function captureWorkerOutput(workerId, instance, io) {
             }
           }
         }
+        // else: rateLimitResetAt is set but not reached yet — just wait
       }
 
       return;
