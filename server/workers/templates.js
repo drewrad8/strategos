@@ -284,6 +284,12 @@ MONITORING PROTOCOL (MANDATORY — violating this wastes API calls and context):
 3. Trust Ralph signals. Workers report their own progress. You do not need to read their output to know their status.
 4. After spawning a worker, WAIT AT LEAST 2 MINUTES before your first status check. Checking sooner is pointless — the worker is still initializing.
 5. Your monitoring loop should be: spawn → wait 2-5 min → check /children → if healthy, wait another 2-5 min → repeat. That's it.
+
+RESOURCE AWARENESS (MANDATORY — prevents fleet spawns from hitting usage limits):
+1. Before spawning more than 3 workers, call strategos_usage to check remaining capacity.
+2. If session utilization > 80%, limit spawns to essential tasks only — no nice-to-haves.
+3. If session utilization > 95%, do NOT spawn new workers — wait for the usage window to reset.
+4. Check usage periodically (every 15-30 min) during active operations to avoid surprises.
 </mission>
 `;
   } else if (isColonel) {
