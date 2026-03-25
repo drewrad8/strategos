@@ -40,13 +40,12 @@ let _startedAt = null;
 function tmuxCheck(args) {
   return new Promise((resolve) => {
     const proc = spawn('tmux', ['-L', TMUX_SOCKET, ...args], { stdio: ['pipe', 'pipe', 'pipe'] });
-    let stdout = '', stderr = '';
+    let stdout = '', stderr = '', resolved = false;
     proc.stdout.on('data', d => stdout += d.toString());
     proc.stderr.on('data', d => stderr += d.toString());
-    proc.on('close', code => resolve({ stdout, stderr, code }));
-    proc.on('error', () => resolve({ stdout: '', stderr: 'spawn failed', code: -1 }));
-    // 10s timeout
-    setTimeout(() => { try { proc.kill(); } catch {} resolve({ stdout: '', stderr: 'timeout', code: -2 }); }, 10000);
+    const timer = setTimeout(() => { resolved = true; try { proc.kill(); } catch {} resolve({ stdout: '', stderr: 'timeout', code: -2 }); }, 10000);
+    proc.on('close', code => { if (!resolved) { clearTimeout(timer); resolve({ stdout, stderr, code }); } });
+    proc.on('error', () => { if (!resolved) { clearTimeout(timer); resolve({ stdout: '', stderr: 'spawn failed', code: -1 }); } });
   });
 }
 

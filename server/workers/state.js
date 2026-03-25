@@ -61,8 +61,15 @@ export const respawnAttempts = new Map();
 export const respawnSuggestions = [];
 export const MAX_RESPAWN_SUGGESTIONS = 20;
 
+// Auto-dismiss timers for workers that signal done
+export const autoDismissTimers = new Map();
+export const AUTO_DISMISS_DELAY_MS = 5 * 60 * 1000; // 5 minutes
+
 // Per-worker send lock
 export const _sendingInput = new Set();
+
+// Per-worker tmux send-keys serialization lock
+export const _tmuxSendLock = new Map();
 
 // Re-entrance guard for processQueue
 export const _processingQueues = new Set();
@@ -177,7 +184,7 @@ export function simpleHash(str) {
   let h = 0;
   for (let i = 0; i < str.length; i++) {
     h = ((h << 5) - h) + str.charCodeAt(i);
-    h = h & h;
+    h = h | 0;
   }
   return h;
 }
@@ -366,6 +373,7 @@ export function normalizeWorker(worker) {
     lastRalphSignalAt: worker.lastRalphSignalAt ?? null,
     crashReason: worker.crashReason ?? null,
     bulldozeMode: worker.bulldozeMode ?? false,
+    forcedAutonomy: worker.forcedAutonomy ?? false,
     bulldozePaused: worker.bulldozePaused ?? false,
     bulldozePauseReason: worker.bulldozePauseReason ?? null,
     bulldozeCyclesCompleted: worker.bulldozeCyclesCompleted ?? 0,
@@ -378,5 +386,7 @@ export function normalizeWorker(worker) {
     autoContinueCount: worker.autoContinueCount ?? 0,
     rateLimited: worker.rateLimited ?? false,
     rateLimitResetAt: worker.rateLimitResetAt ?? null,
+    autoDismissAfterDone: worker.autoDismissAfterDone ?? true,
+    taskReceivedAt: worker.taskReceivedAt ?? null,
   };
 }

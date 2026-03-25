@@ -6,7 +6,7 @@
 import crypto from 'crypto';
 import {
   workers, outputBuffers, commandQueues, ptyInstances,
-  pendingWorkers, inFlightSpawns, autoCleanupTimers, lastResizeSize,
+  pendingWorkers, inFlightSpawns, autoCleanupTimers, autoDismissTimers, lastResizeSize,
   sessionFailCounts, respawnAttempts,
   SESSION_PREFIX, THEA_ROOT, MAX_CONCURRENT_WORKERS, AUTO_CLEANUP_DELAY_MS,
   DEFAULT_COLS, DEFAULT_ROWS, STRATEGOS_API,
@@ -69,7 +69,8 @@ import {
   startSession as dbStartSession,
   endSession as dbEndSession,
 } from '../workerOutputDb.js';
-import { recordWorkerSpawn } from '../metricsService.js';
+import { recordWorkerSpawn, recordWorkerTaskDuration, recordWorkerSuccess, recordWorkerRoleViolations, recordWorkerRalphSignals } from '../metricsService.js';
+import { detectWorkerType as detectWorkerTypeForMetrics } from './templates.js';
 import {
   registerWorkerDependencies,
   markWorkerStarted,
@@ -81,6 +82,41 @@ import {
 } from '../dependencyGraph.js';
 import { MAX_SYSTEM_PROMPT_LENGTH, MAX_TIMEOUT_MS } from '../validation.js';
 
+/**
+ * Record all worker intelligence metrics at lifecycle end (dismiss/complete/kill).
+ */
+function recordWorkerIntelligenceMetrics(worker, success) {
+  try {
+    const typeInfo = detectWorkerTypeForMetrics(worker.label);
+    const template = typeInfo.prefix || 'unknown';
+
+    // Task duration: time from spawn to now
+    if (worker.createdAt) {
+      const durationMs = Date.now() - new Date(worker.createdAt).getTime();
+      if (durationMs > 0 && durationMs < 7 * 24 * 60 * 60 * 1000) { // Cap at 7 days
+        recordWorkerTaskDuration(worker, durationMs, template);
+      }
+    }
+
+    // Success: 1 for done/dismissed, 0 for crashed/killed
+    recordWorkerSuccess(worker, success, template);
+
+    // Role violations from delegation metrics
+    const violations = worker.delegationMetrics?.roleViolations || 0;
+    if (violations > 0) {
+      recordWorkerRoleViolations(worker, violations, template);
+    }
+
+    // Ralph signal count
+    const signalCount = worker.ralphSignalCount || 0;
+    if (signalCount > 0) {
+      recordWorkerRalphSignals(worker, signalCount, template);
+    }
+  } catch (err) {
+    console.error('[Metrics] Failed to record worker intelligence metrics:', err.message);
+  }
+}
+
 // ============================================
 // WORKER INITIALIZATION
 // ============================================
@@ -91,6 +127,7 @@ function initializeWorker(id, config, io) {
     dependsOn, workflowId, taskId,
     parentWorkerId, parentLabel, task, initialInput,
     autoAccept, ralphMode, backend, model,
+    autoDismissAfterDone,
   } = config;
 
   const worker = {
@@ -147,6 +184,9 @@ function initializeWorker(id, config, io) {
       filesEdited: 0,
       commandsRun: 0,
     },
+    // Intelligence improvements
+    autoDismissAfterDone: autoDismissAfterDone !== false, // default true
+    taskReceivedAt: task ? new Date() : null,
   };
 
   workers.set(id, worker);
@@ -162,14 +202,22 @@ function initializeWorker(id, config, io) {
   if (parentWorkerId) {
     const parentWorker = workers.get(parentWorkerId);
     if (parentWorker) {
-      parentWorker.childWorkerIds = parentWorker.childWorkerIds || [];
-      // Idempotent push: prevent duplicate child IDs (e.g. from retry/re-register)
-      if (!parentWorker.childWorkerIds.includes(id)) {
-        parentWorker.childWorkerIds.push(id);
-      }
-      // Track delegation: parent spawned a child
-      if (parentWorker.delegationMetrics) {
-        parentWorker.delegationMetrics.spawnsIssued++;
+      // Reject dead/error/stopped/completed parents — prevents children from being assigned to zombie parents
+      const nonRunningStatuses = ['error', 'stopped', 'completed', 'awaiting_review'];
+      if (nonRunningStatuses.includes(parentWorker.status)) {
+        console.warn(`[InitWorker] parentWorkerId "${parentWorkerId}" has status "${parentWorker.status}" for worker ${id} (${label}). Rejecting dead parent, setting parentWorkerId to null.`);
+        worker.parentWorkerId = null;
+        worker.parentLabel = null;
+      } else {
+        parentWorker.childWorkerIds = parentWorker.childWorkerIds || [];
+        // Idempotent push: prevent duplicate child IDs (e.g. from retry/re-register)
+        if (!parentWorker.childWorkerIds.includes(id)) {
+          parentWorker.childWorkerIds.push(id);
+        }
+        // Track delegation: parent spawned a child
+        if (parentWorker.delegationMetrics) {
+          parentWorker.delegationMetrics.spawnsIssued++;
+        }
       }
     } else {
       // Parent doesn't exist (already killed/dismissed) — don't silently create an orphan
@@ -268,6 +316,7 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
     externalRalphToken = null,
     backend = 'claude',
     model = null,
+    autoDismissAfterDone = true,
   } = options;
 
   const id = uuidv4().slice(0, 8);
@@ -472,7 +521,7 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
       label: workerLabel, projectName, projectPath, sessionName, ralphToken,
       dependsOn, workflowId, taskId,
       parentWorkerId, parentLabel, task, initialInput,
-      autoAccept, ralphMode, backend, model,
+      autoAccept, ralphMode, backend, model, autoDismissAfterDone,
     }, io);
 
     inFlightSpawns.delete(spawnKey);
@@ -749,6 +798,8 @@ async function teardownWorker(workerId, worker, io, { activityMessage, logPrefix
   respawnAttempts.delete(workerId);
   const acTimer = autoCleanupTimers.get(workerId);
   if (acTimer) { clearTimeout(acTimer); autoCleanupTimers.delete(workerId); }
+  const adTimer = autoDismissTimers.get(workerId);
+  if (adTimer) { clearTimeout(adTimer); autoDismissTimers.delete(workerId); }
   clearWorkerContext(workerId);
   removeWorkerDependencies(workerId);
   stopHealthMonitor(workerId);
@@ -967,6 +1018,7 @@ export async function dismissWorker(workerId, io = null) {
   }
 
   console.log(`[Dismiss] Dismissing worker ${workerId} (${worker.label})`);
+  recordWorkerIntelligenceMetrics(worker, true);
   await killWorker(workerId, io, { reason: 'dismissed', force: true });
 
   return { dismissed: true, uncommittedWarning };
@@ -995,6 +1047,7 @@ export async function completeWorker(workerId, io = null, options = {}) {
   worker.status = 'completed';
   worker.completedAt = new Date();
   respawnAttempts.delete(workerId);
+  recordWorkerIntelligenceMetrics(worker, true);
 
   const activity = addActivity('worker_completed', workerId, worker.label, worker.project,
     `Worker "${worker.label}" completed`);
@@ -1115,8 +1168,7 @@ async function handleOnCompleteAction(action, completedWorkerId, io) {
           const response = await fetch(webhookUrl.toString(), {
             method,
             headers: {
-              'Content-Type': 'application/json',
-              ...(action.config.headers || {})
+              'Content-Type': 'application/json'
             },
             body: JSON.stringify({
               event: 'worker_completed',

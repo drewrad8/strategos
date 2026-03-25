@@ -278,7 +278,7 @@ export function setupSocketHandlers(io, theaRoot) {
     });
 
     // Handle worker input (line-based, adds Enter)
-    socket.on('worker:input', async ({ workerId, input }) => {
+    socket.on('worker:input', async ({ workerId, input, fromWorkerId }) => {
       try {
         if (typeof workerId !== 'string' || !workerId) {
           return socket.emit('error', { message: 'Invalid workerId' });
@@ -286,7 +286,21 @@ export function setupSocketHandlers(io, theaRoot) {
         if (typeof input !== 'string' || input.length > MAX_INPUT_LENGTH) {
           return socket.emit('error', { message: 'Input too large or invalid', workerId });
         }
-        await sendInput(workerId, input, null, { source: 'web_ui' });
+
+        // Cross-project guard: block workers from sending input to workers in different projects
+        if (fromWorkerId && typeof fromWorkerId === 'string') {
+          const sender = getWorkerInternal(fromWorkerId);
+          const receiver = getWorkerInternal(workerId);
+          if (sender && receiver && sender.project && receiver.project && sender.project !== receiver.project) {
+            console.warn(`[INPUT] Cross-project input blocked: worker ${fromWorkerId} (${sender.project}) tried to send input to worker ${workerId} (${receiver.project})`);
+            return socket.emit('error', {
+              message: `Cross-project input blocked: sender project (${sender.project}) does not match receiver project (${receiver.project})`,
+              workerId
+            });
+          }
+        }
+
+        await sendInput(workerId, input, null, { fromWorkerId, source: fromWorkerId ? `socket:worker:${fromWorkerId}` : 'web_ui' });
       } catch (error) {
         socket.emit('error', { message: sanitizeErrorMessage(error), workerId });
       }
