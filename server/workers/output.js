@@ -7,7 +7,7 @@ import crypto from 'crypto';
 import {
   workers, outputBuffers, commandQueues, ptyInstances, sessionFailCounts,
   pendingWorkers, autoCleanupTimers, lastResizeSize, respawnAttempts,
-  _sendingInput, _processingQueues,
+  _sendingInput, _processingQueues, _tmuxSendLock,
   SESSION_FAIL_THRESHOLD, PROCESS_QUEUE_MAX_DRAIN, PROCESS_QUEUE_DELAY_MS, MAX_QUEUE_SIZE,
   path, fs, execAsync,
   simpleHash, stripAnsiCodes, normalizeWorker, addActivity,
@@ -21,6 +21,7 @@ import {
   GEMINI_IDLE_PATTERNS, GEMINI_ACTIVE_PATTERNS, GEMINI_AUTO_ACCEPT_PATTERNS,
   AIDER_IDLE_PATTERNS, AIDER_ACTIVE_PATTERNS, AIDER_AUTO_ACCEPT_PATTERNS,
   BULLDOZE_IDLE_THRESHOLD, BULLDOZE_AUDIT_EVERY_N_CYCLES, BULLDOZE_MAX_HOURS,
+  FORCED_AUTONOMY_BASE_THRESHOLD, FORCED_AUTONOMY_MAX_THRESHOLD, FORCED_AUTONOMY_BACKOFF_FACTOR,
   BULLDOZE_MAX_COMPACTIONS, BULLDOZE_CONTINUATION_PREFIX,
   RATE_LIMIT_PATTERN, RATE_LIMIT_RESET_RE,
   AUTO_CONTINUE_RATE_LIMIT_COOLDOWN,
@@ -39,6 +40,36 @@ import {
   markWorkerFailed,
   removeWorkerDependencies,
 } from '../dependencyGraph.js';
+
+// Per-worker tmux send-keys serialization lock (Promise chain pattern)
+const TMUX_LOCK_TIMEOUT_MS = 5000;
+
+async function withTmuxLock(workerId, fn) {
+  const prev = _tmuxSendLock.get(workerId) || Promise.resolve();
+  const next = prev.then(
+    () => runWithTimeout(fn, TMUX_LOCK_TIMEOUT_MS),
+    () => runWithTimeout(fn, TMUX_LOCK_TIMEOUT_MS)
+  );
+  const settled = next.catch(() => {}); // Prevent rejection from blocking chain
+  _tmuxSendLock.set(workerId, settled);
+  // Cleanup to avoid memory leak
+  settled.finally(() => {
+    if (_tmuxSendLock.get(workerId) === settled) {
+      _tmuxSendLock.delete(workerId);
+    }
+  });
+  return next;
+}
+
+function runWithTimeout(fn, ms) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`tmux send lock timed out after ${ms}ms`)), ms);
+    Promise.resolve(fn()).then(
+      (val) => { clearTimeout(timer); resolve(val); },
+      (err) => { clearTimeout(timer); reject(err); }
+    );
+  });
+}
 
 // Global PTY capture interval
 let globalCaptureInterval = null;
@@ -485,6 +516,40 @@ async function captureWorkerOutput(workerId, instance, io) {
         }
       }
 
+      // Forced autonomy: detect idle workers and push them to research/act instead of waiting
+      if (shouldContinueForcedAutonomy(workerId)) {
+        worker._forcedAutonomyIdleCount = (worker._forcedAutonomyIdleCount || 0) + 1;
+        worker._forcedAutonomyNudgeCount = worker._forcedAutonomyNudgeCount || 0;
+
+        // Exponential backoff: 15s, 30s, 60s, 120s, ... capped at 30min
+        const currentThreshold = Math.min(
+          FORCED_AUTONOMY_BASE_THRESHOLD * Math.pow(FORCED_AUTONOMY_BACKOFF_FACTOR, worker._forcedAutonomyNudgeCount),
+          FORCED_AUTONOMY_MAX_THRESHOLD
+        );
+
+        if (worker._forcedAutonomyIdleCount >= currentThreshold) {
+          const cleaned = stripAnsiCodes(stdout);
+          const tailSize = getBackendTailSize(worker.backend, 'wide');
+          const tail = cleaned.slice(-tailSize);
+          const idlePatterns = getIdlePatterns(worker.backend);
+          const activePatterns = getActivePatterns(worker.backend);
+          const isAtIdlePrompt = idlePatterns.some(p => p.test(tail));
+          const narrowTail = cleaned.slice(-getBackendTailSize(worker.backend, 'narrow'));
+          const isActivelyWorking = activePatterns.some(p => p.test(narrowTail));
+
+          if (isAtIdlePrompt && !isActivelyWorking) {
+            const msg = generateAutonomyNudge(worker);
+            console.log(`[ForcedAutonomy] Nudge #${worker._forcedAutonomyNudgeCount} for ${worker.label} (${workerId}), next in ${Math.min(currentThreshold * 2, FORCED_AUTONOMY_MAX_THRESHOLD) * 5}s`);
+            withTmuxLock(workerId, async () => {
+              await safeSendKeys(worker.tmuxSession, [msg, 'Enter']);
+            }).catch(err => console.error(`[ForcedAutonomy] Idle push failed for ${worker.label}: ${err.message}`));
+            worker._forcedAutonomyIdleCount = 0;
+            worker._forcedAutonomyNudgeCount++;
+            worker._forcedAutonomyLastNudge = Date.now();
+          }
+        }
+      }
+
       // Auto-continue for rate-limited workers (skip if bulldoze handles it)
       if (worker && worker.autoContinue !== false && !worker.bulldozeMode &&
           worker.status === 'running' && worker._sessionLimitDetected &&
@@ -525,6 +590,10 @@ async function captureWorkerOutput(workerId, instance, io) {
 
     if (worker && worker.bulldozeMode) {
       worker.bulldozeIdleCount = 0;
+    }
+    if (worker && worker.forcedAutonomy) {
+      worker._forcedAutonomyIdleCount = 0;
+      worker._forcedAutonomyNudgeCount = 0;  // Reset backoff on activity
     }
 
     // Auto-continue: detect rate limits in fresh output
@@ -632,6 +701,7 @@ async function captureWorkerOutput(workerId, instance, io) {
     workers.delete(workerId);
     outputBuffers.delete(workerId);
     commandQueues.delete(workerId);
+    _tmuxSendLock.delete(workerId);
     sessionFailCounts.delete(workerId);
     lastResizeSize.delete(workerId);
     ptyInstances.delete(workerId);
@@ -781,6 +851,19 @@ async function handleAutoAcceptCheck(workerId, output, io) {
     }
   }
 
+  if (pauseKeywordFound && worker.forcedAutonomy) {
+    console.log(`[ForcedAutonomy] Intercepting question for ${worker.label}`);
+    const msg = 'Do NOT ask the user. You have forcedAutonomy enabled. Answer this question yourself using available tools: WebSearch, WebFetch, Grep, Read, Glob. If you cannot find the answer, make your best judgment call and document the assumption. Proceed without human input.';
+    try {
+      await withTmuxLock(workerId, async () => {
+        await safeSendKeys(worker.tmuxSession, [msg, 'Enter']);
+      });
+    } catch (err) {
+      console.error(`[ForcedAutonomy] Failed for ${worker.label}: ${err.message}`);
+    }
+    return;
+  }
+
   if (pauseKeywordFound && !worker.autoAcceptPaused) {
     console.log(`[AutoAccept] Pausing for ${worker.label} - detected pause keyword`);
     worker.autoAcceptPaused = true;
@@ -815,7 +898,9 @@ async function handleAutoAcceptCheck(workerId, output, io) {
   console.log(`[AutoAccept] Accepting prompt for ${worker.label} (matched: ${matchedPattern})`);
 
   try {
-    await safeSendKeys(worker.tmuxSession, ['Enter']);
+    await withTmuxLock(workerId, async () => {
+      await safeSendKeys(worker.tmuxSession, ['Enter']);
+    });
     console.log(`[AutoAccept] Sent Enter to ${worker.label}`);
 
     setTimeout(() => {
@@ -832,6 +917,73 @@ async function handleAutoAcceptCheck(workerId, output, io) {
 // ============================================
 // BULLDOZE MODE: Continuation Engine
 // ============================================
+
+/**
+ * Guard function: should forced autonomy nudge this worker?
+ * Mirrors shouldContinueBulldoze() but for the lighter forced autonomy mode.
+ */
+function shouldContinueForcedAutonomy(workerId) {
+  const worker = workers.get(workerId);
+  if (!worker || !worker.forcedAutonomy || worker.bulldozeMode) return false;
+  if (worker.status !== 'running') return false;
+  if (worker.health === 'crashed' || worker.health === 'dead') return false;
+
+  // Don't nudge done/blocked/suppressed workers
+  if (worker.ralphStatus === 'done') return false;
+  if (worker.ralphStatus === 'blocked') return false;
+  if (worker.status === 'awaiting_review') return false;
+  if (worker._forcedAutonomySuppressed) return false;
+
+  // Don't nudge if command queue has items
+  const queue = commandQueues.get(workerId) || [];
+  if (queue.length > 0) return false;
+
+  // Don't nudge if actively sending input
+  if (_sendingInput.has(workerId)) return false;
+
+  // Don't nudge if active children are running
+  const childIds = worker.childWorkerIds || [];
+  if (childIds.length > 0) {
+    const activeChildren = childIds.filter(cid => {
+      const child = workers.get(cid);
+      if (!child) return false;
+      if (child.health === 'dead' || child.health === 'crashed') return false;
+      return child.status === 'running' && child.ralphStatus === 'in_progress';
+    });
+    if (activeChildren.length > 0) return false;
+  }
+
+  return true;
+}
+
+/**
+ * Generate context-aware nudge messages that vary by nudge count.
+ * Earlier nudges are gentle; later ones are direct and shorter to save context.
+ */
+function generateAutonomyNudge(worker) {
+  const nudgeCount = worker._forcedAutonomyNudgeCount || 0;
+
+  // First nudge: gentle
+  if (nudgeCount === 0) {
+    return 'You appear to be idle. Continue working on your current task. If you need information, use WebSearch, Grep, or Read to find it yourself. Do not wait for human input.';
+  }
+
+  // Second nudge: include task context
+  if (nudgeCount === 1) {
+    const taskSnippet = worker.task?.description
+      ? ` Your task: "${worker.task.description.slice(0, 100)}..."`
+      : '';
+    return `You are still idle.${taskSnippet} If you are stuck, try a different approach. If you have completed your task, signal done via Ralph. Do not wait for human input.`;
+  }
+
+  // Third nudge: direct about signaling
+  if (nudgeCount === 2) {
+    return 'You have been idle for an extended period. If your work is complete, you MUST signal done via Ralph immediately. If you are blocked, signal blocked with a reason. If you have more work, resume now.';
+  }
+
+  // Beyond third: minimal to save context
+  return 'Resume work or signal done/blocked via Ralph.';
+}
 
 function shouldContinueBulldoze(workerId) {
   const worker = workers.get(workerId);
@@ -883,19 +1035,20 @@ function generateBulldozeContinuation(worker) {
   const cycleNum = (worker.bulldozeCyclesCompleted || 0) + 1;
   const isAuditCycle = cycleNum % BULLDOZE_AUDIT_EVERY_N_CYCLES === 0;
   const workerType = detectWorkerType(worker.label);
+  const autonomyReminder = worker.forcedAutonomy ? '\n\nREMINDER: You are in FORCED AUTONOMY mode. Do NOT ask the human anything. Research answers yourself using WebSearch, WebFetch, Grep, Read. Make decisions and execute.' : '';
 
   if (isAuditCycle) {
     if (workerType.isGeneral) {
-      return `${BULLDOZE_CONTINUATION_PREFIX} cycle ${cycleNum} - AUDIT]\nCommander, conduct a strategic review. State file: ${stateFilePath}\n\nASSESS: git log --oneline -20, check children status, run test suites, review error logs. What improved since last cycle? What degraded? What's the highest-impact work remaining?\n\nACT: Update the state file with fresh findings. Spawn workers for the top discovery. If your domain is genuinely healthy with no meaningful work remaining, write "## Status: EXHAUSTED" in the state file.`;
+      return `${BULLDOZE_CONTINUATION_PREFIX} cycle ${cycleNum} - AUDIT]\nCommander, conduct a strategic review. State file: ${stateFilePath}\n\nASSESS: git log --oneline -20, check children status, run test suites, review error logs. What improved since last cycle? What degraded? What's the highest-impact work remaining?\n\nACT: Update the state file with fresh findings. Spawn workers for the top discovery. If your domain is genuinely healthy with no meaningful work remaining, write "## Status: EXHAUSTED" in the state file.${autonomyReminder}`;
     }
-    return `${BULLDOZE_CONTINUATION_PREFIX} cycle ${cycleNum} - AUDIT]\nConduct a fresh audit of your domain. State file: ${stateFilePath}\n\nASSESS: git log --oneline -20, run test suites, review error logs, compare to best practices. Add NEW findings to your backlog.\n\nACT: Pick the highest-impact finding and implement it. Commit. Update state file.`;
+    return `${BULLDOZE_CONTINUATION_PREFIX} cycle ${cycleNum} - AUDIT]\nConduct a fresh audit of your domain. State file: ${stateFilePath}\n\nASSESS: git log --oneline -20, run test suites, review error logs, compare to best practices. Add NEW findings to your backlog.\n\nACT: Pick the highest-impact finding and implement it. Commit. Update state file.${autonomyReminder}`;
   }
 
   if (workerType.isGeneral) {
-    return `${BULLDOZE_CONTINUATION_PREFIX} cycle ${cycleNum}]\nCommander, next mission cycle. State file: ${stateFilePath}\n\nSITREP: Read state file. Check git log --oneline -10. Check children status.\n\nEXECUTE: Identify the highest-priority incomplete item. Spawn a worker for it — do NOT implement it yourself. Monitor and drive to completion. Update the state file.\n\nIf all remaining items need human action, write "## Status: NEEDS_HUMAN" in the state file. If genuinely nothing left, write "## Status: EXHAUSTED".`;
+    return `${BULLDOZE_CONTINUATION_PREFIX} cycle ${cycleNum}]\nCommander, next mission cycle. State file: ${stateFilePath}\n\nSITREP: Read state file. Check git log --oneline -10. Check children status.\n\nEXECUTE: Identify the highest-priority incomplete item. Spawn a worker for it — do NOT implement it yourself. Monitor and drive to completion. Update the state file.\n\nIf all remaining items need human action, write "## Status: NEEDS_HUMAN" in the state file. If genuinely nothing left, write "## Status: EXHAUSTED".${autonomyReminder}`;
   }
 
-  return `${BULLDOZE_CONTINUATION_PREFIX} cycle ${cycleNum}]\nNext mission cycle. State file: ${stateFilePath}\n\nSITREP: Read state file. Check git log --oneline -10 to avoid redoing committed work.\n\nEXECUTE: Pick the highest-priority incomplete item. Implement it thoroughly. Test. Commit with descriptive message. Update state file — mark complete, add any new discoveries. Signal Ralph.\n\nIf all remaining items are low-impact or need human action, write "## Status: EXHAUSTED" in the state file.`;
+  return `${BULLDOZE_CONTINUATION_PREFIX} cycle ${cycleNum}]\nNext mission cycle. State file: ${stateFilePath}\n\nSITREP: Read state file. Check git log --oneline -10 to avoid redoing committed work.\n\nEXECUTE: Pick the highest-priority incomplete item. Implement it thoroughly. Test. Commit with descriptive message. Update state file — mark complete, add any new discoveries. Signal Ralph.\n\nIf all remaining items are low-impact or need human action, write "## Status: EXHAUSTED" in the state file.${autonomyReminder}`;
 }
 
 export async function createBulldozeStateFile(worker, settings = {}) {
@@ -1182,6 +1335,7 @@ export function updateWorkerSettings(workerId, settings, io = null) {
         .then(() => resetBulldozeStateFileStatus(worker))
         .then(() => writeStrategosContext(worker.id, worker.label, worker.workingDir, worker.ralphToken, {
           bulldozeMode: true,
+          forcedAutonomy: worker.forcedAutonomy,
           parentWorkerId: worker.parentWorkerId,
           parentLabel: worker.parentLabel,
         }))
@@ -1196,18 +1350,21 @@ export function updateWorkerSettings(workerId, settings, io = null) {
             parentWorkerId: worker.parentWorkerId,
             parentLabel: worker.parentLabel,
             bulldozeMode: false,
+            forcedAutonomy: worker.forcedAutonomy,
           });
       } else if (worker.backend === 'aider') {
         rewriteContext = writeAiderContext(worker.id, worker.label, worker.workingDir, worker.ralphToken, {
             parentWorkerId: worker.parentWorkerId,
             parentLabel: worker.parentLabel,
             bulldozeMode: false,
+            forcedAutonomy: worker.forcedAutonomy,
           });
       } else {
         rewriteContext = writeStrategosContext(worker.id, worker.label, worker.workingDir, worker.ralphToken, {
             parentWorkerId: worker.parentWorkerId,
             parentLabel: worker.parentLabel,
             bulldozeMode: false,
+            forcedAutonomy: worker.forcedAutonomy,
           });
       }
       rewriteContext.catch(err => console.error(`[Bulldoze] Failed to rewrite rules for ${workerId}: ${err.message}`));
@@ -1229,6 +1386,23 @@ export function updateWorkerSettings(workerId, settings, io = null) {
     console.log(`[Bulldoze] ${worker.label} bulldozePaused set to ${settings.bulldozePaused}`);
   }
 
+  if (settings.forcedAutonomy !== undefined) {
+    if (typeof settings.forcedAutonomy !== 'boolean') {
+      throw new Error('forcedAutonomy must be a boolean');
+    }
+    worker.forcedAutonomy = settings.forcedAutonomy;
+    if (settings.forcedAutonomy && worker.autoAcceptPaused) {
+      worker.autoAcceptPaused = false;
+    }
+    writeStrategosContext(worker.id, worker.label, worker.workingDir, worker.ralphToken, {
+      bulldozeMode: worker.bulldozeMode,
+      forcedAutonomy: worker.forcedAutonomy,
+      parentWorkerId: worker.parentWorkerId,
+      parentLabel: worker.parentLabel,
+    }).catch(err => console.error(`[ForcedAutonomy] Failed to rewrite rules: ${err.message}`));
+    console.log(`[ForcedAutonomy] ${worker.label} forcedAutonomy set to ${settings.forcedAutonomy}`);
+  }
+
   if (io) {
     io.emit('worker:updated', normalizeWorker(worker));
   }
@@ -1246,6 +1420,9 @@ export async function sendInput(workerId, input, io = null, { fromWorkerId, sour
   if (!worker) {
     throw new Error(`Worker ${workerId} not found`);
   }
+
+  // Cancel auto-dismiss timer when worker receives new input (lazy import to avoid circular dep)
+  import('./ralph.js').then(({ cancelAutoDismissTimer }) => cancelAutoDismissTimer(workerId)).catch(() => {});
 
   const isWorkerInput = fromWorkerId && workers.has(fromWorkerId);
   if (worker.bulldozeMode && !worker.bulldozePaused && !isWorkerInput &&
@@ -1294,6 +1471,14 @@ export async function sendInput(workerId, input, io = null, { fromWorkerId, sour
     _sendingInput.delete(workerId);
   }
 
+  // Auto-drain any queued items after send completes
+  const remainingQueue = commandQueues.get(workerId) || [];
+  if (remainingQueue.length > 0) {
+    processQueue(workerId, io).catch(err =>
+      console.error(`[Queue] Auto-drain failed for ${workerId}: ${err.message}`)
+    );
+  }
+
   return true;
 }
 
@@ -1309,14 +1494,16 @@ export async function sendInputDirect(workerId, input, source = null) {
 
   const sanitized = input.replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, '');
 
-  try {
-    await safeSendKeys(worker.tmuxSession, ['-l', sanitized]);
-    await new Promise(resolve => setTimeout(resolve, 200));
-    await safeSendKeys(worker.tmuxSession, ['Enter']);
-    worker.lastActivity = new Date();
-  } catch (error) {
-    throw new Error(`Failed to send input: ${error.message}`);
-  }
+  return withTmuxLock(workerId, async () => {
+    try {
+      await safeSendKeys(worker.tmuxSession, ['-l', sanitized]);
+      await new Promise(resolve => setTimeout(resolve, 200));
+      await safeSendKeys(worker.tmuxSession, ['Enter']);
+      worker.lastActivity = new Date();
+    } catch (error) {
+      throw new Error(`Failed to send input: ${error.message}`);
+    }
+  });
 }
 
 export async function sendRawInput(workerId, keys) {
@@ -1326,12 +1513,14 @@ export async function sendRawInput(workerId, keys) {
     throw new Error(`Worker ${workerId} not found`);
   }
 
-  try {
-    await safeSendKeys(worker.tmuxSession, ['-l', keys]);
-    worker.lastActivity = new Date();
-  } catch (error) {
-    throw new Error(`Failed to send raw input: ${error.message}`);
-  }
+  return withTmuxLock(workerId, async () => {
+    try {
+      await safeSendKeys(worker.tmuxSession, ['-l', keys]);
+      worker.lastActivity = new Date();
+    } catch (error) {
+      throw new Error(`Failed to send raw input: ${error.message}`);
+    }
+  });
 }
 
 export async function interruptWorker(workerId, followUp = null, io = null) {
@@ -1346,7 +1535,9 @@ export async function interruptWorker(workerId, followUp = null, io = null) {
   }
 
   try {
-    await safeSendKeys(worker.tmuxSession, ['C-c']);
+    await withTmuxLock(workerId, async () => {
+      await safeSendKeys(worker.tmuxSession, ['C-c']);
+    });
     worker.lastActivity = new Date();
     console.log(`[InterruptWorker] Sent C-c to worker ${workerId} (${worker.label})`);
 

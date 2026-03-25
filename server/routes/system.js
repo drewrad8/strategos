@@ -613,7 +613,101 @@ export function createSystemRoutes(theaRoot, io) {
     }
   });
 
-  // ============================================
+  // GET /api/metrics/worker-intelligence - Worker intelligence baseline metrics
+  router.get('/metrics/worker-intelligence', (req, res) => {
+    try {
+      const metricsService = getMetricsService();
+      const parsedPeriod = parseInt(req.query.period, 10);
+      const periodMinutes = Math.max(1, Math.min(Number.isNaN(parsedPeriod) ? 1440 : parsedPeriod, 10080)); // Default 24h
+      const startTime = new Date(Date.now() - periodMinutes * 60000).toISOString();
+      const endTime = new Date().toISOString();
+
+      // Filter parameters
+      const filterTemplate = req.query.template || null;
+      const filterProject = req.query.project || null;
+
+      // Intelligence metric types
+      const intelligenceTypes = [
+        MetricTypes.WORKER_TASK_DURATION,
+        MetricTypes.WORKER_SUCCESS,
+        MetricTypes.WORKER_ROLE_VIOLATIONS,
+        MetricTypes.WORKER_RESPAWNS,
+        MetricTypes.WORKER_RALPH_SIGNALS,
+        MetricTypes.WORKER_FALSE_CRASH,
+      ];
+
+      const summaries = {};
+      for (const type of intelligenceTypes) {
+        // Get raw metrics for filtering
+        const rawMetrics = metricsService.getMetrics(type, startTime, endTime, 10000);
+
+        // Apply label filters
+        const filtered = rawMetrics.filter(m => {
+          if (!filterTemplate && !filterProject) return true;
+          let labels = {};
+          try { labels = m.labels ? JSON.parse(m.labels) : {}; } catch { return true; }
+          if (filterTemplate && labels.template !== filterTemplate) return false;
+          if (filterProject && labels.project !== filterProject) return false;
+          return true;
+        });
+
+        // Calculate summary stats from filtered data
+        if (filtered.length === 0) {
+          summaries[type] = { count: 0, sum: 0, avg: 0, min: null, max: null, p50: null, p95: null };
+          continue;
+        }
+
+        const values = filtered.map(m => m.value).sort((a, b) => a - b);
+        let sum = 0, min = Infinity, max = -Infinity;
+        for (const v of values) {
+          sum += v;
+          if (v < min) min = v;
+          if (v > max) max = v;
+        }
+
+        const percentile = (arr, p) => {
+          const idx = Math.ceil(arr.length * p) - 1;
+          return arr[Math.max(0, idx)];
+        };
+
+        summaries[type] = {
+          count: values.length,
+          sum,
+          avg: sum / values.length,
+          min,
+          max,
+          p50: percentile(values, 0.5),
+          p95: percentile(values, 0.95),
+        };
+      }
+
+      // Compute derived intelligence scores
+      const successData = summaries[MetricTypes.WORKER_SUCCESS];
+      const successRate = successData.count > 0 ? (successData.sum / successData.count * 100) : null;
+
+      const durationData = summaries[MetricTypes.WORKER_TASK_DURATION];
+      const avgDurationMin = durationData.count > 0 ? Math.round(durationData.avg / 60000) : null;
+
+      res.json({
+        period: `${periodMinutes} minutes`,
+        filters: { template: filterTemplate, project: filterProject },
+        summaries,
+        derived: {
+          successRate: successRate !== null ? `${successRate.toFixed(1)}%` : null,
+          avgTaskDurationMinutes: avgDurationMin,
+          totalRespawns: summaries[MetricTypes.WORKER_RESPAWNS]?.sum || 0,
+          totalFalseCrashes: summaries[MetricTypes.WORKER_FALSE_CRASH]?.sum || 0,
+          totalRoleViolations: summaries[MetricTypes.WORKER_ROLE_VIOLATIONS]?.sum || 0,
+          avgRalphSignalsPerWorker: summaries[MetricTypes.WORKER_RALPH_SIGNALS]?.avg || 0,
+        },
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error) {
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
+    }
+  });
+
+    // ============================================
   // HEALTH & RESOURCES
   // ============================================
 

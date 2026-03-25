@@ -140,74 +140,68 @@ export async function saveWorkerStateImmediate() {
   return _saveStatePending;
 }
 
+function serializeWorker(w) {
+  return {
+    id: w.id,
+    label: w.label,
+    project: w.project,
+    workingDir: w.workingDir,
+    tmuxSession: w.tmuxSession,
+    backend: w.backend || 'claude',
+    model: w.model || null,
+    createdAt: w.createdAt,
+    lastOutput: w.lastOutput,
+    lastActivity: w.lastActivity,
+    autoAccept: w.autoAccept ?? true,
+    autoAcceptPaused: w.autoAcceptPaused ?? false,
+    ralphMode: w.ralphMode ?? false,
+    ralphToken: w.ralphToken ?? null,
+    task: w.task ?? null,
+    parentWorkerId: w.parentWorkerId ?? null,
+    parentLabel: w.parentLabel ?? null,
+    childWorkerIds: w.childWorkerIds || [],
+    childWorkerHistory: w.childWorkerHistory || [],
+    dependsOn: w.dependsOn || [],
+    workflowId: w.workflowId ?? null,
+    taskId: w.taskId ?? null,
+    status: w.status ?? 'running',
+    health: w.health ?? 'healthy',
+    ralphStatus: w.ralphStatus ?? null,
+    ralphProgress: w.ralphProgress ?? null,
+    ralphCurrentStep: w.ralphCurrentStep ?? null,
+    ralphSignalCount: w.ralphSignalCount ?? 0,
+    firstRalphAt: w.firstRalphAt ?? null,
+    lastRalphSignalAt: w.lastRalphSignalAt ?? null,
+    ralphSignaledAt: w.ralphSignaledAt ?? null,
+    ralphLearnings: w.ralphLearnings ?? null,
+    ralphOutputs: w.ralphOutputs ?? null,
+    ralphArtifacts: w.ralphArtifacts ?? null,
+    ralphBlockedReason: w.ralphBlockedReason ?? null,
+    _ralphManuallySignaled: w._ralphManuallySignaled ?? false,
+    completedAt: w.completedAt ?? null,
+    awaitingReviewAt: w.awaitingReviewAt ?? null,
+    crashReason: w.crashReason ?? null,
+    crashedAt: w.crashedAt ?? null,
+    bulldozeMode: w.bulldozeMode ?? false,
+    bulldozePaused: w.bulldozePaused ?? false,
+    bulldozePauseReason: w.bulldozePauseReason ?? null,
+    bulldozeCyclesCompleted: w.bulldozeCyclesCompleted ?? 0,
+    bulldozeStartedAt: w.bulldozeStartedAt ?? null,
+    bulldozeLastCycleAt: w.bulldozeLastCycleAt ?? null,
+    bulldozeConsecutiveErrors: w.bulldozeConsecutiveErrors ?? 0,
+    forcedAutonomy: w.forcedAutonomy ?? false,
+    roleViolations: w.roleViolations ?? 0,
+    delegationMetrics: w.delegationMetrics ?? null,
+    autoContinue: w.autoContinue ?? true,
+    autoContinueCount: w.autoContinueCount ?? 0,
+  };
+}
+
 async function _doSaveWorkerState() {
   try {
     const state = {
       timestamp: new Date().toISOString(),
-      workers: Array.from(workers.values()).map(w => ({
-        id: w.id,
-        label: w.label,
-        project: w.project,
-        workingDir: w.workingDir,
-        tmuxSession: w.tmuxSession,
-        backend: w.backend || 'claude',
-        model: w.model || null,
-        createdAt: w.createdAt,
-        // Timestamps for stalled/crash detection
-        lastOutput: w.lastOutput,
-        lastActivity: w.lastActivity,
-        // Settings
-        autoAccept: w.autoAccept ?? true,
-        autoAcceptPaused: w.autoAcceptPaused ?? false,
-        ralphMode: w.ralphMode ?? false,
-        ralphToken: w.ralphToken ?? null,
-        // Task context for respawn
-        task: w.task ?? null,
-        parentWorkerId: w.parentWorkerId ?? null,
-        parentLabel: w.parentLabel ?? null,
-        childWorkerIds: w.childWorkerIds || [],
-        childWorkerHistory: w.childWorkerHistory || [],
-        // Dependency tracking (for graph reconstruction on restore)
-        dependsOn: w.dependsOn || [],
-        workflowId: w.workflowId ?? null,
-        taskId: w.taskId ?? null,
-        // Runtime state (survives restart)
-        status: w.status ?? 'running',
-        health: w.health ?? 'healthy',
-        ralphStatus: w.ralphStatus ?? null,
-        ralphProgress: w.ralphProgress ?? null,
-        ralphCurrentStep: w.ralphCurrentStep ?? null,
-        ralphSignalCount: w.ralphSignalCount ?? 0,
-        firstRalphAt: w.firstRalphAt ?? null,
-        lastRalphSignalAt: w.lastRalphSignalAt ?? null,
-        // Ralph completion data (must survive restart for dependent workers)
-        ralphSignaledAt: w.ralphSignaledAt ?? null,
-        ralphLearnings: w.ralphLearnings ?? null,
-        ralphOutputs: w.ralphOutputs ?? null,
-        ralphArtifacts: w.ralphArtifacts ?? null,
-        ralphBlockedReason: w.ralphBlockedReason ?? null,
-        _ralphManuallySignaled: w._ralphManuallySignaled ?? false,
-        // Lifecycle timestamps
-        completedAt: w.completedAt ?? null,
-        awaitingReviewAt: w.awaitingReviewAt ?? null,
-        crashReason: w.crashReason ?? null,
-        crashedAt: w.crashedAt ?? null,
-        // Bulldoze mode state
-        bulldozeMode: w.bulldozeMode ?? false,
-        bulldozePaused: w.bulldozePaused ?? false,
-        bulldozePauseReason: w.bulldozePauseReason ?? null,
-        bulldozeCyclesCompleted: w.bulldozeCyclesCompleted ?? 0,
-        bulldozeStartedAt: w.bulldozeStartedAt ?? null,
-        bulldozeLastCycleAt: w.bulldozeLastCycleAt ?? null,
-        bulldozeConsecutiveErrors: w.bulldozeConsecutiveErrors ?? 0,
-        // Sentinel role-violation counter (must survive restart)
-        roleViolations: w.roleViolations ?? 0,
-        // Delegation metrics (for tracking general behavior)
-        delegationMetrics: w.delegationMetrics ?? null,
-        // Auto-continue settings (must survive restart)
-        autoContinue: w.autoContinue ?? true,
-        autoContinueCount: w.autoContinueCount ?? 0,
-      }))
+      workers: Array.from(workers.values()).map(serializeWorker)
     };
 
     // Atomic write: write to temp file then rename to prevent corruption on crash
@@ -232,62 +226,7 @@ export function saveWorkerStateSync() {
     const state = {
       timestamp: new Date().toISOString(),
       crashSave: true,
-      workers: Array.from(workers.values()).map(w => ({
-        id: w.id,
-        label: w.label,
-        project: w.project,
-        workingDir: w.workingDir,
-        tmuxSession: w.tmuxSession,
-        backend: w.backend || 'claude',
-        model: w.model || null,
-        createdAt: w.createdAt,
-        lastOutput: w.lastOutput,
-        lastActivity: w.lastActivity,
-        autoAccept: w.autoAccept ?? true,
-        autoAcceptPaused: w.autoAcceptPaused ?? false,
-        ralphMode: w.ralphMode ?? false,
-        ralphToken: w.ralphToken ?? null,
-        task: w.task ?? null,
-        parentWorkerId: w.parentWorkerId ?? null,
-        parentLabel: w.parentLabel ?? null,
-        childWorkerIds: w.childWorkerIds || [],
-        childWorkerHistory: w.childWorkerHistory || [],
-        dependsOn: w.dependsOn || [],
-        workflowId: w.workflowId ?? null,
-        taskId: w.taskId ?? null,
-        status: w.status ?? 'running',
-        health: w.health ?? 'healthy',
-        ralphStatus: w.ralphStatus ?? null,
-        ralphProgress: w.ralphProgress ?? null,
-        ralphCurrentStep: w.ralphCurrentStep ?? null,
-        ralphSignalCount: w.ralphSignalCount ?? 0,
-        firstRalphAt: w.firstRalphAt ?? null,
-        lastRalphSignalAt: w.lastRalphSignalAt ?? null,
-        // Ralph completion data (must survive restart for dependent workers)
-        ralphSignaledAt: w.ralphSignaledAt ?? null,
-        ralphLearnings: w.ralphLearnings ?? null,
-        ralphOutputs: w.ralphOutputs ?? null,
-        ralphArtifacts: w.ralphArtifacts ?? null,
-        ralphBlockedReason: w.ralphBlockedReason ?? null,
-        _ralphManuallySignaled: w._ralphManuallySignaled ?? false,
-        // Lifecycle timestamps
-        completedAt: w.completedAt ?? null,
-        awaitingReviewAt: w.awaitingReviewAt ?? null,
-        crashReason: w.crashReason ?? null,
-        crashedAt: w.crashedAt ?? null,
-        // Bulldoze mode state
-        bulldozeMode: w.bulldozeMode ?? false,
-        bulldozePaused: w.bulldozePaused ?? false,
-        bulldozePauseReason: w.bulldozePauseReason ?? null,
-        bulldozeCyclesCompleted: w.bulldozeCyclesCompleted ?? 0,
-        bulldozeStartedAt: w.bulldozeStartedAt ?? null,
-        bulldozeLastCycleAt: w.bulldozeLastCycleAt ?? null,
-        bulldozeConsecutiveErrors: w.bulldozeConsecutiveErrors ?? 0,
-        roleViolations: w.roleViolations ?? 0,
-        delegationMetrics: w.delegationMetrics ?? null,
-        autoContinue: w.autoContinue ?? true,
-        autoContinueCount: w.autoContinueCount ?? 0,
-      }))
+      workers: Array.from(workers.values()).map(serializeWorker)
     };
 
     // Atomic write: temp file then rename (even in sync crash handler)
@@ -422,6 +361,23 @@ export async function restoreWorkerState(io = null) {
         continue;
       }
 
+      // Kill zombie tmux sessions: if the saved state says the worker is dead/error/stopped/completed,
+      // don't reanimate it just because its tmux session survived a restart.
+      const savedStatus = typeof savedWorker.status === 'string' ? savedWorker.status : '';
+      const savedHealth = typeof savedWorker.health === 'string' ? savedWorker.health : '';
+      if (['error', 'stopped', 'completed'].includes(savedStatus) || savedHealth === 'dead') {
+        console.log(`[Restore] Killing zombie tmux session for dead worker ${savedWorker.id} (${savedWorker.label}) — status: ${savedStatus}, health: ${savedHealth}`);
+        try {
+          await spawnTmux(['kill-session', '-t', savedWorker.tmuxSession]);
+        } catch { /* session may already be gone */ }
+        // Write a checkpoint so the dead state is preserved, then skip restoring
+        try {
+          const checkpointPath = path.join(CHECKPOINT_DIR, `${savedWorker.id}.json`);
+          writeFileSync(checkpointPath, JSON.stringify(savedWorker, null, 2));
+        } catch { /* best-effort checkpoint */ }
+        continue;
+      }
+
       // Verify the process inside the tmux session is still alive (not just a dead shell)
       let _processHealthy = true;
       try {
@@ -512,6 +468,8 @@ export async function restoreWorkerState(io = null) {
         bulldozeLastCycleAt: savedWorker.bulldozeLastCycleAt ? new Date(savedWorker.bulldozeLastCycleAt) : null,
         bulldozeConsecutiveErrors: typeof savedWorker.bulldozeConsecutiveErrors === 'number' ? savedWorker.bulldozeConsecutiveErrors : 0,
         bulldozeIdleCount: 0, // Runtime-only, reset on restore
+        // Forced autonomy mode
+        forcedAutonomy: savedWorker.forcedAutonomy === true,
         // Sentinel role-violation counter
         roleViolations: typeof savedWorker.roleViolations === 'number' ? savedWorker.roleViolations : 0,
         // Delegation metrics (for tracking general behavior)

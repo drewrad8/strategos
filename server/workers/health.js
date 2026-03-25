@@ -7,6 +7,7 @@ import {
   healthChecks, sessionFailCounts, pendingWorkers, inFlightSpawns,
   autoCleanupTimers, lastResizeSize, respawnAttempts, _contextWriteLocks,
   respawnSuggestions, MAX_RESPAWN_SUGGESTIONS,
+  autoDismissTimers, AUTO_DISMISS_DELAY_MS,
   MAX_CONCURRENT_WORKERS, AUTO_CLEANUP_DELAY_MS, STALE_WORKER_THRESHOLD_MS,
   MAX_RESPAWN_ATTEMPTS, RESPAWN_COOLDOWN_MS,
   path, stripAnsiCodes, normalizeWorker, addActivity,
@@ -23,6 +24,8 @@ import {
 } from './resources.js';
 import { clearWorkerContext } from '../summaryService.js';
 import { getLogger } from '../logger.js';
+import { recordWorkerSuccess, recordWorkerRespawn, recordWorkerFalseCrash, recordWorkerTaskDuration, recordWorkerRoleViolations, recordWorkerRalphSignals } from '../metricsService.js';
+import { detectWorkerType as detectWorkerTypeForMetrics } from './templates.js';
 import {
   markWorkerFailed,
   markWorkerCompleted,
@@ -49,7 +52,18 @@ let resourceMonitorInterval = null;
 export function getCrashPatterns(output) {
   const tail = output.slice(-2000);
   return [
-    { test: () => tail.includes('Cannot read properties of undefined'), reason: 'Claude Code internal error' },
+    {
+      // Only match "Cannot read properties of undefined" when accompanied by
+      // Node.js/Claude Code crash indicators — not arbitrary JS errors in worker output
+      test: () => tail.includes('Cannot read properties of undefined') && (
+        tail.includes('UnhandledPromiseRejection') ||
+        tail.includes('uncaughtException') ||
+        tail.includes('TypeError:') && tail.includes('at Object.') ||
+        tail.includes('node:internal/') ||
+        tail.includes('process exited with code')
+      ),
+      reason: 'Claude Code internal error',
+    },
     { test: () => tail.includes('FATAL') && tail.includes('out of memory'), reason: 'Out of memory' },
     { test: () => tail.includes('ERR_WORKER_OUT_OF_MEMORY'), reason: 'Worker out of memory' },
     { test: () => tail.includes('Maximum call stack size exceeded'), reason: 'Stack overflow' },
@@ -75,11 +89,11 @@ function startGlobalHealthMonitor(io) {
   if (globalHealthInterval) return;
   console.log('[HealthMonitor] Starting global health interval (every 10s)');
 
-  globalHealthInterval = setInterval(() => {
+  globalHealthInterval = setInterval(async () => {
     const workerIds = [...healthChecks];
     for (const workerId of workerIds) {
       try {
-        checkWorkerHealth(workerId, io);
+        await checkWorkerHealth(workerId, io);
       } catch (err) {
         console.error(`[HealthMonitor] Unhandled error for ${workerId}: ${err.message}`);
       }
@@ -91,7 +105,7 @@ function startGlobalHealthMonitor(io) {
   }
 }
 
-function checkWorkerHealth(workerId, io) {
+async function checkWorkerHealth(workerId, io) {
   const worker = workers.get(workerId);
   if (!worker) {
     healthChecks.delete(workerId);
@@ -114,6 +128,21 @@ function checkWorkerHealth(workerId, io) {
   for (const pattern of crashPatterns) {
     if (pattern.test()) {
       if (worker.health !== 'crashed') {
+        // Before declaring crashed, verify the tmux session is actually dead
+        if (worker.tmuxSession) {
+          try {
+            await spawnTmux(['has-session', '-t', worker.tmuxSession]);
+            // Session is alive — this is a false positive from output content
+            console.warn(`[CrashDetect] Pattern matched for ${workerId} (${worker.label}): "${pattern.reason}" but tmux session is alive — ignoring false positive`);
+            try {
+              const typeInfo = detectWorkerTypeForMetrics(worker.label);
+              recordWorkerFalseCrash(worker, typeInfo.prefix || 'unknown');
+            } catch { /* best effort */ }
+            break;
+          } catch {
+            // has-session failed — session is dead, crash is real
+          }
+        }
         console.error(`[CrashDetect] Worker ${workerId} (${worker.label}): ${pattern.reason}`);
         worker.health = 'crashed';
         worker.crashReason = pattern.reason;
@@ -139,9 +168,19 @@ function checkWorkerHealth(workerId, io) {
 
     if (!outputStalled) {
       worker.health = 'healthy';
+      // Reset graduated stall recovery flags when healthy
+      worker._stallNudged = false;
+      worker._stallWarningNudged = false;
+      worker._stallAutoKilled = false;
+      worker._stallCommanderNotified = false;
     } else if (ralphRecentlyActive) {
       // Output stalled but Ralph recently signaled — worker is alive, just no terminal output
       worker.health = 'healthy';
+      // Reset graduated stall recovery flags when healthy
+      worker._stallNudged = false;
+      worker._stallWarningNudged = false;
+      worker._stallAutoKilled = false;
+      worker._stallCommanderNotified = false;
     } else {
       // Output stalled AND no recent Ralph signal — truly stalled
       const stalledMinutes = Math.round(timeSinceOutput / 60000);
@@ -151,6 +190,64 @@ function checkWorkerHealth(workerId, io) {
         if (io) {
           io.emit('worker:stalled', { workerId, label: worker.label, stalledMinutes });
         }
+      }
+
+      // === Graduated stall recovery ===
+
+      // GENERALs with no active children are legitimately idle (awaiting Commander orders).
+      // Skip 10/20-min nudges for them — they have nothing to monitor.
+      const isIdleGeneral = isProtectedWorker(worker) && !([...workers.values()].some(
+        w => w.parentWorkerId === workerId && w.status === 'running'
+      ));
+
+      if (stalledMinutes >= 30 && !isProtectedWorker(worker) && !worker._stallAutoKilled) {
+        // 30 min stalled (non-GENERAL): auto-kill with parent notification
+        worker._stallAutoKilled = true;
+        console.error(`[StallRecovery] Auto-killing stalled worker ${workerId} (${worker.label}) after ${stalledMinutes}m`);
+        if (worker.parentWorkerId) {
+          const parentNotification = `[STALL AUTO-KILL] Your child worker "${worker.label}" (${workerId}) was automatically terminated after ${stalledMinutes} minutes of inactivity. Consider respawning if the task is still needed.`;
+          sendInputDirect(worker.parentWorkerId, parentNotification, 'health:stall_kill_notification').catch(e => {
+            console.warn(`[StallRecovery] Could not notify parent ${worker.parentWorkerId}: ${e.message}`);
+          });
+        }
+        import('./lifecycle.js').then(async ({ killWorker }) => {
+          try {
+            await killWorker(workerId, io);
+            if (io) {
+              io.emit('worker:auto-killed:stall', { workerId, label: worker.label, stalledMinutes });
+            }
+          } catch (err) {
+            console.error(`[StallRecovery] Auto-kill failed for ${workerId}: ${err.message}`);
+          }
+        });
+      } else if (stalledMinutes >= 30 && isProtectedWorker(worker)) {
+        // GENERALs: never auto-kill, but notify Commander
+        if (!worker._stallCommanderNotified) {
+          worker._stallCommanderNotified = true;
+          console.error(`[StallRecovery] GENERAL ${workerId} (${worker.label}) stalled for ${stalledMinutes}m — notifying Commander`);
+          if (io) {
+            io.emit('worker:general:stalled', {
+              workerId,
+              label: worker.label,
+              stalledMinutes,
+              message: `GENERAL worker stalled for ${stalledMinutes}m — requires human attention`,
+            });
+          }
+        }
+      } else if (stalledMinutes >= 20 && !worker._stallWarningNudged && !isIdleGeneral) {
+        // 20 min stalled: send warning (skip for idle GENERALs with no active children)
+        worker._stallWarningNudged = true;
+        console.warn(`[StallRecovery] Sending stall WARNING to ${workerId} (${worker.label}) after ${stalledMinutes}m`);
+        sendInputDirect(workerId, 'STALL WARNING: You have been idle for 20 minutes. Signal your status via Ralph immediately or you will be terminated. If you are working on something that does not produce output, signal in_progress with your current step.', 'health:stall_warning').catch(e => {
+          console.warn(`[StallRecovery] Warning nudge failed for ${workerId}: ${e.message}`);
+        });
+      } else if (stalledMinutes >= 10 && !worker._stallNudged && !isIdleGeneral) {
+        // 10 min stalled: send nudge (skip for idle GENERALs with no active children)
+        worker._stallNudged = true;
+        console.warn(`[StallRecovery] Sending stall nudge to ${workerId} (${worker.label}) after ${stalledMinutes}m`);
+        sendInputDirect(workerId, 'You appear to be idle. If you are working on something that does not produce output, signal Ralph with your progress. If you are stuck, signal blocked via Ralph.', 'health:stall_nudge').catch(e => {
+          console.warn(`[StallRecovery] Nudge failed for ${workerId}: ${e.message}`);
+        });
       }
     }
 
@@ -162,6 +259,25 @@ function checkWorkerHealth(workerId, io) {
       }
     } else if (worker.ralphStatus !== 'blocked') {
       worker._blockedEmitted = false;
+    }
+
+    // === Mandatory early Ralph signal check ===
+    // If a worker has a task but hasn't signaled Ralph within 5 minutes, send a nudge
+    if (worker.task && worker.status === 'running' && !worker.firstRalphAt && !worker._earlyRalphNudged) {
+      const taskTime = worker.taskReceivedAt || worker.createdAt;
+      if (taskTime) {
+        const msSinceTask = Date.now() - new Date(taskTime).getTime();
+        if (msSinceTask > 5 * 60 * 1000) {
+          worker._earlyRalphNudged = true;
+          console.warn(`[HealthMonitor] Worker ${workerId} (${worker.label}) has not signaled Ralph within 5 minutes of receiving task`);
+          if (io) {
+            io.emit('worker:signal-overdue', { workerId, label: worker.label, minutesSinceTask: Math.round(msSinceTask / 60000) });
+          }
+          sendInputDirect(workerId, 'REMINDER: Signal your progress via Ralph. You have not sent any status updates since receiving your task. Signal in_progress with your current step so your parent knows you are alive.', 'health:early_ralph_nudge').catch(e => {
+            console.warn(`[HealthMonitor] Early Ralph nudge failed for ${workerId}: ${e.message}`);
+          });
+        }
+      }
     }
   }
 
@@ -246,6 +362,17 @@ export async function handleCrashedWorker(workerId, worker, io) {
     worker.status = 'error';
     worker.health = 'dead';
     try {
+      const typeInfo = detectWorkerTypeForMetrics(worker.label);
+      const template = typeInfo.prefix || 'unknown';
+      recordWorkerSuccess(worker, false, template);
+      if (worker.createdAt) {
+        const durationMs = Date.now() - new Date(worker.createdAt).getTime();
+        if (durationMs > 0) recordWorkerTaskDuration(worker, durationMs, template);
+      }
+      if (worker.ralphSignalCount > 0) recordWorkerRalphSignals(worker, worker.ralphSignalCount, template);
+      if (worker.delegationMetrics?.roleViolations > 0) recordWorkerRoleViolations(worker, worker.delegationMetrics.roleViolations, template);
+    } catch { /* best effort */ }
+    try {
       const failedDependents = markWorkerFailed(workerId);
       for (const depId of failedDependents) {
         if (pendingWorkers.has(depId)) {
@@ -272,9 +399,38 @@ export async function handleCrashedWorker(workerId, worker, io) {
   console.log(`[CrashRecovery] Respawning crashed worker ${workerId} (${worker.label}), attempt ${attempts.count}/${MAX_RESPAWN_ATTEMPTS}`);
 
   if (isProtectedWorker(worker)) {
+    // Double-check: verify tmux session is actually dead before marking GENERAL as dead
+    if (worker.tmuxSession) {
+      try {
+        await spawnTmux(['has-session', '-t', worker.tmuxSession]);
+        // Session is alive — false positive crash detection
+        console.warn(`[CrashRecovery] GENERAL ${workerId} (${worker.label}) tmux session is alive — resetting to healthy (false positive crash)`);
+        try {
+          const typeInfo = detectWorkerTypeForMetrics(worker.label);
+          recordWorkerFalseCrash(worker, typeInfo.prefix || 'unknown');
+        } catch { /* best effort */ }
+        worker.health = 'healthy';
+        worker.crashReason = null;
+        worker.crashedAt = null;
+        if (io) io.emit('worker:updated', normalizeWorker(worker));
+        return;
+      } catch {
+        // Session is dead — proceed with marking dead
+      }
+    }
     console.error(`[CrashRecovery] GENERAL worker ${workerId} (${worker.label}) crashed. NOT respawning.`);
     worker.health = 'dead';
     worker.status = 'error';
+    try {
+      const typeInfo = detectWorkerTypeForMetrics(worker.label);
+      const template = typeInfo.prefix || 'unknown';
+      recordWorkerSuccess(worker, false, template);
+      if (worker.createdAt) {
+        const durationMs = Date.now() - new Date(worker.createdAt).getTime();
+        if (durationMs > 0) recordWorkerTaskDuration(worker, durationMs, template);
+      }
+      if (worker.ralphSignalCount > 0) recordWorkerRalphSignals(worker, worker.ralphSignalCount, template);
+    } catch { /* best effort */ }
     try {
       const failedDependents = markWorkerFailed(workerId);
       for (const depId of failedDependents) {
@@ -311,6 +467,10 @@ export async function handleCrashedWorker(workerId, worker, io) {
     });
 
     console.log(`[CrashRecovery] Respawned as ${newWorker.id} (${newWorker.label})`);
+    try {
+      const typeInfo = detectWorkerTypeForMetrics(worker.label);
+      recordWorkerRespawn(worker, typeInfo.prefix || 'unknown');
+    } catch { /* best effort */ }
 
     respawnAttempts.set(newWorker.id, { count: attempts.count, lastAttempt: attempts.lastAttempt });
     respawnAttempts.delete(workerId);

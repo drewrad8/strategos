@@ -8,6 +8,7 @@
 
 import {
   workers, STRATEGOS_API, normalizeWorker,
+  autoDismissTimers, AUTO_DISMISS_DELAY_MS,
 } from './state.js';
 
 import { sendInputDirect } from './output.js';
@@ -39,6 +40,34 @@ function isPersistentTier(worker) {
 function deliverResultsToParent(worker, workerId, statusNote) {
   if (!worker.parentWorkerId) return;
 
+  // Don't deliver results from dismissed/stopped workers (race: done signal after dismissal)
+  if (worker.status === 'stopped' || worker.status === 'completed') {
+    getLogger().warn(`Skipping result delivery from ${workerId} — worker status is "${worker.status}" (already dismissed/stopped)`, { workerId, parentWorkerId: worker.parentWorkerId });
+    return;
+  }
+
+  // Don't deliver duplicate results (worker already in awaiting_review means results were already sent)
+  if (worker.status === 'awaiting_review' && worker._resultsDelivered) {
+    getLogger().warn(`Skipping duplicate result delivery from ${workerId} — results already delivered`, { workerId, parentWorkerId: worker.parentWorkerId });
+    return;
+  }
+
+  // Don't deliver results to parents that can no longer act on them
+  const parentWorker = workers.get(worker.parentWorkerId);
+  if (parentWorker) {
+    // Don't deliver cross-project results (e.g. financial_tracker child → thea GENERAL)
+    if (worker.project && parentWorker.project && worker.project !== parentWorker.project) {
+      getLogger().warn(`Skipping cross-project result delivery: child ${workerId} (project: ${worker.project}) -> parent ${worker.parentWorkerId} (project: ${parentWorker.project})`, { workerId, parentWorkerId: worker.parentWorkerId });
+      return;
+    }
+
+    const terminalStatuses = new Set(['completed', 'stopped', 'error']);
+    if (terminalStatuses.has(parentWorker.status)) {
+      getLogger().warn(`Skipping result delivery to parent ${worker.parentWorkerId} — parent status is "${parentWorker.status}" (ralph: "${parentWorker.ralphStatus || 'n/a'}")`, { workerId, parentWorkerId: worker.parentWorkerId });
+      return;
+    }
+  }
+
   const dm = worker.delegationMetrics;
   const delegationLine = dm
     ? `Delegation: spawned ${dm.spawnsIssued} workers, ${dm.roleViolations} role violations, ${dm.filesEdited} files edited, ${dm.commandsRun} commands run`
@@ -53,6 +82,9 @@ function deliverResultsToParent(worker, workerId, statusNote) {
     `Status: ${statusNote}. Worker is alive for follow-up questions.`,
     `To dismiss: curl -s -X POST ${STRATEGOS_API}/api/workers/${workerId}/dismiss`,
   ].filter(Boolean).join('\n');
+
+  // Mark results as delivered to prevent duplicate deliveries
+  worker._resultsDelivered = true;
 
   sendInputDirect(worker.parentWorkerId, resultSummary, 'ralph:result_delivery').catch(e => {
     getLogger().warn(`Could not deliver results to parent ${worker.parentWorkerId}`, { workerId, parentWorkerId: worker.parentWorkerId, error: e.message });
@@ -90,6 +122,18 @@ function emitDoneEvents(worker, workerId, io) {
  * @param {string} statusNote - Status note for parent delivery
  */
 function transitionToDone(worker, workerId, io, statusNote) {
+  // Guard: don't transition dismissed/stopped workers (race with dismissal)
+  if (worker.status === 'stopped' || worker.status === 'completed') {
+    getLogger().warn(`Skipping transitionToDone for ${workerId} — already ${worker.status}`, { workerId, status: worker.status });
+    return;
+  }
+
+  // Guard: already in awaiting_review = duplicate done signal, skip
+  if (worker.status === 'awaiting_review') {
+    getLogger().info(`Skipping transitionToDone for ${workerId} — already awaiting_review (duplicate done signal)`, { workerId });
+    return;
+  }
+
   worker.ralphProgress = 100;
   worker.ralphStatus = 'done';
   worker.ralphSignaledAt = new Date();
@@ -98,7 +142,82 @@ function transitionToDone(worker, workerId, io, statusNote) {
 
   emitDoneEvents(worker, workerId, io);
   deliverResultsToParent(worker, workerId, statusNote);
+  startAutoDismissTimer(workerId, io);
 }
+
+/**
+ * Start an auto-dismiss countdown for a worker that has signaled done.
+ * After AUTO_DISMISS_DELAY_MS (5 minutes), if no new input was received,
+ * the worker is automatically dismissed.
+ *
+ * @param {string} workerId - Worker ID
+ * @param {Object} io - Socket.io instance (nullable)
+ */
+export function startAutoDismissTimer(workerId, io) {
+  const worker = workers.get(workerId);
+  if (!worker) return;
+
+  // Don't auto-dismiss if the option is disabled
+  if (worker.autoDismissAfterDone === false) {
+    getLogger().info(`Auto-dismiss disabled for ${workerId} (${worker.label})`, { workerId });
+    return;
+  }
+
+  // Don't auto-dismiss protected workers (GENERALs)
+  if (isPersistentTier(worker)) {
+    getLogger().info(`Skipping auto-dismiss for persistent-tier worker ${workerId} (${worker.label})`, { workerId });
+    return;
+  }
+
+  // Cancel any existing timer
+  cancelAutoDismissTimer(workerId);
+
+  const timer = setTimeout(async () => {
+    autoDismissTimers.delete(workerId);
+    const w = workers.get(workerId);
+    if (!w) return;
+
+    // Only dismiss if still in awaiting_review (no new input reverted it to running)
+    if (w.status !== 'awaiting_review') {
+      getLogger().info(`Auto-dismiss cancelled for ${workerId} — status changed to ${w.status}`, { workerId });
+      return;
+    }
+
+    getLogger().info(`Auto-dismissing worker ${workerId} (${w.label}) after done timeout`, { workerId, label: w.label });
+
+    try {
+      const { killWorker } = await import('./lifecycle.js');
+      await killWorker(workerId, io);
+      if (io) {
+        io.emit('worker:auto-dismissed', {
+          workerId,
+          label: w.label,
+          reason: 'Auto-dismissed after done signal (5 minute timeout)',
+        });
+      }
+    } catch (err) {
+      getLogger().warn(`Auto-dismiss failed for ${workerId}: ${err.message}`, { workerId, error: err.message });
+    }
+  }, AUTO_DISMISS_DELAY_MS);
+
+  if (timer.unref) timer.unref();
+  autoDismissTimers.set(workerId, timer);
+  getLogger().info(`Started auto-dismiss timer for ${workerId} (${worker.label}) — ${AUTO_DISMISS_DELAY_MS / 60000}m countdown`, { workerId });
+}
+
+/**
+ * Cancel an auto-dismiss timer (e.g., when the worker receives new input).
+ * @param {string} workerId - Worker ID
+ */
+export function cancelAutoDismissTimer(workerId) {
+  const timer = autoDismissTimers.get(workerId);
+  if (timer) {
+    clearTimeout(timer);
+    autoDismissTimers.delete(workerId);
+    getLogger().info(`Cancelled auto-dismiss timer for ${workerId}`, { workerId });
+  }
+}
+
 
 /**
  * Shared auto-promotion: checks if a worker should be promoted to "done" based on
@@ -166,8 +285,10 @@ export function updateWorkerRalphStatus(workerId, signalData, io = null) {
   // If worker is in awaiting_review and signals in_progress, revert to running.
   // This allows bulldoze to resume on workers that were previously done but got a new mission.
   if (status === 'in_progress' && worker.status === 'awaiting_review') {
+    cancelAutoDismissTimer(workerId);
     worker.status = 'running';
     worker.awaitingReviewAt = null;
+    worker._resultsDelivered = false; // Reset so results can be delivered again if worker re-completes
     getLogger().info(`Worker ${workerId} (${worker.label}) reverted from awaiting_review → running (in_progress signal)`, { workerId, label: worker.label });
   }
 
@@ -185,6 +306,18 @@ export function updateWorkerRalphStatus(workerId, signalData, io = null) {
   // Only set signaled timestamp on terminal states
   if (status === 'done' || status === 'blocked') {
     worker.ralphSignaledAt = new Date();
+  }
+
+  // Auto-suppress forced autonomy nudges on done/blocked signals
+  if ((status === 'done' || status === 'blocked') && worker.forcedAutonomy) {
+    console.log(`[ForcedAutonomy] Auto-suppressing nudges for ${worker.label} — worker signaled ${status}`);
+    worker._forcedAutonomySuppressed = true;
+  }
+  // Re-enable if worker goes back to in_progress
+  if (status === 'in_progress' && worker._forcedAutonomySuppressed) {
+    console.log(`[ForcedAutonomy] Re-enabling nudges for ${worker.label} — worker resumed work`);
+    worker._forcedAutonomySuppressed = false;
+    worker._forcedAutonomyNudgeCount = 0;  // Reset backoff
   }
 
   // Track blocked reason (P3 fix: was never stored before)
@@ -282,6 +415,9 @@ export function updateWorkerRalphStatus(workerId, signalData, io = null) {
 
     // Auto-deliver structured results to parent worker
     deliverResultsToParent(worker, workerId, 'Complete');
+
+    // Start auto-dismiss countdown
+    startAutoDismissTimer(workerId, io);
   }
 
   // Also notify parent worker if exists (for non-done signals)

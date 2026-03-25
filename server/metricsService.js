@@ -20,6 +20,12 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 export const MetricTypes = {
   WORKER_SPAWN_TIME: 'worker_spawn_time',       // Recorded in workerManager.js via recordWorkerSpawn
+  WORKER_TASK_DURATION: 'worker_task_duration', // Time from spawn to done/dismiss (ms)
+  WORKER_SUCCESS: 'worker_success',             // 1 = done/dismissed, 0 = crashed
+  WORKER_ROLE_VIOLATIONS: 'worker_role_violations', // Role violation count per worker
+  WORKER_RESPAWNS: 'worker_respawns',           // Recorded when a worker is respawned
+  WORKER_RALPH_SIGNALS: 'worker_ralph_signals', // Signal count per worker at completion
+  WORKER_FALSE_CRASH: 'worker_false_crash',     // Tmux-alive false positive crash detection
 };
 
 // ============================================
@@ -590,6 +596,87 @@ export function recordWorkerSpawn(workerId, durationMs, labels = {}) {
     MetricTypes.WORKER_SPAWN_TIME,
     durationMs,
     { workerId, ...labels }
+  );
+}
+
+/**
+ * Build standard worker intelligence metric labels.
+ * @param {Object} worker - Worker object
+ * @param {string} template - Worker template/prefix (e.g. 'IMPL', 'GENERAL')
+ * @returns {Object} labels for metrics
+ */
+export function buildWorkerMetricLabels(worker, template = null) {
+  return {
+    workerId: worker.id,
+    template: template || 'unknown',
+    project: worker.project || 'unknown',
+    role: template ? template.toLowerCase() : 'worker',
+  };
+}
+
+/**
+ * Record worker task duration (spawn to completion)
+ */
+export function recordWorkerTaskDuration(worker, durationMs, template = null) {
+  getMetricsService().record(
+    MetricTypes.WORKER_TASK_DURATION,
+    durationMs,
+    buildWorkerMetricLabels(worker, template)
+  );
+}
+
+/**
+ * Record worker success (1) or failure (0)
+ */
+export function recordWorkerSuccess(worker, success, template = null) {
+  getMetricsService().record(
+    MetricTypes.WORKER_SUCCESS,
+    success ? 1 : 0,
+    buildWorkerMetricLabels(worker, template)
+  );
+}
+
+/**
+ * Record worker role violations count
+ */
+export function recordWorkerRoleViolations(worker, count, template = null) {
+  getMetricsService().record(
+    MetricTypes.WORKER_ROLE_VIOLATIONS,
+    count,
+    buildWorkerMetricLabels(worker, template)
+  );
+}
+
+/**
+ * Record worker respawn event
+ */
+export function recordWorkerRespawn(worker, template = null) {
+  getMetricsService().increment(
+    MetricTypes.WORKER_RESPAWNS,
+    1,
+    buildWorkerMetricLabels(worker, template)
+  );
+}
+
+/**
+ * Record worker Ralph signal count at completion
+ */
+export function recordWorkerRalphSignals(worker, count, template = null) {
+  getMetricsService().record(
+    MetricTypes.WORKER_RALPH_SIGNALS,
+    count,
+    buildWorkerMetricLabels(worker, template)
+  );
+}
+
+/**
+ * Record false crash detection (tmux alive but crash pattern matched)
+ */
+export function recordWorkerFalseCrash(worker, template = null) {
+  getMetricsService().increment(
+    MetricTypes.WORKER_FALSE_CRASH,
+    1,
+    buildWorkerMetricLabels(worker, template)
   );
 }
 

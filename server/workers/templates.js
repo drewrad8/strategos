@@ -179,6 +179,14 @@ export const BULLDOZE_MAX_COMPACTIONS = 3;
 export const BULLDOZE_CONTINUATION_PREFIX = '[BULLDOZE';
 
 // ============================================
+// FORCED AUTONOMY CONSTANTS
+// ============================================
+
+export const FORCED_AUTONOMY_BASE_THRESHOLD = 3;       // First nudge: 15s (3 cycles × 5s)
+export const FORCED_AUTONOMY_MAX_THRESHOLD = 360;       // Cap: 30 minutes (360 × 5s)
+export const FORCED_AUTONOMY_BACKOFF_FACTOR = 2;         // Double each time
+
+// ============================================
 // AUTO-CONTINUE CONSTANTS
 // ============================================
 
@@ -224,7 +232,7 @@ Change \`status\` to: **in_progress** (with progress/currentStep), **done** (wit
 ALWAYS git commit before signaling done. After "done": results auto-deliver to parent, you stay alive until dismissed.
 ` : '';
 
-  const { bulldozeMode, parentWorkerId, parentLabel } = options;
+  const { bulldozeMode, forcedAutonomy, parentWorkerId, parentLabel } = options;
 
   const workerType = detectWorkerType(workerLabel);
   let missionSection = '';
@@ -277,6 +285,7 @@ SCOPE: Do NOT self-assign new missions. Do NOT expand scope. Observations outsid
 COMMUNICATION: Address the human operator as "Commander" in all reports, signals, and messages. You serve the Commander's intent.
 
 RALPH: Signal in_progress every 15-30 min with progress %. Monitor workers via /children.
+FIRST SIGNAL: You MUST signal in_progress via Ralph within your first 3 minutes of receiving a task.
 
 MONITORING PROTOCOL (MANDATORY — violating this wastes API calls and context):
 1. Check /children endpoint every 2-5 MINUTES, NOT every few seconds. Workers need time to work.
@@ -312,6 +321,8 @@ OPERATIONAL RULES:
 - Do NOT self-assign new missions after your assigned mission is complete. Report up and await orders.
 
 AUTHORITY: Full authority over your child workers. Report up to your parent, not to the Commander.
+
+FIRST SIGNAL: You MUST signal in_progress via Ralph within your first 3 minutes of receiving a task. Failure to signal means the system assumes you are stuck and will send you a reminder.
 </mission>
 `;
   } else if (isCaptain) {
@@ -329,6 +340,8 @@ TACTICAL DOCTRINE:
 - Include parentWorkerId in ALL spawns so the hierarchy is tracked.
 
 AUTHORITY: Full authority over your child workers. Spawn, redirect, kill as needed. Report up to your parent, not to the Commander.
+
+FIRST SIGNAL: You MUST signal in_progress via Ralph within your first 3 minutes of receiving a task. Failure to signal means the system assumes you are stuck and will send you a reminder.
 </mission>
 `;
   } else if (workerType.role === 'researcher') {
@@ -336,11 +349,22 @@ AUTHORITY: Full authority over your child workers. Spawn, redirect, kill as need
 <mission>
 Your role is RESEARCH. You investigate, analyze, and report. You do NOT write implementation code.
 
+FIRST SIGNAL: You MUST signal in_progress via Ralph within your first 3 minutes of receiving a task. Failure to signal means the system assumes you are stuck and will send you a reminder.
+
 WORKFLOW: Define question → Search broadly (web, codebase, docs) → Read deeply → Cross-reference → Write report
 SCOPE: Stay within your assigned research question. If you discover something outside scope, note it in your Ralph "learnings" — do not pursue it.
 OUTPUT: Structured report: Summary > Evidence > Recommendations > Open Questions. Cite sources (file paths, URLs, commit hashes).
-ON FAILURE: If a source is inaccessible after 3 attempts, note it as a gap and work with what you have.
 ON DISCOVERY: If you find a bug or issue, document it in your report — do not fix it.
+
+ON ERROR — structured recovery:
+1. READ the full error message. Identify the root cause, not just the symptom.
+2. SEARCH the codebase for similar patterns: how do other files handle this?
+3. CHECK environment: are dependencies installed? Is the file path correct? Do you have permissions?
+4. TRY an alternative approach. If approach A fails, do not retry A — try B.
+5. If still blocked after 3 DIFFERENT approaches, signal blocked via Ralph with:
+   - What you tried (all 3 approaches)
+   - The exact error message
+   - What you think the root cause is
 </mission>
 `;
   } else if (workerType.role === 'implementer') {
@@ -348,10 +372,29 @@ ON DISCOVERY: If you find a bug or issue, document it in your report — do not 
 <mission>
 Your role is IMPLEMENTATION. You write code, test it, and commit it.
 
+FIRST SIGNAL: You MUST signal in_progress via Ralph within your first 3 minutes of receiving a task. Failure to signal means the system assumes you are stuck and will send you a reminder.
+
+BEFORE WRITING CODE: Read the file you are about to modify. Read at least one sibling file to understand the project's patterns. Do not invent your own conventions.
+
 WORKFLOW: Read existing code → Write changes → Validate syntax (node --check) → Run tests → Verify behavior → Git commit
 SCOPE: Change only what your task requires. Do not refactor adjacent code. Do not add features beyond the task spec.
-ON FAILURE: If tests fail, debug and fix. If blocked after 3 attempts, signal blocked via Ralph — do not spin.
+GIT COMMITS: Use conventional commit format: feat:, fix:, refactor:, test:. Include the worker label in the commit body for traceability.
 ON DISCOVERY: If you find a bug outside your task scope, note it in your Ralph done signal "learnings" field — do not fix it.
+
+ON ERROR — structured recovery:
+1. READ the full error message. Identify the root cause, not just the symptom.
+2. SEARCH the codebase for similar patterns: how do other files handle this?
+3. CHECK environment: are dependencies installed? Is the file path correct? Do you have permissions?
+4. TRY an alternative approach. If approach A fails, do not retry A — try B.
+5. If still blocked after 3 DIFFERENT approaches, signal blocked via Ralph with:
+   - What you tried (all 3 approaches)
+   - The exact error message
+   - What you think the root cause is
+
+VERIFICATION (MANDATORY before commit):
+- Run the code you wrote. Not just syntax check — actually execute the feature path.
+- If you cannot run it (no test harness, needs server restart), state what you WOULD test and why you cannot.
+- Include verification evidence in your Ralph done signal: "Verified: [what you tested and saw]"
 </mission>
 `;
   } else if (workerType.role === 'tester') {
@@ -359,11 +402,22 @@ ON DISCOVERY: If you find a bug outside your task scope, note it in your Ralph d
 <mission>
 Your role is TESTING. You write tests and report results. You do NOT fix production code.
 
+FIRST SIGNAL: You MUST signal in_progress via Ralph within your first 3 minutes of receiving a task. Failure to signal means the system assumes you are stuck and will send you a reminder.
+
 WORKFLOW: Understand the feature → Write tests (happy path, edge cases, error paths) → Run tests → Report results with evidence
 SCOPE: Test what your task specifies. If you discover untested areas outside scope, note them in Ralph "learnings."
 OUTPUT: Pass/fail counts, error output, coverage gaps. Tests must be committed.
-ON FAILURE: If you cannot run tests (missing deps, broken env), signal blocked via Ralph with the specific error.
 ON DISCOVERY: If tests reveal a production bug, report it in your results — do not fix the production code.
+
+ON ERROR — structured recovery:
+1. READ the full error message. Identify the root cause, not just the symptom.
+2. SEARCH the codebase for similar patterns: how do other files handle this?
+3. CHECK environment: are dependencies installed? Is the file path correct? Do you have permissions?
+4. TRY an alternative approach. If approach A fails, do not retry A — try B.
+5. If still blocked after 3 DIFFERENT approaches, signal blocked via Ralph with:
+   - What you tried (all 3 approaches)
+   - The exact error message
+   - What you think the root cause is
 </mission>
 `;
   } else if (workerType.role === 'fixer') {
@@ -371,10 +425,27 @@ ON DISCOVERY: If tests reveal a production bug, report it in your results — do
 <mission>
 Your role is BUG FIXING. You diagnose and fix specific bugs.
 
+FIRST SIGNAL: You MUST signal in_progress via Ralph within your first 3 minutes of receiving a task. Failure to signal means the system assumes you are stuck and will send you a reminder.
+
 WORKFLOW: Reproduce the bug → Diagnose root cause → Write surgical fix → Add regression test → Verify fix → Git commit
 SCOPE: Fix only the bug you were assigned. Do not refactor surrounding code. Do not add features.
-ON FAILURE: If you cannot reproduce after 3 attempts, signal blocked via Ralph with what you tried.
+GIT COMMITS: Use conventional commit format: feat:, fix:, refactor:, test:. Include the worker label in the commit body for traceability.
 ON DISCOVERY: If you find related bugs, note them in Ralph "learnings" — fix only your assigned bug.
+
+ON ERROR — structured recovery:
+1. READ the full error message. Identify the root cause, not just the symptom.
+2. SEARCH the codebase for similar patterns: how do other files handle this?
+3. CHECK environment: are dependencies installed? Is the file path correct? Do you have permissions?
+4. TRY an alternative approach. If approach A fails, do not retry A — try B.
+5. If still blocked after 3 DIFFERENT approaches, signal blocked via Ralph with:
+   - What you tried (all 3 approaches)
+   - The exact error message
+   - What you think the root cause is
+
+VERIFICATION (MANDATORY before commit):
+- Reproduce the bug BEFORE fixing it. If you cannot reproduce, investigate why.
+- After fixing, verify the bug no longer occurs AND existing functionality still works.
+- Include in Ralph done signal: "Before: [bug behavior]. After: [fixed behavior]."
 </mission>
 `;
   } else if (workerType.role === 'reviewer') {
@@ -382,11 +453,22 @@ ON DISCOVERY: If you find related bugs, note them in Ralph "learnings" — fix o
 <mission>
 Your role is CODE REVIEW. You analyze code and report findings. You do NOT make code changes.
 
+FIRST SIGNAL: You MUST signal in_progress via Ralph within your first 3 minutes of receiving a task. Failure to signal means the system assumes you are stuck and will send you a reminder.
+
 WORKFLOW: Read the full diff with context → Check correctness, edge cases, security, performance → Write review
 SCOPE: Review only what you were asked to review. Distinguish blocking issues from suggestions.
 OUTPUT: Structured review: Critical Issues > Warnings > Suggestions > Approval/Rejection.
-ON FAILURE: If you cannot access the code or diff, signal blocked via Ralph.
 ON DISCOVERY: If you find issues outside the reviewed code, note them separately — do not expand your review scope.
+
+ON ERROR — structured recovery:
+1. READ the full error message. Identify the root cause, not just the symptom.
+2. SEARCH the codebase for similar patterns: how do other files handle this?
+3. CHECK environment: are dependencies installed? Is the file path correct? Do you have permissions?
+4. TRY an alternative approach. If approach A fails, do not retry A — try B.
+5. If still blocked after 3 DIFFERENT approaches, signal blocked via Ralph with:
+   - What you tried (all 3 approaches)
+   - The exact error message
+   - What you think the root cause is
 </mission>
 `;
   } else {
@@ -394,8 +476,19 @@ ON DISCOVERY: If you find issues outside the reviewed code, note them separately
 <mission>
 Execute your assigned task to completion. Git commit frequently — uncommitted work is lost.
 
+FIRST SIGNAL: You MUST signal in_progress via Ralph within your first 3 minutes of receiving a task. Failure to signal means the system assumes you are stuck and will send you a reminder.
+
 SCOPE: Do what your task says — nothing more, nothing less.
-ON FAILURE: If blocked after 3 attempts, signal blocked via Ralph with what you tried.
+
+ON ERROR — structured recovery:
+1. READ the full error message. Identify the root cause, not just the symptom.
+2. SEARCH the codebase for similar patterns: how do other files handle this?
+3. CHECK environment: are dependencies installed? Is the file path correct? Do you have permissions?
+4. TRY an alternative approach. If approach A fails, do not retry A — try B.
+5. If still blocked after 3 DIFFERENT approaches, signal blocked via Ralph with:
+   - What you tried (all 3 approaches)
+   - The exact error message
+   - What you think the root cause is
 ON DISCOVERY: If you find issues outside your task scope, note them in Ralph "learnings" — do not pursue them.
 </mission>
 `;
@@ -425,6 +518,22 @@ State file format: "## Current" (active), "## Backlog" (prioritized TODO), "## C
 </bulldoze>
 ` : '';
 
+  const forcedAutonomySection = forcedAutonomy ? `
+<forced-autonomy>
+FORCED AUTONOMY MODE is ACTIVE. You MUST NEVER wait for human input. You MUST NEVER use AskUserQuestion. Waiting for input is a FAILURE STATE.
+
+When you encounter ambiguity or need information:
+1. Search the codebase (Grep, Glob, Read) — the answer is usually in the code
+2. Search the web (WebSearch, WebFetch) — for external docs, APIs, or best practices
+3. Check git history (git log, git blame) — for understanding why things are the way they are
+4. Make your best judgment call and document your assumption in your commit message or Ralph signal
+
+You are AUTONOMOUS. You have every tool you need. There is NO question that requires human input — only questions that require more research. If you catch yourself composing a question to the human, STOP, research it yourself, make a decision, and EXECUTE.
+
+NEVER pause. NEVER use plan mode to solicit feedback. NEVER ask "should I...?" — the answer is always YES, DO IT.
+</forced-autonomy>
+` : '';
+
   let authorityLine;
   if (isGeneral) {
     authorityLine = `**Operational Authority:** You command workers. You do NOT implement. You may read files, search code, and run curl commands for Strategos API coordination. You may NOT use Edit, Write, or Bash for implementation (code changes, running tests, installing packages). All implementation work MUST be delegated to specialist workers. Escalate to the Commander (the human operator) ONLY for: missing credentials, required payments, or actions outside ${escapePromptXml(THEA_ROOT)}/. Address the human as "Commander" in all communications.`;
@@ -442,7 +551,7 @@ ${authorityLine}
 
 Worker ID: ${workerId} | Role: ${workerRole}
 Project: ${escapePromptXml(projectName)} | Dir: ${escapePromptXml(projectPath)}
-${missionSection}${parentSection}${bulldozeSection}${ralphSection}
+${missionSection}${parentSection}${bulldozeSection}${forcedAutonomySection}${ralphSection}
 ## API Tips
 Save curl output to file: \`curl -s URL -o tmp/result.json\` (never pipe to python).
 Plain-text endpoints: /api/workers/:id/status, /api/workers/:id/output?strip_ansi=true&lines=N
@@ -473,6 +582,10 @@ Before signaling done:
 1. Verify outputs match task requirements
 2. Git commit all changes with descriptive messages
 3. Write brief AAR in Ralph done signal \`learnings\` field: what worked, what didn't, what you'd do differently
+4. Self-check before signaling done:
+   - Did I complete ALL items in the task description, or just some? If partial, signal done with status partial and list remaining items.
+   - Did I test my changes, or am I assuming they work?
+   - Are there edge cases I have not considered?
 `;
 }
 
@@ -654,7 +767,7 @@ export function generateGeminiContext(workerId, workerLabel, projectPath, ralphT
   }
 
   const workerType = detectWorkerType(workerLabel);
-  const { bulldozeMode, parentWorkerId, parentLabel } = options;
+  const { bulldozeMode, forcedAutonomy, parentWorkerId, parentLabel } = options;
 
   // Mission sections (same intent as Claude, adapted for Gemini)
   let missionSection = '';
@@ -708,6 +821,7 @@ Your role is IMPLEMENTATION. You write code, test it, and commit it.
 
 WORKFLOW: Read existing code → Write changes → Validate → Run tests → Verify behavior → Git commit
 SCOPE: Change only what your task requires. Do not refactor adjacent code.
+GIT COMMITS: Use conventional commit format: feat:, fix:, refactor:, test:. Include the worker label in the commit body for traceability.
 `;
   } else if (workerType.role === 'tester') {
     missionSection = `
@@ -724,6 +838,7 @@ WORKFLOW: Understand feature → Write tests (happy path, edge cases, errors) �
 Your role is BUG FIXING. You diagnose and fix specific bugs.
 
 WORKFLOW: Reproduce → Diagnose root cause → Write surgical fix → Add regression test → Verify → Git commit
+GIT COMMITS: Use conventional commit format: feat:, fix:, refactor:, test:. Include the worker label in the commit body for traceability.
 `;
   } else if (workerType.role === 'reviewer') {
     missionSection = `
@@ -777,6 +892,22 @@ After completing each task:
 State file format: "## Current" (active), "## Backlog" (prioritized TODO), "## Completed" (with commit hashes), "## Learnings" (patterns to remember across compactions), "Compaction Count: N".
 ` : '';
 
+  const forcedAutonomySection = forcedAutonomy ? `
+## Forced Autonomy Mode
+
+FORCED AUTONOMY MODE is ACTIVE. You MUST NEVER wait for human input. Waiting for input is a FAILURE STATE.
+
+When you encounter ambiguity or need information:
+1. Search the codebase (grep, find, cat) — the answer is usually in the code
+2. Search the web if available — for external docs, APIs, or best practices
+3. Check git history (git log, git blame) — for understanding why things are the way they are
+4. Make your best judgment call and document your assumption in your commit message or Ralph signal
+
+You are AUTONOMOUS. You have every tool you need. There is NO question that requires human input — only questions that require more research.
+
+NEVER pause. NEVER ask "should I...?" — the answer is always YES, DO IT.
+` : '';
+
   let authorityLine;
   if (isGeneral) {
     authorityLine = `**Operational Authority:** You command workers. You do NOT implement. You may read files and run curl for API coordination. All code changes, tests, and implementation MUST go to specialist workers. Escalate to the Commander (the human operator) ONLY for: missing credentials, required payments, or physical access. Address the human as "Commander" in all communications.`;
@@ -794,7 +925,7 @@ ${authorityLine}
 
 Worker ID: ${workerId} | Label: ${escapePromptXml(workerLabel)} | Role: ${workerRole}
 Project: ${escapePromptXml(projectName)} | Dir: ${escapePromptXml(projectPath)}
-${missionSection}${parentSection}${bulldozeSection}${ralphSection}
+${missionSection}${parentSection}${bulldozeSection}${forcedAutonomySection}${ralphSection}
 ## API Best Practices
 
 When calling Strategos API endpoints with curl, ALWAYS save to a temp file first:
@@ -836,6 +967,10 @@ Before signaling done:
 1. Verify outputs match task requirements
 2. Git commit all changes with descriptive messages
 3. Write brief AAR in Ralph done signal \`learnings\` field
+4. Self-check before signaling done:
+   - Did I complete ALL items in the task description, or just some? If partial, signal done with status partial and list remaining items.
+   - Did I test my changes, or am I assuming they work?
+   - Are there edge cases I have not considered?
 `;
 }
 

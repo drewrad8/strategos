@@ -718,6 +718,11 @@ export function createWorkerRoutes(theaRoot, io) {
         }
       }
 
+      // Atomically enable forced autonomy if requested
+      if (req.body.forcedAutonomy) {
+        updateWorkerSettings(worker.id, { forcedAutonomy: true }, io);
+      }
+
       // Atomically enable bulldoze if requested (avoids two-step spawn + settings dance)
       if (req.body.bulldozeMode) {
         const bulldozeSettings = { bulldozeMode: true };
@@ -816,7 +821,7 @@ export function createWorkerRoutes(theaRoot, io) {
   router.post('/:id/settings', async (req, res) => {
     try {
       const { autoAccept, autoAcceptPaused, ralphMode, bulldozeMode, bulldozePaused,
-        bulldozeMission, bulldozeBacklog, bulldozeStandingOrders } = req.body;
+        bulldozeMission, bulldozeBacklog, bulldozeStandingOrders, forcedAutonomy } = req.body;
       const settings = {};
       if (autoAccept !== undefined) {
         if (typeof autoAccept !== 'boolean') return res.status(400).json({ error: 'autoAccept must be a boolean' });
@@ -833,6 +838,10 @@ export function createWorkerRoutes(theaRoot, io) {
       if (bulldozeMode !== undefined) {
         if (typeof bulldozeMode !== 'boolean') return res.status(400).json({ error: 'bulldozeMode must be a boolean' });
         settings.bulldozeMode = bulldozeMode;
+      }
+      if (forcedAutonomy !== undefined) {
+        if (typeof forcedAutonomy !== 'boolean') return res.status(400).json({ error: 'forcedAutonomy must be a boolean' });
+        settings.forcedAutonomy = forcedAutonomy;
       }
       if (bulldozePaused !== undefined) {
         if (typeof bulldozePaused !== 'boolean') return res.status(400).json({ error: 'bulldozePaused must be a boolean' });
@@ -918,6 +927,7 @@ curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Co
           autoAcceptPaused: worker.autoAcceptPaused,
           ralphMode: worker.ralphMode,
           bulldozeMode: worker.bulldozeMode,
+          forcedAutonomy: worker.forcedAutonomy,
           bulldozePaused: worker.bulldozePaused,
           bulldozePauseReason: worker.bulldozePauseReason,
           bulldozeCyclesCompleted: worker.bulldozeCyclesCompleted,
@@ -945,6 +955,18 @@ curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Co
       // Match socket handler's 1MB limit
       if (input.length > 1024 * 1024) {
         return res.status(400).json({ error: 'Input too large (max 1MB)' });
+      }
+
+      // Cross-project guard: block workers from sending input to workers in different projects
+      if (fromWorkerId) {
+        const sender = getWorker(fromWorkerId);
+        const receiver = getWorker(req.params.id);
+        if (sender && receiver && sender.project && receiver.project && sender.project !== receiver.project) {
+          console.warn(`[INPUT] Cross-project input blocked: worker ${fromWorkerId} (${sender.project}) tried to send input to worker ${req.params.id} (${receiver.project})`);
+          return res.status(403).json({
+            error: `Cross-project input blocked: sender project (${sender.project}) does not match receiver project (${receiver.project})`
+          });
+        }
       }
 
       await sendInput(req.params.id, input, null, { fromWorkerId, source: fromWorkerId ? `rest_api:worker:${fromWorkerId}` : 'rest_api' });
