@@ -36,6 +36,8 @@ import {
   endSession as dbEndSession,
 } from '../workerOutputDb.js';
 
+const logger = getLogger();
+
 // Global health monitor interval
 let globalHealthInterval = null;
 
@@ -87,16 +89,20 @@ export function startHealthMonitor(workerId, io) {
 
 function startGlobalHealthMonitor(io) {
   if (globalHealthInterval) return;
-  console.log('[HealthMonitor] Starting global health interval (every 10s)');
+  logger.info('[HealthMonitor] Starting global health interval (every 10s)');
+
+  const HEALTH_CHECK_CONCURRENCY = 5;
 
   globalHealthInterval = setInterval(async () => {
     const workerIds = [...healthChecks];
-    for (const workerId of workerIds) {
-      try {
-        await checkWorkerHealth(workerId, io);
-      } catch (err) {
-        console.error(`[HealthMonitor] Unhandled error for ${workerId}: ${err.message}`);
-      }
+    // Process health checks in parallel batches of HEALTH_CHECK_CONCURRENCY
+    for (let i = 0; i < workerIds.length; i += HEALTH_CHECK_CONCURRENCY) {
+      const batch = workerIds.slice(i, i + HEALTH_CHECK_CONCURRENCY);
+      await Promise.all(batch.map(workerId =>
+        checkWorkerHealth(workerId, io).catch(err => {
+          logger.error(`[HealthMonitor] Unhandled error for ${workerId}: ${err.message}`);
+        })
+      ));
     }
   }, 10000);
 
@@ -133,7 +139,7 @@ async function checkWorkerHealth(workerId, io) {
           try {
             await spawnTmux(['has-session', '-t', worker.tmuxSession]);
             // Session is alive — this is a false positive from output content
-            console.warn(`[CrashDetect] Pattern matched for ${workerId} (${worker.label}): "${pattern.reason}" but tmux session is alive — ignoring false positive`);
+            logger.warn(`[CrashDetect] Pattern matched for ${workerId} (${worker.label}): "${pattern.reason}" but tmux session is alive — ignoring false positive`);
             try {
               const typeInfo = detectWorkerTypeForMetrics(worker.label);
               recordWorkerFalseCrash(worker, typeInfo.prefix || 'unknown');
@@ -143,7 +149,7 @@ async function checkWorkerHealth(workerId, io) {
             // has-session failed — session is dead, crash is real
           }
         }
-        console.error(`[CrashDetect] Worker ${workerId} (${worker.label}): ${pattern.reason}`);
+        logger.error(`[CrashDetect] Worker ${workerId} (${worker.label}): ${pattern.reason}`);
         worker.health = 'crashed';
         worker.crashReason = pattern.reason;
         worker.crashedAt = new Date();
@@ -151,7 +157,7 @@ async function checkWorkerHealth(workerId, io) {
           io.emit('worker:crashed', { workerId, label: worker.label, reason: worker.crashReason });
         }
         handleCrashedWorker(workerId, worker, io)
-          .catch(err => console.error(`[CrashDetect] handleCrashedWorker failed for ${workerId}: ${err.message}`));
+          .catch(err => logger.error(`[CrashDetect] handleCrashedWorker failed for ${workerId}: ${err.message}`));
       }
       crashDetected = true;
       break;
@@ -185,7 +191,7 @@ async function checkWorkerHealth(workerId, io) {
       // Output stalled AND no recent Ralph signal — truly stalled
       const stalledMinutes = Math.round(timeSinceOutput / 60000);
       if (worker.health !== 'stalled') {
-        console.warn(`[HealthMonitor] Worker ${workerId} (${worker.label}) stalled for ${stalledMinutes}m`);
+        logger.warn(`[HealthMonitor] Worker ${workerId} (${worker.label}) stalled for ${stalledMinutes}m`);
         worker.health = 'stalled';
         if (io) {
           io.emit('worker:stalled', { workerId, label: worker.label, stalledMinutes });
@@ -203,11 +209,11 @@ async function checkWorkerHealth(workerId, io) {
       if (stalledMinutes >= 30 && !isProtectedWorker(worker) && !worker._stallAutoKilled) {
         // 30 min stalled (non-GENERAL): auto-kill with parent notification
         worker._stallAutoKilled = true;
-        console.error(`[StallRecovery] Auto-killing stalled worker ${workerId} (${worker.label}) after ${stalledMinutes}m`);
+        logger.error(`[StallRecovery] Auto-killing stalled worker ${workerId} (${worker.label}) after ${stalledMinutes}m`);
         if (worker.parentWorkerId) {
           const parentNotification = `[STALL AUTO-KILL] Your child worker "${worker.label}" (${workerId}) was automatically terminated after ${stalledMinutes} minutes of inactivity. Consider respawning if the task is still needed.`;
           sendInputDirect(worker.parentWorkerId, parentNotification, 'health:stall_kill_notification').catch(e => {
-            console.warn(`[StallRecovery] Could not notify parent ${worker.parentWorkerId}: ${e.message}`);
+            logger.warn(`[StallRecovery] Could not notify parent ${worker.parentWorkerId}: ${e.message}`);
           });
         }
         import('./lifecycle.js').then(async ({ killWorker }) => {
@@ -217,14 +223,14 @@ async function checkWorkerHealth(workerId, io) {
               io.emit('worker:auto-killed:stall', { workerId, label: worker.label, stalledMinutes });
             }
           } catch (err) {
-            console.error(`[StallRecovery] Auto-kill failed for ${workerId}: ${err.message}`);
+            logger.error(`[StallRecovery] Auto-kill failed for ${workerId}: ${err.message}`);
           }
         });
       } else if (stalledMinutes >= 30 && isProtectedWorker(worker)) {
         // GENERALs: never auto-kill, but notify Commander
         if (!worker._stallCommanderNotified) {
           worker._stallCommanderNotified = true;
-          console.error(`[StallRecovery] GENERAL ${workerId} (${worker.label}) stalled for ${stalledMinutes}m — notifying Commander`);
+          logger.error(`[StallRecovery] GENERAL ${workerId} (${worker.label}) stalled for ${stalledMinutes}m — notifying Commander`);
           if (io) {
             io.emit('worker:general:stalled', {
               workerId,
@@ -237,22 +243,22 @@ async function checkWorkerHealth(workerId, io) {
       } else if (stalledMinutes >= 20 && !worker._stallWarningNudged && !isIdleGeneral) {
         // 20 min stalled: send warning (skip for idle GENERALs with no active children)
         worker._stallWarningNudged = true;
-        console.warn(`[StallRecovery] Sending stall WARNING to ${workerId} (${worker.label}) after ${stalledMinutes}m`);
+        logger.warn(`[StallRecovery] Sending stall WARNING to ${workerId} (${worker.label}) after ${stalledMinutes}m`);
         sendInputDirect(workerId, 'STALL WARNING: You have been idle for 20 minutes. Signal your status via Ralph immediately or you will be terminated. If you are working on something that does not produce output, signal in_progress with your current step.', 'health:stall_warning').catch(e => {
-          console.warn(`[StallRecovery] Warning nudge failed for ${workerId}: ${e.message}`);
+          logger.warn(`[StallRecovery] Warning nudge failed for ${workerId}: ${e.message}`);
         });
       } else if (stalledMinutes >= 10 && !worker._stallNudged && !isIdleGeneral) {
         // 10 min stalled: send nudge (skip for idle GENERALs with no active children)
         worker._stallNudged = true;
-        console.warn(`[StallRecovery] Sending stall nudge to ${workerId} (${worker.label}) after ${stalledMinutes}m`);
+        logger.warn(`[StallRecovery] Sending stall nudge to ${workerId} (${worker.label}) after ${stalledMinutes}m`);
         sendInputDirect(workerId, 'You appear to be idle. If you are working on something that does not produce output, signal Ralph with your progress. If you are stuck, signal blocked via Ralph.', 'health:stall_nudge').catch(e => {
-          console.warn(`[StallRecovery] Nudge failed for ${workerId}: ${e.message}`);
+          logger.warn(`[StallRecovery] Nudge failed for ${workerId}: ${e.message}`);
         });
       }
     }
 
     if (worker.ralphStatus === 'blocked' && !worker._blockedEmitted) {
-      console.warn(`[HEALTH] Worker ${workerId} (${worker.label}) signaled BLOCKED: ${worker.ralphProgress}`);
+      logger.warn(`[HEALTH] Worker ${workerId} (${worker.label}) signaled BLOCKED: ${worker.ralphProgress}`);
       worker._blockedEmitted = true;
       if (io) {
         io.emit('worker:blocked', { workerId, label: worker.label, ralphStatus: worker.ralphStatus });
@@ -269,12 +275,12 @@ async function checkWorkerHealth(workerId, io) {
         const msSinceTask = Date.now() - new Date(taskTime).getTime();
         if (msSinceTask > 5 * 60 * 1000) {
           worker._earlyRalphNudged = true;
-          console.warn(`[HealthMonitor] Worker ${workerId} (${worker.label}) has not signaled Ralph within 5 minutes of receiving task`);
+          logger.warn(`[HealthMonitor] Worker ${workerId} (${worker.label}) has not signaled Ralph within 5 minutes of receiving task`);
           if (io) {
             io.emit('worker:signal-overdue', { workerId, label: worker.label, minutesSinceTask: Math.round(msSinceTask / 60000) });
           }
           sendInputDirect(workerId, 'REMINDER: Signal your progress via Ralph. You have not sent any status updates since receiving your task. Signal in_progress with your current step so your parent knows you are alive.', 'health:early_ralph_nudge').catch(e => {
-            console.warn(`[HealthMonitor] Early Ralph nudge failed for ${workerId}: ${e.message}`);
+            logger.warn(`[HealthMonitor] Early Ralph nudge failed for ${workerId}: ${e.message}`);
           });
         }
       }
@@ -291,7 +297,7 @@ async function checkWorkerHealth(workerId, io) {
   if (queue.length > 0 && worker.lastActivity) {
     const msSinceActivity = Date.now() - new Date(worker.lastActivity).getTime();
     if (msSinceActivity > 30000) {
-      console.warn(`[HealthMonitor] Worker ${workerId} (${worker.label}) has stuck queue: ${queue.length} commands, no activity for ${Math.round(msSinceActivity / 1000)}s`);
+      logger.warn(`[HealthMonitor] Worker ${workerId} (${worker.label}) has stuck queue: ${queue.length} commands, no activity for ${Math.round(msSinceActivity / 1000)}s`);
     }
   }
 
@@ -312,7 +318,7 @@ export function stopAllHealthMonitors() {
     globalHealthInterval = null;
   }
   if (count > 0) {
-    console.log(`[Shutdown] Stopped health monitoring for ${count} worker(s)`);
+    logger.info(`[Shutdown] Stopped health monitoring for ${count} worker(s)`);
   }
 }
 
@@ -337,7 +343,7 @@ export function addRespawnSuggestion(workerId, worker) {
   if (respawnSuggestions.length > MAX_RESPAWN_SUGGESTIONS) {
     respawnSuggestions.length = MAX_RESPAWN_SUGGESTIONS;
   }
-  console.log(`[RespawnSuggestion] Added suggestion for ${worker.label} (${workerId})`);
+  logger.info(`[RespawnSuggestion] Added suggestion for ${worker.label} (${workerId})`);
 }
 
 // ============================================
@@ -358,7 +364,7 @@ export async function handleCrashedWorker(workerId, worker, io) {
   }
 
   if (attempts.count >= MAX_RESPAWN_ATTEMPTS) {
-    console.warn(`[CrashRecovery] Worker ${workerId} exceeded max respawn attempts (${MAX_RESPAWN_ATTEMPTS}), not respawning`);
+    logger.warn(`[CrashRecovery] Worker ${workerId} exceeded max respawn attempts (${MAX_RESPAWN_ATTEMPTS}), not respawning`);
     worker.status = 'error';
     worker.health = 'dead';
     try {
@@ -376,7 +382,7 @@ export async function handleCrashedWorker(workerId, worker, io) {
       const failedDependents = markWorkerFailed(workerId);
       for (const depId of failedDependents) {
         if (pendingWorkers.has(depId)) {
-          console.log(`[CrashRecovery] Removing orphaned pending worker ${depId}`);
+          logger.info(`[CrashRecovery] Removing orphaned pending worker ${depId}`);
           pendingWorkers.delete(depId);
         }
       }
@@ -388,7 +394,7 @@ export async function handleCrashedWorker(workerId, worker, io) {
   }
 
   if (now - attempts.lastAttempt < RESPAWN_COOLDOWN_MS) {
-    console.log(`[CrashRecovery] Worker ${workerId} in cooldown, waiting...`);
+    logger.info(`[CrashRecovery] Worker ${workerId} in cooldown, waiting...`);
     return;
   }
 
@@ -396,7 +402,7 @@ export async function handleCrashedWorker(workerId, worker, io) {
   attempts.lastAttempt = now;
   respawnAttempts.set(workerId, attempts);
 
-  console.log(`[CrashRecovery] Respawning crashed worker ${workerId} (${worker.label}), attempt ${attempts.count}/${MAX_RESPAWN_ATTEMPTS}`);
+  logger.info(`[CrashRecovery] Respawning crashed worker ${workerId} (${worker.label}), attempt ${attempts.count}/${MAX_RESPAWN_ATTEMPTS}`);
 
   if (isProtectedWorker(worker)) {
     // Double-check: verify tmux session is actually dead before marking GENERAL as dead
@@ -404,7 +410,7 @@ export async function handleCrashedWorker(workerId, worker, io) {
       try {
         await spawnTmux(['has-session', '-t', worker.tmuxSession]);
         // Session is alive — false positive crash detection
-        console.warn(`[CrashRecovery] GENERAL ${workerId} (${worker.label}) tmux session is alive — resetting to healthy (false positive crash)`);
+        logger.warn(`[CrashRecovery] GENERAL ${workerId} (${worker.label}) tmux session is alive — resetting to healthy (false positive crash)`);
         try {
           const typeInfo = detectWorkerTypeForMetrics(worker.label);
           recordWorkerFalseCrash(worker, typeInfo.prefix || 'unknown');
@@ -418,7 +424,7 @@ export async function handleCrashedWorker(workerId, worker, io) {
         // Session is dead — proceed with marking dead
       }
     }
-    console.error(`[CrashRecovery] GENERAL worker ${workerId} (${worker.label}) crashed. NOT respawning.`);
+    logger.error(`[CrashRecovery] GENERAL worker ${workerId} (${worker.label}) crashed. NOT respawning.`);
     worker.health = 'dead';
     worker.status = 'error';
     try {
@@ -466,7 +472,7 @@ export async function handleCrashedWorker(workerId, worker, io) {
       initialInput: `You are respawning after a crash. Your previous task was: ${worker.task?.description || 'unknown'}. Continue where you left off or restart if needed.`
     });
 
-    console.log(`[CrashRecovery] Respawned as ${newWorker.id} (${newWorker.label})`);
+    logger.info(`[CrashRecovery] Respawned as ${newWorker.id} (${newWorker.label})`);
     try {
       const typeInfo = detectWorkerTypeForMetrics(worker.label);
       recordWorkerRespawn(worker, typeInfo.prefix || 'unknown');
@@ -482,7 +488,7 @@ export async function handleCrashedWorker(workerId, worker, io) {
         try {
           await sendInputDirect(worker.parentWorkerId, msg, 'health:death_notification');
         } catch (e) {
-          console.warn(`[CrashRecovery] Could not notify parent ${worker.parentWorkerId}: ${e.message}`);
+          logger.warn(`[CrashRecovery] Could not notify parent ${worker.parentWorkerId}: ${e.message}`);
         }
       }
     }
@@ -498,7 +504,7 @@ export async function handleCrashedWorker(workerId, worker, io) {
       });
     }
   } catch (error) {
-    console.error(`[CrashRecovery] Failed to respawn worker ${workerId}:`, error.message);
+    logger.error(`[CrashRecovery] Failed to respawn worker ${workerId}:`, error.message);
     if (attempts.count >= MAX_RESPAWN_ATTEMPTS) {
       worker.status = 'error';
       worker.health = 'dead';
@@ -515,12 +521,12 @@ export async function handleCrashedWorker(workerId, worker, io) {
       }
     } else {
       const retryDelayMs = RESPAWN_COOLDOWN_MS + 5000;
-      console.log(`[CrashRecovery] Scheduling retry for ${workerId} in ${retryDelayMs / 1000}s`);
+      logger.info(`[CrashRecovery] Scheduling retry for ${workerId} in ${retryDelayMs / 1000}s`);
       setTimeout(() => {
         const w = workers.get(workerId);
         if (w && w.health === 'crashed') {
           handleCrashedWorker(workerId, w, io)
-            .catch(err => console.error(`[CrashRecovery] Retry failed for ${workerId}: ${err.message}`));
+            .catch(err => logger.error(`[CrashRecovery] Retry failed for ${workerId}: ${err.message}`));
         }
       }, retryDelayMs);
     }
@@ -533,11 +539,11 @@ export async function handleCrashedWorker(workerId, worker, io) {
 
 export function startPeriodicCleanup(io = null) {
   if (cleanupInterval) {
-    console.log('[PeriodicCleanup] Already running');
+    logger.info('[PeriodicCleanup] Already running');
     return;
   }
 
-  console.log('[PeriodicCleanup] Starting periodic cleanup sweep (every 60s)');
+  logger.info('[PeriodicCleanup] Starting periodic cleanup sweep (every 60s)');
 
   // Start resource monitor alongside periodic cleanup
   startResourceMonitor(io);
@@ -545,7 +551,7 @@ export function startPeriodicCleanup(io = null) {
   let _cleanupRunning = false;
   cleanupInterval = setInterval(async () => {
     if (_cleanupRunning) {
-      console.warn('[PeriodicCleanup] Previous tick still running, skipping');
+      logger.warn('[PeriodicCleanup] Previous tick still running, skipping');
       return;
     }
     _cleanupRunning = true;
@@ -560,7 +566,7 @@ export function startPeriodicCleanup(io = null) {
 
       if (isProtectedWorker(worker)) {
         if (worker.status === 'completed') {
-          console.warn(`[PeriodicCleanup] GENERAL worker ${id} (${worker.label}) is marked completed but will NOT be auto-cleaned.`);
+          logger.warn(`[PeriodicCleanup] GENERAL worker ${id} (${worker.label}) is marked completed but will NOT be auto-cleaned.`);
         }
         continue;
       }
@@ -585,11 +591,11 @@ export function startPeriodicCleanup(io = null) {
           // Don't auto-dismiss workers that had children (they completed work, may be awaiting orders)
           const hadChildren = (worker.childWorkerHistory || []).length > 0;
           if (activeChildren.length > 0) {
-            console.log(`[PeriodicCleanup] Skipping awaiting_review worker ${id} (${worker.label}) — has ${activeChildren.length} active children`);
+            logger.info(`[PeriodicCleanup] Skipping awaiting_review worker ${id} (${worker.label}) — has ${activeChildren.length} active children`);
           } else if (hadChildren) {
-            console.log(`[PeriodicCleanup] Skipping awaiting_review worker ${id} (${worker.label}) — has ${worker.childWorkerHistory.length} historical children, awaiting orders`);
+            logger.info(`[PeriodicCleanup] Skipping awaiting_review worker ${id} (${worker.label}) — has ${worker.childWorkerHistory.length} historical children, awaiting orders`);
           } else {
-            console.log(`[PeriodicCleanup] Auto-dismissing worker ${id} (${worker.label}) — awaiting_review for ${Math.round(reviewAge / 60000)}m`);
+            logger.info(`[PeriodicCleanup] Auto-dismissing worker ${id} (${worker.label}) — awaiting_review for ${Math.round(reviewAge / 60000)}m`);
             workersToClean.push({ id, reason: 'auto-dismissed', label: worker.label });
           }
         }
@@ -599,7 +605,7 @@ export function startPeriodicCleanup(io = null) {
         const inactiveTime = now - new Date(worker.lastActivity).getTime();
         if (!Number.isNaN(inactiveTime) && inactiveTime > STALE_WORKER_THRESHOLD_MS && !worker._staleWarned) {
           worker._staleWarned = true;
-          console.warn(`[PeriodicCleanup] Worker ${id} (${worker.label}) has been inactive for ${Math.round(inactiveTime / 60000)} minutes`);
+          logger.warn(`[PeriodicCleanup] Worker ${id} (${worker.label}) has been inactive for ${Math.round(inactiveTime / 60000)} minutes`);
         }
       }
     }
@@ -608,15 +614,15 @@ export function startPeriodicCleanup(io = null) {
     const { killWorker } = await import('./lifecycle.js');
     for (const { id, reason, label } of workersToClean) {
       try {
-        console.log(`[PeriodicCleanup] Cleaning up ${reason} worker ${id} (${label})`);
+        logger.info(`[PeriodicCleanup] Cleaning up ${reason} worker ${id} (${label})`);
         await killWorker(id, io);
       } catch (error) {
-        console.error(`[PeriodicCleanup] Failed to cleanup worker ${id}:`, error.message);
+        logger.error(`[PeriodicCleanup] Failed to cleanup worker ${id}:`, error.message);
       }
     }
 
     if (workersToClean.length > 0) {
-      console.log(`[PeriodicCleanup] Cleaned up ${workersToClean.length} workers`);
+      logger.info(`[PeriodicCleanup] Cleaned up ${workersToClean.length} workers`);
     }
 
     // Monitor aggregate output buffer memory usage
@@ -626,7 +632,7 @@ export function startPeriodicCleanup(io = null) {
     }
     const bufferMB = totalBufferBytes / (1024 * 1024);
     if (bufferMB > 100) {
-      console.warn(`[MemoryMonitor] Output buffers using ${bufferMB.toFixed(1)}MB across ${outputBuffers.size} workers`);
+      logger.warn(`[MemoryMonitor] Output buffers using ${bufferMB.toFixed(1)}MB across ${outputBuffers.size} workers`);
     }
 
     // Periodic state save
@@ -634,7 +640,7 @@ export function startPeriodicCleanup(io = null) {
     try {
       await saveWorkerState();
     } catch (err) {
-      console.error(`[PeriodicCleanup] State save failed: ${err.message}`);
+      logger.error(`[PeriodicCleanup] State save failed: ${err.message}`);
     }
 
     // Clean stale respawnAttempts
@@ -647,7 +653,7 @@ export function startPeriodicCleanup(io = null) {
       }
     }
     if (respawnCleaned > 0) {
-      console.log(`[PeriodicCleanup] Cleaned ${respawnCleaned} stale respawnAttempts entries`);
+      logger.info(`[PeriodicCleanup] Cleaned ${respawnCleaned} stale respawnAttempts entries`);
     }
 
     // Clean up stuck pending workers
@@ -658,7 +664,7 @@ export function startPeriodicCleanup(io = null) {
 
       const pendingAge = Date.now() - (pending.createdAt || 0);
       if (pendingAge > MAX_PENDING_TIMEOUT_MS) {
-        console.warn(`[PeriodicCleanup] Removing timed-out pending worker ${pendingId} (${pending.label})`);
+        logger.warn(`[PeriodicCleanup] Removing timed-out pending worker ${pendingId} (${pending.label})`);
         pendingWorkers.delete(pendingId);
         pendingCleaned++;
         continue;
@@ -669,18 +675,18 @@ export function startPeriodicCleanup(io = null) {
         return dep && (dep.status === 'running' || dep.status === 'completed');
       });
       if (!anyDepActive && deps.length > 0) {
-        console.log(`[PeriodicCleanup] Removing stale pending worker ${pendingId} (${pending.label})`);
+        logger.info(`[PeriodicCleanup] Removing stale pending worker ${pendingId} (${pending.label})`);
         pendingWorkers.delete(pendingId);
         pendingCleaned++;
       }
     }
     if (pendingCleaned > 0) {
-      console.log(`[PeriodicCleanup] Cleaned ${pendingCleaned} stale pending workers`);
+      logger.info(`[PeriodicCleanup] Cleaned ${pendingCleaned} stale pending workers`);
     }
 
     const depCleanup = cleanupFinishedWorkflows();
     if (depCleanup.workflowsCleaned > 0 || depCleanup.nodesCleaned > 0) {
-      console.log(`[PeriodicCleanup] Cleaned ${depCleanup.workflowsCleaned} finished workflows, ${depCleanup.nodesCleaned} dep nodes`);
+      logger.info(`[PeriodicCleanup] Cleaned ${depCleanup.workflowsCleaned} finished workflows, ${depCleanup.nodesCleaned} dep nodes`);
     }
 
     if (_contextWriteLocks.size > 0) {
@@ -696,7 +702,7 @@ export function startPeriodicCleanup(io = null) {
         }
       }
       if (locksCleaned > 0) {
-        console.log(`[PeriodicCleanup] Cleaned ${locksCleaned} stale context write lock(s)`);
+        logger.info(`[PeriodicCleanup] Cleaned ${locksCleaned} stale context write lock(s)`);
       }
     }
 
@@ -704,7 +710,7 @@ export function startPeriodicCleanup(io = null) {
       _cleanupRunning = false;
       const tickDuration = Date.now() - tickStart;
       if (tickDuration > 50000) {
-        console.warn(`[PeriodicCleanup] Tick took ${tickDuration}ms (near 60s interval threshold)`);
+        logger.warn(`[PeriodicCleanup] Tick took ${tickDuration}ms (near 60s interval threshold)`);
       }
     }
   }, 60000);
@@ -718,7 +724,7 @@ export function stopPeriodicCleanup() {
   if (cleanupInterval) {
     clearInterval(cleanupInterval);
     cleanupInterval = null;
-    console.log('[PeriodicCleanup] Stopped');
+    logger.info('[PeriodicCleanup] Stopped');
   }
   stopResourceMonitor();
 }
@@ -733,7 +739,7 @@ export function stopPeriodicCleanup() {
  */
 export function startResourceMonitor(io) {
   if (resourceMonitorInterval) return;
-  console.log('[ResourceMonitor] Starting periodic resource monitoring (every 60s)');
+  logger.info('[ResourceMonitor] Starting periodic resource monitoring (every 60s)');
 
   resourceMonitorInterval = setInterval(async () => {
     try {
@@ -741,7 +747,7 @@ export function startResourceMonitor(io) {
       const resources = await getSystemResources();
 
       if (resources.availableMB < CRITICAL_AVAILABLE_MB) {
-        console.error(`[ResourceMonitor] CRITICAL: Only ${resources.availableMB}MB memory available (threshold: ${CRITICAL_AVAILABLE_MB}MB)`);
+        logger.error(`[ResourceMonitor] CRITICAL: Only ${resources.availableMB}MB memory available (threshold: ${CRITICAL_AVAILABLE_MB}MB)`);
         if (io) {
           io.emit('system:resource:critical', {
             type: 'memory',
@@ -754,7 +760,7 @@ export function startResourceMonitor(io) {
       }
 
       if (resources.swapUsedPercent > 90) {
-        console.error(`[ResourceMonitor] CRITICAL: Swap ${resources.swapUsedPercent}% used (${resources.swapUsedMB}MB/${resources.swapTotalMB}MB)`);
+        logger.error(`[ResourceMonitor] CRITICAL: Swap ${resources.swapUsedPercent}% used (${resources.swapUsedMB}MB/${resources.swapTotalMB}MB)`);
         if (io) {
           io.emit('system:resource:critical', {
             type: 'swap',
@@ -770,7 +776,7 @@ export function startResourceMonitor(io) {
       // Check worker ages
       const agedWorkers = checkWorkerAges();
       for (const aged of agedWorkers) {
-        console.warn(`[ResourceMonitor] Worker age ${aged.severity}: ${aged.id} (${aged.label}) — ${aged.message}`);
+        logger.warn(`[ResourceMonitor] Worker age ${aged.severity}: ${aged.id} (${aged.label}) — ${aged.message}`);
         if (io) {
           io.emit('worker:age:warning', {
             workerId: aged.id,
@@ -783,7 +789,7 @@ export function startResourceMonitor(io) {
         }
       }
     } catch (err) {
-      console.error(`[ResourceMonitor] Error during resource check: ${err.message}`);
+      logger.error(`[ResourceMonitor] Error during resource check: ${err.message}`);
     }
   }, 60000);
 
@@ -796,6 +802,6 @@ export function stopResourceMonitor() {
   if (resourceMonitorInterval) {
     clearInterval(resourceMonitorInterval);
     resourceMonitorInterval = null;
-    console.log('[ResourceMonitor] Stopped');
+    logger.info('[ResourceMonitor] Stopped');
   }
 }

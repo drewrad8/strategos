@@ -542,24 +542,22 @@ export function cleanupFinishedWorkflows(maxAgeMs = 60 * 60 * 1000) {
  * @returns {Object}
  */
 export function getDependencyStats() {
-  const nodes = Array.from(dependencyNodes.values());
+  const nodeStatus = { pending: 0, waiting: 0, ready: 0, running: 0, completed: 0, failed: 0 };
+  for (const node of dependencyNodes.values()) {
+    if (node.status in nodeStatus) nodeStatus[node.status]++;
+  }
+
+  const wfStatus = { pending: 0, running: 0, completed: 0, failed: 0 };
+  for (const wf of workflows.values()) {
+    if (wf.status in wfStatus) wfStatus[wf.status]++;
+  }
 
   return {
-    totalNodes: nodes.length,
-    byStatus: {
-      pending: nodes.filter(n => n.status === 'pending').length,
-      waiting: nodes.filter(n => n.status === 'waiting').length,
-      ready: nodes.filter(n => n.status === 'ready').length,
-      running: nodes.filter(n => n.status === 'running').length,
-      completed: nodes.filter(n => n.status === 'completed').length,
-      failed: nodes.filter(n => n.status === 'failed').length
-    },
+    totalNodes: dependencyNodes.size,
+    byStatus: nodeStatus,
     workflows: {
       total: workflows.size,
-      pending: Array.from(workflows.values()).filter(w => w.status === 'pending').length,
-      running: Array.from(workflows.values()).filter(w => w.status === 'running').length,
-      completed: Array.from(workflows.values()).filter(w => w.status === 'completed').length,
-      failed: Array.from(workflows.values()).filter(w => w.status === 'failed').length
+      ...wfStatus
     }
   };
 }
