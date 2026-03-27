@@ -25,6 +25,7 @@ import {
   markWorkerCompleted,
   markWorkerFailed,
 } from '../dependencyGraph.js';
+import { invalidateWorkersCache } from './queries.js';
 import {
   startSession as dbStartSession,
 } from '../workerOutputDb.js';
@@ -504,6 +505,7 @@ export async function restoreWorkerState(io = null) {
         }
 
         workers.set(savedWorker.id, worker);
+        invalidateWorkersCache();
         outputBuffers.set(savedWorker.id, '');
         commandQueues.set(savedWorker.id, []);
 
@@ -546,6 +548,7 @@ export async function restoreWorkerState(io = null) {
         stopPtyCapture(savedWorker.id);
         stopHealthMonitor(savedWorker.id);
         workers.delete(savedWorker.id);
+        invalidateWorkersCache();
         outputBuffers.delete(savedWorker.id);
         commandQueues.delete(savedWorker.id);
         continue; // Skip to next worker, don't abort entire restore

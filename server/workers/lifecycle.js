@@ -48,7 +48,7 @@ const READ_ONLY_TOOLS = 'Read,Glob,Grep,Bash,WebSearch,WebFetch';
 function getToolRestrictionArgs(label) {
   const { prefix } = detectWorkerType(label);
   if (prefix && READ_ONLY_ROLES.has(prefix)) {
-    console.log(`[SpawnWorker] Tool restriction (--tools): ${READ_ONLY_TOOLS} for ${label}`);
+    logger.info(`[SpawnWorker] Tool restriction (--tools): ${READ_ONLY_TOOLS} for ${label}`);
     return ['--tools', READ_ONLY_TOOLS];
   }
   return [];
@@ -81,6 +81,9 @@ import {
   registerWorkflowWorker,
 } from '../dependencyGraph.js';
 import { MAX_SYSTEM_PROMPT_LENGTH, MAX_TIMEOUT_MS } from '../validation.js';
+import { invalidateWorkersCache } from './queries.js';
+
+const logger = getLogger();
 
 /**
  * Record all worker intelligence metrics at lifecycle end (dismiss/complete/kill).
@@ -113,7 +116,7 @@ function recordWorkerIntelligenceMetrics(worker, success) {
       recordWorkerRalphSignals(worker, signalCount, template);
     }
   } catch (err) {
-    console.error('[Metrics] Failed to record worker intelligence metrics:', err.message);
+    logger.error('[Metrics] Failed to record worker intelligence metrics:', err.message);
   }
 }
 
@@ -190,6 +193,7 @@ function initializeWorker(id, config, io) {
   };
 
   workers.set(id, worker);
+  invalidateWorkersCache();
   outputBuffers.set(id, '');
   commandQueues.set(id, []);
 
@@ -205,7 +209,7 @@ function initializeWorker(id, config, io) {
       // Reject dead/error/stopped/completed parents — prevents children from being assigned to zombie parents
       const nonRunningStatuses = ['error', 'stopped', 'completed', 'awaiting_review'];
       if (nonRunningStatuses.includes(parentWorker.status)) {
-        console.warn(`[InitWorker] parentWorkerId "${parentWorkerId}" has status "${parentWorker.status}" for worker ${id} (${label}). Rejecting dead parent, setting parentWorkerId to null.`);
+        logger.warn(`[InitWorker] parentWorkerId "${parentWorkerId}" has status "${parentWorker.status}" for worker ${id} (${label}). Rejecting dead parent, setting parentWorkerId to null.`);
         worker.parentWorkerId = null;
         worker.parentLabel = null;
       } else {
@@ -221,7 +225,7 @@ function initializeWorker(id, config, io) {
       }
     } else {
       // Parent doesn't exist (already killed/dismissed) — don't silently create an orphan
-      console.warn(`[InitWorker] parentWorkerId "${parentWorkerId}" not found for worker ${id} (${label}). Setting parentWorkerId to null.`);
+      logger.warn(`[InitWorker] parentWorkerId "${parentWorkerId}" not found for worker ${id} (${label}). Setting parentWorkerId to null.`);
       worker.parentWorkerId = null;
       worker.parentLabel = null;
     }
@@ -263,11 +267,11 @@ function initializeWorker(id, config, io) {
             stdinMsg = stdinMsg.replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim();
           }
           await sendInputDirect(id, stdinMsg, 'lifecycle:stdin');
-          console.log(`Sent initial task to ${label}`);
+          logger.info(`Sent initial task to ${label}`);
         }
       }
     } catch (err) {
-      console.error(`Failed to send initial task to ${label}:`, err.message);
+      logger.error(`Failed to send initial task to ${label}:`, err.message);
     }
   }, 3000);
 
@@ -278,8 +282,8 @@ function initializeWorker(id, config, io) {
       if (w && w.ralphMode && w.status === 'running' && (!w.ralphStatus || w.ralphStatus === 'pending')) {
         const rulesLocation = worker.backend === 'gemini' ? 'GEMINI.md' : worker.backend === 'aider' ? 'initial message' : '.claude/rules/';
         const reminderMsg = `Reminder: Signal your progress via Ralph. The curl command is in your rules file (${rulesLocation}).`;
-        sendInputDirect(id, reminderMsg, 'lifecycle:ralph_reminder').catch(err => { console.warn(`[Ralph] Failed to send reminder: ${err.message}`); });
-        console.log(`[Ralph] Sent 60s reminder to ${label}`);
+        sendInputDirect(id, reminderMsg, 'lifecycle:ralph_reminder').catch(err => { logger.warn(`[Ralph] Failed to send reminder: ${err.message}`); });
+        logger.info(`[Ralph] Sent 60s reminder to ${label}`);
       }
     }, 60000);
   }
@@ -340,7 +344,7 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
     throw new Error(`Cannot spawn worker: ${resourceCheck.reason}`);
   }
   if (resourceCheck.warnings) {
-    console.warn(`[SpawnWorker] Resource warnings for ${workerLabel}: ${resourceCheck.warnings.join(", ")}`);
+    logger.warn(`[SpawnWorker] Resource warnings for ${workerLabel}: ${resourceCheck.warnings.join(", ")}`);
   }
 
   const spawnKey = `${workerLabel}::${projectName}`;
@@ -438,13 +442,13 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
     }
 
     validateSessionName(sessionName);
-    console.log(`[SpawnWorker] Creating worker ${id} with session ${sessionName}`);
+    logger.info(`[SpawnWorker] Creating worker ${id} with session ${sessionName}`);
 
     const spawnStartTime = Date.now();
 
     const ralphToken = ralphMode ? (externalRalphToken || crypto.randomBytes(16).toString('hex')) : null;
 
-    console.log(`[SpawnWorker] Writing worker rules for ${id} (backend: ${backend})${ralphToken ? ` (Ralph token: ${ralphToken.slice(0, 8)}...)` : ''}`);
+    logger.info(`[SpawnWorker] Writing worker rules for ${id} (backend: ${backend})${ralphToken ? ` (Ralph token: ${ralphToken.slice(0, 8)}...)` : ''}`);
     if (backend === 'gemini') {
       await writeGeminiContext(id, workerLabel, projectPath, ralphToken, {
         parentWorkerId,
@@ -464,7 +468,7 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
         bulldozeMode: false,
       });
     }
-    console.log(`[SpawnWorker] Rules written, now creating tmux session ${sessionName}`);
+    logger.info(`[SpawnWorker] Rules written, now creating tmux session ${sessionName}`);
 
     if (backend === 'gemini') {
       // Spawn Gemini CLI with --yolo flag for auto-approval
@@ -507,14 +511,14 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
         'claude', ...toolArgs
       ]);
     }
-    console.log(`[SpawnWorker] tmux session ${sessionName} created successfully`);
+    logger.info(`[SpawnWorker] tmux session ${sessionName} created successfully`);
     resetCircuitBreakerOnSuccess();
 
     const spawnDuration = Date.now() - spawnStartTime;
     try {
       recordWorkerSpawn(id, spawnDuration, { project: projectName, label: workerLabel });
     } catch (metricsErr) {
-      console.error(`[SpawnWorker] Metrics recording failed (non-fatal): ${metricsErr.message}`);
+      logger.error(`[SpawnWorker] Metrics recording failed (non-fatal): ${metricsErr.message}`);
     }
 
     const worker = initializeWorker(id, {
@@ -547,7 +551,7 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
 
     if (!workers.has(id)) {
       incrementCircuitBreaker();
-      console.error(`[CircuitBreaker] Tmux spawn failure`);
+      logger.error(`[CircuitBreaker] Tmux spawn failure`);
     }
 
     markWorkerFailed(id);
@@ -557,6 +561,7 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
       stopPtyCapture(id);
       stopHealthMonitor(id);
       workers.delete(id);
+      invalidateWorkersCache();
       outputBuffers.delete(id);
       commandQueues.delete(id);
       sessionFailCounts.delete(id);
@@ -589,14 +594,14 @@ async function startPendingWorker(workerId, io = null) {
   if (!pending) return null;
 
   if (!canWorkerStart(workerId)) {
-    console.log(`[StartPending] Worker ${workerId} (${pending.label}) cannot start`);
+    logger.info(`[StartPending] Worker ${workerId} (${pending.label}) cannot start`);
     pendingWorkers.delete(workerId);
     return null;
   }
 
   const runningWorkers = Array.from(workers.values()).filter(w => w.status === 'running');
   if (runningWorkers.length + inFlightSpawns.size >= MAX_CONCURRENT_WORKERS) {
-    console.warn(`[StartPending] Worker ${workerId} (${pending.label}) blocked — at limit`);
+    logger.warn(`[StartPending] Worker ${workerId} (${pending.label}) blocked — at limit`);
     pendingWorkers.set(workerId, pending);
     return null;
   }
@@ -700,6 +705,7 @@ async function startPendingWorker(workerId, io = null) {
       stopPtyCapture(workerId);
       stopHealthMonitor(workerId);
       workers.delete(workerId);
+      invalidateWorkersCache();
       outputBuffers.delete(workerId);
       commandQueues.delete(workerId);
       sessionFailCounts.delete(workerId);
@@ -761,7 +767,7 @@ async function teardownWorker(workerId, worker, io, { activityMessage, logPrefix
     const failedDependents = markWorkerFailed(workerId);
     for (const depId of failedDependents) {
       if (pendingWorkers.has(depId)) {
-        console.log(`[${logPrefix}] Removing orphaned pending worker ${depId}`);
+        logger.info(`[${logPrefix}] Removing orphaned pending worker ${depId}`);
         pendingWorkers.delete(depId);
       }
     }
@@ -790,6 +796,7 @@ async function teardownWorker(workerId, worker, io, { activityMessage, logPrefix
 
   worker.status = 'stopped';
   workers.delete(workerId);
+  invalidateWorkersCache();
   outputBuffers.delete(workerId);
   commandQueues.delete(workerId);
   sessionFailCounts.delete(workerId);
@@ -810,7 +817,7 @@ async function teardownWorker(workerId, worker, io, { activityMessage, logPrefix
     try { await fs.unlink(bulldozeStatePath); } catch { /* ENOENT is fine */ }
   }
 
-  console.log(`[${logPrefix}] Worker ${workerId} cleanup complete`);
+  logger.info(`[${logPrefix}] Worker ${workerId} cleanup complete`);
 
   const activity = addActivity('worker_stopped', workerId, worker.label, worker.project,
     activityMessage || `Stopped worker "${worker.label}"`);
@@ -836,7 +843,7 @@ export async function cleanupWorker(workerId, io) {
   addRespawnSuggestion(workerId, worker);
 
   if (isProtectedWorker(worker)) {
-    console.error(`[CleanupWorker] BLOCKED: Refusing to cleanup protected worker ${workerId} (${worker.label}).`);
+    logger.error(`[CleanupWorker] BLOCKED: Refusing to cleanup protected worker ${workerId} (${worker.label}).`);
     if (io) {
       io.emit('worker:kill:blocked', { workerId, label: worker.label, reason: 'protected_tier_cleanup' });
     }
@@ -853,12 +860,12 @@ export async function killWorker(workerId, io = null, options = {}) {
   const worker = workers.get(workerId);
 
   if (!worker) {
-    console.log(`[KillWorker] Worker ${workerId} already removed — skipping (idempotent)`);
+    logger.info(`[KillWorker] Worker ${workerId} already removed — skipping (idempotent)`);
     return;
   }
 
   if (worker.beingCleanedUp) {
-    console.log(`[KillWorker] Worker ${workerId} already being cleaned up — skipping (idempotent)`);
+    logger.info(`[KillWorker] Worker ${workerId} already being cleaned up — skipping (idempotent)`);
     return;
   }
   worker.beingCleanedUp = true;
@@ -869,7 +876,7 @@ export async function killWorker(workerId, io = null, options = {}) {
 
     if (options.callerWorkerId === workerId) {
       worker.beingCleanedUp = false;
-      console.error(`[KillWorker] BLOCKED: Worker ${options.callerWorkerId} attempted to kill itself.`);
+      logger.error(`[KillWorker] BLOCKED: Worker ${options.callerWorkerId} attempted to kill itself.`);
       try { getLogger().error('Kill blocked: self-kill attempt', { callerWorkerId: options.callerWorkerId, targetWorkerId: workerId }); } catch { /* best effort */ }
       if (io) {
         io.emit('worker:kill:blocked', { workerId, callerWorkerId: options.callerWorkerId, reason: 'self_kill' });
@@ -892,7 +899,7 @@ export async function killWorker(workerId, io = null, options = {}) {
     if (!isAncestor) {
       worker.beingCleanedUp = false;
       const callerLabel = caller?.label || 'unknown';
-      console.error(`[KillWorker] BLOCKED: Worker ${options.callerWorkerId} (${callerLabel}) attempted to kill non-descendant ${workerId} (${worker.label}).`);
+      logger.error(`[KillWorker] BLOCKED: Worker ${options.callerWorkerId} (${callerLabel}) attempted to kill non-descendant ${workerId} (${worker.label}).`);
       try { getLogger().error('Kill blocked: not a descendant', { callerWorkerId: options.callerWorkerId, callerLabel, targetWorkerId: workerId, targetLabel: worker.label }); } catch { /* best effort */ }
       if (io) {
         io.emit('worker:kill:blocked', {
@@ -906,20 +913,20 @@ export async function killWorker(workerId, io = null, options = {}) {
       throw new Error(`Worker "${callerLabel}" cannot kill "${worker.label}" — not a descendant.`);
     }
 
-    console.log(`[KillWorker] Hierarchy validated: ${options.callerWorkerId} is ancestor of ${workerId}`);
+    logger.info(`[KillWorker] Hierarchy validated: ${options.callerWorkerId} is ancestor of ${workerId}`);
   }
 
   // GENERAL protection
   if (isProtectedWorker(worker) && !options.force) {
     worker.beingCleanedUp = false;
-    console.error(`[KillWorker] BLOCKED: Refusing to kill protected worker ${workerId} (${worker.label}).`);
+    logger.error(`[KillWorker] BLOCKED: Refusing to kill protected worker ${workerId} (${worker.label}).`);
     if (io) {
       io.emit('worker:kill:blocked', { workerId, label: worker.label, reason: 'protected_tier' });
     }
     throw new Error(`Cannot kill GENERAL-tier worker "${worker.label}" without force flag.`);
   }
 
-  console.log(`[KillWorker] Killing worker ${workerId} (${worker.label})`);
+  logger.info(`[KillWorker] Killing worker ${workerId} (${worker.label})`);
   try {
     getLogger().warn('Worker killed', {
       workerId, label: worker.label, project: worker.project,
@@ -936,20 +943,20 @@ export async function killWorker(workerId, io = null, options = {}) {
   try {
     validateSessionName(worker.tmuxSession);
   } catch (validationError) {
-    console.error(`[KillWorker] Invalid session name: ${validationError.message}`);
+    logger.error(`[KillWorker] Invalid session name: ${validationError.message}`);
     throw new Error(`Invalid worker session name`);
   }
 
   try {
     const result = await spawnTmux(['kill-session', '-t', worker.tmuxSession]);
-    console.log(`[KillWorker] Tmux kill-session result:`, result);
+    logger.info(`[KillWorker] Tmux kill-session result:`, result);
   } catch (error) {
-    console.log(`[KillWorker] Tmux kill-session failed (may already be gone):`, error.message);
+    logger.info(`[KillWorker] Tmux kill-session failed (may already be gone):`, error.message);
   }
 
   const stillExists = await sessionExists(worker.tmuxSession);
   if (stillExists) {
-    console.warn(`[KillWorker] Session still exists, force killing...`);
+    logger.warn(`[KillWorker] Session still exists, force killing...`);
     try {
       await spawnTmux(['kill-session', '-t', worker.tmuxSession]);
     } catch {
@@ -974,12 +981,12 @@ export async function killWorker(workerId, io = null, options = {}) {
         if (!grandparent.childWorkerIds.includes(childId)) {
           grandparent.childWorkerIds.push(childId);
         }
-        console.log(`[KillWorker] Re-parented orphan ${childId} (${child.label}) to grandparent ${grandparentId} (${grandparent.label})`);
+        logger.info(`[KillWorker] Re-parented orphan ${childId} (${child.label}) to grandparent ${grandparentId} (${grandparent.label})`);
       } else {
         // No grandparent — child becomes a root worker
         child.parentWorkerId = null;
         child.parentLabel = null;
-        console.warn(`[KillWorker] Orphaned child ${childId} (${child.label}) — no grandparent available, now a root worker`);
+        logger.warn(`[KillWorker] Orphaned child ${childId} (${child.label}) — no grandparent available, now a root worker`);
       }
     }
     // Clear the dying parent's child list (children have been re-parented)
@@ -1011,13 +1018,13 @@ export async function dismissWorker(workerId, io = null) {
     });
     if (stdout.trim()) {
       uncommittedWarning = `Worker had uncommitted changes:\n${stdout.trim()}`;
-      console.warn(`[Dismiss] Worker ${workerId} (${worker.label}) has uncommitted changes: ${stdout.trim()}`);
+      logger.warn(`[Dismiss] Worker ${workerId} (${worker.label}) has uncommitted changes: ${stdout.trim()}`);
     }
   } catch (e) {
     // Best effort
   }
 
-  console.log(`[Dismiss] Dismissing worker ${workerId} (${worker.label})`);
+  logger.info(`[Dismiss] Dismissing worker ${workerId} (${worker.label})`);
   recordWorkerIntelligenceMetrics(worker, true);
   await killWorker(workerId, io, { reason: 'dismissed', force: true });
 
@@ -1038,7 +1045,7 @@ export async function completeWorker(workerId, io = null, options = {}) {
 
   const COMPLETABLE_STATUSES = ['running', 'error', 'awaiting_review'];
   if (!COMPLETABLE_STATUSES.includes(worker.status)) {
-    console.warn(`[CompleteWorker] Worker ${workerId} (${worker.label}) has status "${worker.status}" — not completable, skipping`);
+    logger.warn(`[CompleteWorker] Worker ${workerId} (${worker.label}) has status "${worker.status}" — not completable, skipping`);
     return { worker: normalizeWorker(worker), triggeredWorkers: [], onCompleteAction: null };
   }
 
@@ -1065,7 +1072,7 @@ export async function completeWorker(workerId, io = null, options = {}) {
         startedWorkers.push(started);
       }
     } catch (error) {
-      console.error(`Failed to start triggered worker ${triggeredId}:`, error.message);
+      logger.error(`Failed to start triggered worker ${triggeredId}:`, error.message);
     }
   }
 
@@ -1087,16 +1094,16 @@ export async function completeWorker(workerId, io = null, options = {}) {
         const currentWorker = workers.get(workerId);
         if (currentWorker && currentWorker.status === 'completed' && !currentWorker.beingCleanedUp) {
           currentWorker.beingCleanedUp = true;
-          console.log(`[AutoCleanup] Cleaning up completed worker ${workerId} (${worker.label})`);
+          logger.info(`[AutoCleanup] Cleaning up completed worker ${workerId} (${worker.label})`);
           await killWorker(workerId, io);
         }
       } catch (error) {
-        console.error(`[AutoCleanup] Failed to cleanup worker ${workerId}:`, error.message);
+        logger.error(`[AutoCleanup] Failed to cleanup worker ${workerId}:`, error.message);
       }
     }, AUTO_CLEANUP_DELAY_MS);
     autoCleanupTimers.set(workerId, timerId);
   } else if (autoCleanup && isProtectedWorker(worker)) {
-    console.warn(`[AutoCleanup] Skipping auto-cleanup for GENERAL worker ${workerId} (${worker.label}).`);
+    logger.warn(`[AutoCleanup] Skipping auto-cleanup for GENERAL worker ${workerId} (${worker.label}).`);
   }
 
   return {
@@ -1114,7 +1121,7 @@ async function handleOnCompleteAction(action, completedWorkerId, io) {
       if (action.config && action.config.projectPath) {
         const spawnPath = path.resolve(String(action.config.projectPath));
         if (!spawnPath.startsWith(THEA_ROOT) || spawnPath.includes('\0') || spawnPath.includes('..')) {
-          console.warn(`[onComplete] Blocked spawn with path outside allowed root: ${spawnPath}`);
+          logger.warn(`[onComplete] Blocked spawn with path outside allowed root: ${spawnPath}`);
           break;
         }
         try {
@@ -1125,7 +1132,7 @@ async function handleOnCompleteAction(action, completedWorkerId, io) {
             action.config.options || {}
           );
         } catch (error) {
-          console.error('onComplete spawn failed:', error.message);
+          logger.error('onComplete spawn failed:', error.message);
         }
       }
       break;
@@ -1135,7 +1142,7 @@ async function handleOnCompleteAction(action, completedWorkerId, io) {
         try {
           const webhookUrl = new URL(String(action.config.url));
           if (webhookUrl.protocol !== 'http:' && webhookUrl.protocol !== 'https:') {
-            console.warn(`[onComplete] Blocked webhook with disallowed protocol: ${webhookUrl.protocol}`);
+            logger.warn(`[onComplete] Blocked webhook with disallowed protocol: ${webhookUrl.protocol}`);
             break;
           }
           const rawHostname = webhookUrl.hostname.toLowerCase();
@@ -1157,12 +1164,12 @@ async function handleOnCompleteAction(action, completedWorkerId, io) {
             '::ffff:192.168.', '::ffff:127.', '::ffff:0.',
           ];
           if (BLOCKED_HOSTS.includes(hostname) || BLOCKED_PREFIXES.some(p => hostname.startsWith(p))) {
-            console.warn(`[onComplete] Blocked webhook to internal/private host: ${hostname}`);
+            logger.warn(`[onComplete] Blocked webhook to internal/private host: ${hostname}`);
             break;
           }
           const method = (action.config.method || 'POST').toUpperCase();
           if (method !== 'POST' && method !== 'PUT') {
-            console.warn(`[onComplete] Blocked webhook with disallowed method: ${method}`);
+            logger.warn(`[onComplete] Blocked webhook with disallowed method: ${method}`);
             break;
           }
           const response = await fetch(webhookUrl.toString(), {
@@ -1178,9 +1185,9 @@ async function handleOnCompleteAction(action, completedWorkerId, io) {
             }),
             signal: AbortSignal.timeout(10000)
           });
-          console.log(`Webhook ${webhookUrl.hostname} returned ${response.status}`);
+          logger.info(`Webhook ${webhookUrl.hostname} returned ${response.status}`);
         } catch (error) {
-          console.error('onComplete webhook failed:', error.message);
+          logger.error('onComplete webhook failed:', error.message);
         }
       }
       break;
@@ -1191,7 +1198,7 @@ async function handleOnCompleteAction(action, completedWorkerId, io) {
         const eventName = String(action.config.event);
         const isAllowed = ALLOWED_EVENT_PREFIXES.some(p => eventName.startsWith(p));
         if (!isAllowed) {
-          console.warn(`[onComplete] Blocked emit of disallowed event: ${eventName}`);
+          logger.warn(`[onComplete] Blocked emit of disallowed event: ${eventName}`);
           break;
         }
         const SENSITIVE_KEYS = ['ralphToken', 'apiKey', 'password', 'secret', 'token', 'credential'];
@@ -1214,7 +1221,7 @@ async function handleOnCompleteAction(action, completedWorkerId, io) {
       break;
 
     default:
-      console.warn(`Unknown onComplete action type: ${action.type}`);
+      logger.warn(`Unknown onComplete action type: ${action.type}`);
   }
 }
 
@@ -1237,7 +1244,7 @@ export function updateWorkerLabel(workerId, newLabel, io = null) {
   }
 
   import('./persistence.js').then(({ saveWorkerState }) => {
-    saveWorkerState().catch(err => console.error(`[UpdateLabel] State save failed: ${err.message}`));
+    saveWorkerState().catch(err => logger.error(`[UpdateLabel] State save failed: ${err.message}`));
   });
 
   return normalizeWorker(worker);
@@ -1262,10 +1269,10 @@ export async function resizeWorkerTerminal(workerId, cols, rows, io = null) {
     validateSessionName(worker.tmuxSession);
     await spawnTmux(['resize-window', '-t', worker.tmuxSession, '-x', String(cols), '-y', String(rows)]);
     await spawnTmux(['send-keys', '-t', worker.tmuxSession, 'C-l']);
-    console.log(`Resized ${worker.label} to ${cols}x${rows}`);
+    logger.info(`Resized ${worker.label} to ${cols}x${rows}`);
     return { cols, rows };
   } catch (error) {
-    console.error(`Failed to resize ${worker.label}:`, error.message);
+    logger.error(`Failed to resize ${worker.label}:`, error.message);
     throw error;
   }
 }
@@ -1304,7 +1311,7 @@ export async function discoverExistingWorkers(io = null) {
       try {
         validateSessionName(sessionName);
       } catch {
-        console.warn(`[Discover] Skipping session with invalid name: ${sessionName}`);
+        logger.warn(`[Discover] Skipping session with invalid name: ${sessionName}`);
         continue;
       }
 
@@ -1320,7 +1327,7 @@ export async function discoverExistingWorkers(io = null) {
         if (resolvedDir.startsWith(THEA_ROOT)) {
           workingDir = resolvedDir;
         } else {
-          console.warn(`[Discover] Session ${sessionName} has workingDir outside thea root (${resolvedDir}), using default`);
+          logger.warn(`[Discover] Session ${sessionName} has workingDir outside thea root (${resolvedDir}), using default`);
         }
       } catch {
         // Use default
@@ -1396,7 +1403,7 @@ export async function discoverExistingWorkers(io = null) {
     const { getWorkers } = await import('../workerManager.js');
     return getWorkers();
   } catch (err) {
-    console.warn('[DiscoverWorkers] Error discovering existing workers:', err.message);
+    logger.warn('[DiscoverWorkers] Error discovering existing workers:', err.message);
     return [];
   }
 }

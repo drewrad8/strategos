@@ -166,6 +166,8 @@ export const AUTO_ACCEPT_PAUSE_KEYWORDS = [
   'ExitPlanMode',
   'AskUserQuestion',
   'EnterPlanMode',
+  'How is Claude doing this session?',
+  'Give feedback',
 ];
 
 // ============================================

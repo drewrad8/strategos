@@ -16,18 +16,25 @@ import {
 // ============================================
 
 let _cachedWorkers = null;
-let _cacheTime = 0;
-const CACHE_TTL_MS = 1000;
+let _cacheVersion = 0;
+let _cachedAtVersion = -1;
+
+/**
+ * Increment the cache version to invalidate the workers cache.
+ * Call this on any worker Map mutation (set, delete, clear).
+ */
+export function invalidateWorkersCache() {
+  _cacheVersion++;
+}
 
 export function getWorkers() {
-  const now = Date.now();
-  if (_cachedWorkers && (now - _cacheTime < CACHE_TTL_MS)) {
+  if (_cachedWorkers && _cachedAtVersion === _cacheVersion) {
     return _cachedWorkers;
   }
   const active = Array.from(workers.values()).map(normalizeWorker);
   const pending = getPendingWorkers();
   _cachedWorkers = [...active, ...pending];
-  _cacheTime = now;
+  _cachedAtVersion = _cacheVersion;
   return _cachedWorkers;
 }
 

@@ -618,6 +618,7 @@ let _startupCleanupTimer = setTimeout(() => {
   // Enforce size limit
   enforceDbSizeLimit();
 }, 5000);
+if (_startupCleanupTimer.unref) _startupCleanupTimer.unref();
 
 // Schedule periodic cleanup (every 30 minutes instead of 6 hours)
 let _periodicCleanupInterval = setInterval(() => {
