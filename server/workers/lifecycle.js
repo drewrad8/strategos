@@ -206,12 +206,22 @@ function initializeWorker(id, config, io) {
   if (parentWorkerId) {
     const parentWorker = workers.get(parentWorkerId);
     if (parentWorker) {
-      // Reject dead/error/stopped/completed parents — prevents children from being assigned to zombie parents
-      const nonRunningStatuses = ['error', 'stopped', 'completed', 'awaiting_review'];
-      if (nonRunningStatuses.includes(parentWorker.status)) {
+      // Reject truly dead parents — prevents children from being assigned to zombie parents
+      const deadStatuses = ['error', 'stopped', 'completed'];
+      if (deadStatuses.includes(parentWorker.status)) {
         logger.warn(`[InitWorker] parentWorkerId "${parentWorkerId}" has status "${parentWorker.status}" for worker ${id} (${label}). Rejecting dead parent, setting parentWorkerId to null.`);
         worker.parentWorkerId = null;
         worker.parentLabel = null;
+      } else if (parentWorker.status === 'awaiting_review') {
+        // Parent signaled done but is spawning a child — clearly active again. Revert to running.
+        import('./ralph.js').then(({ revertFromDone }) => revertFromDone(parentWorkerId, io, `child_spawn:${id}`)).catch(() => {});
+        parentWorker.childWorkerIds = parentWorker.childWorkerIds || [];
+        if (!parentWorker.childWorkerIds.includes(id)) {
+          parentWorker.childWorkerIds.push(id);
+        }
+        if (parentWorker.delegationMetrics) {
+          parentWorker.delegationMetrics.spawnsIssued++;
+        }
       } else {
         parentWorker.childWorkerIds = parentWorker.childWorkerIds || [];
         // Idempotent push: prevent duplicate child IDs (e.g. from retry/re-register)
@@ -273,7 +283,7 @@ function initializeWorker(id, config, io) {
     } catch (err) {
       logger.error(`Failed to send initial task to ${label}:`, err.message);
     }
-  }, 3000);
+  }, 1500);
 
   // Ralph adoption reminder
   if (ralphMode && ralphToken) {

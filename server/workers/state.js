@@ -63,7 +63,7 @@ export const MAX_RESPAWN_SUGGESTIONS = 20;
 
 // Auto-dismiss timers for workers that signal done
 export const autoDismissTimers = new Map();
-export const AUTO_DISMISS_DELAY_MS = 5 * 60 * 1000; // 5 minutes
+export const AUTO_DISMISS_DELAY_MS = 90 * 1000; // 90 seconds
 
 // Per-worker send lock
 export const _sendingInput = new Set();

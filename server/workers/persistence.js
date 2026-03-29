@@ -195,6 +195,8 @@ function serializeWorker(w) {
     delegationMetrics: w.delegationMetrics ?? null,
     autoContinue: w.autoContinue ?? true,
     autoContinueCount: w.autoContinueCount ?? 0,
+    autoDismissAfterDone: w.autoDismissAfterDone ?? true,
+    taskReceivedAt: w.taskReceivedAt ?? null,
   };
 }
 
@@ -493,6 +495,10 @@ export async function restoreWorkerState(io = null) {
         _autoContinueExhausted: false,
         rateLimited: false,
         rateLimitResetAt: null,
+        // Auto-dismiss after done
+        autoDismissAfterDone: savedWorker.autoDismissAfterDone !== false, // default true
+        // Task received timestamp
+        taskReceivedAt: savedWorker.taskReceivedAt ? new Date(savedWorker.taskReceivedAt) : null,
       };
 
       // Per-worker try-catch: if one worker fails to initialize, continue restoring others

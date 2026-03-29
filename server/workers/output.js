@@ -159,6 +159,82 @@ function isSessionEnded(lastOutput) {
   return SESSION_END_PATTERNS.some(p => p.test(tail));
 }
 
+// Session recovery rate-limit: max 3 recoveries per 30 minutes per worker
+const SESSION_RECOVERY_MAX = 3;
+const SESSION_RECOVERY_WINDOW_MS = 30 * 60 * 1000;
+
+/**
+ * Attempt to auto-recover a session-ended worker (bulldoze or forcedAutonomy).
+ * Dismisses the Claude feedback survey, resets state, and sends a recovery prompt.
+ * Returns true if recovery was initiated, false if rate-limited or ineligible.
+ */
+async function trySessionRecovery(workerId, io) {
+  const worker = workers.get(workerId);
+  if (!worker) return false;
+  if (!worker.bulldozeMode && !worker.forcedAutonomy) return false;
+  if (worker._sessionRecoverySuppressed) return false;
+
+  // Rate-limit check
+  if (!worker._sessionRecoveryTimestamps) worker._sessionRecoveryTimestamps = [];
+  const now = Date.now();
+  worker._sessionRecoveryTimestamps = worker._sessionRecoveryTimestamps.filter(
+    ts => now - ts < SESSION_RECOVERY_WINDOW_MS
+  );
+
+  if (worker._sessionRecoveryTimestamps.length >= SESSION_RECOVERY_MAX) {
+    worker._sessionRecoverySuppressed = true;
+    logger.warn(`[SessionRecovery] Worker ${workerId} (${worker.label}) hit recovery rate limit (${SESSION_RECOVERY_MAX}/${SESSION_RECOVERY_WINDOW_MS / 60000}min) — suppressing further recoveries`);
+    if (io) {
+      io.emit('worker:session-recovery-exhausted', { workerId, label: worker.label });
+    }
+    return false;
+  }
+
+  worker._sessionRecoveryTimestamps.push(now);
+  worker._sessionRecoveryCount = (worker._sessionRecoveryCount || 0) + 1;
+  const attempt = worker._sessionRecoveryCount;
+
+  logger.info(`[SessionRecovery] Worker ${workerId} (${worker.label}) session ended, auto-recovering (attempt ${attempt})`);
+
+  try {
+    // Dismiss the Claude feedback survey by sending "0"
+    await sendInputDirect(workerId, '0', 'session_recovery');
+    await new Promise(resolve => setTimeout(resolve, 500));
+
+    // Reset session-ended state
+    worker._sessionEnded = false;
+
+    // Reset bulldoze state if applicable
+    if (worker.bulldozeMode) {
+      worker.bulldozePaused = false;
+      worker.bulldozePauseReason = null;
+      worker.bulldozeIdleCount = 0;
+    }
+
+    // Reset forced autonomy state if applicable
+    if (worker.forcedAutonomy) {
+      worker._forcedAutonomySuppressed = false;
+      worker._forcedAutonomyIdleCount = 0;
+      worker._forcedAutonomyNudgeCount = 0;
+    }
+
+    // Send recovery prompt
+    const recoveryPrompt = `Your previous session ended due to context exhaustion. You are in autonomous mode. Check your bulldoze state file if you have one (tmp/bulldoze-state-${workerId}.md), assess what was in progress, and continue working. Signal Ralph with your current status.`;
+    await sendInput(workerId, recoveryPrompt, io, { source: 'session_recovery' });
+
+    // Emit socket event for UI awareness
+    if (io) {
+      io.emit('worker:session-recovered', { workerId, label: worker.label, recoveryCount: attempt });
+      io.emit('worker:updated', normalizeWorker(worker));
+    }
+
+    return true;
+  } catch (err) {
+    logger.error(`[SessionRecovery] Failed to recover worker ${workerId}: ${err.message}`);
+    return false;
+  }
+}
+
 
 // ============================================
 // GENERAL ROLE-VIOLATION DETECTION (SENTINEL)
@@ -596,6 +672,10 @@ async function captureWorkerOutput(workerId, instance, io) {
           if (isAtIdlePrompt && !isActivelyWorking) {
             const msg = generateAutonomyNudge(worker);
             logger.info(`[ForcedAutonomy] Nudge #${worker._forcedAutonomyNudgeCount} for ${worker.label} (${workerId}), next in ${Math.min(currentThreshold * 2, FORCED_AUTONOMY_MAX_THRESHOLD) * 5}s`);
+            // Revert from done if nudging an awaiting_review worker back to activity
+            if (worker.status === 'awaiting_review') {
+              import('./ralph.js').then(({ revertFromDone }) => revertFromDone(workerId, io, 'forced_autonomy_nudge')).catch(() => {});
+            }
             withTmuxLock(workerId, async () => {
               await safeSendKeys(worker.tmuxSession, [msg, 'Enter']);
             }).catch(err => logger.error(`[ForcedAutonomy] Idle push failed for ${worker.label}: ${err.message}`));
@@ -659,6 +739,11 @@ async function captureWorkerOutput(workerId, instance, io) {
         if (!worker._sessionEnded) {
           logger.warn(`[DoneLoop] Session ended detected for ${worker.label} (${workerId})`);
           worker._sessionEnded = true;
+          // Attempt auto-recovery if not already suppressed
+          if (!worker._sessionRecoverySuppressed) {
+            trySessionRecovery(workerId, io).catch(err =>
+              logger.error(`[SessionRecovery] Recovery attempt failed for ${workerId}: ${err.message}`));
+          }
         }
       }
       // Was a nudge recently sent? If so, check if this output is a done response
@@ -988,7 +1073,7 @@ async function handleAutoAcceptCheck(workerId, output, io) {
       if (w && w.autoAccept) {
         w.lastAutoAcceptHash = null;
       }
-    }, 6000);
+    }, 3000);
   } catch (error) {
     logger.error(`[AutoAccept] Failed to send keys for ${worker.label}:`, error.message);
   }
@@ -1008,15 +1093,17 @@ function shouldContinueForcedAutonomy(workerId) {
   // Allow running and awaiting_review (done workers with explicit forcedAutonomy get nudged)
   if (worker.status !== 'running' && worker.status !== 'awaiting_review') return false;
   if (worker.health === 'crashed' || worker.health === 'dead') return false;
-
   // Don't nudge blocked/suppressed workers
   // Note: done/awaiting_review workers ARE nudged if forcedAutonomy was explicitly enabled
   // (Commander override). Auto-suppress flag handles the "finished naturally" case.
   if (worker.ralphStatus === 'blocked') return false;
   if (worker._forcedAutonomySuppressed) return false;
 
-  // Don't nudge session-ended workers
+  // Don't nudge session-ended workers (unless recovery is in progress)
   if (worker._sessionEnded) return false;
+
+  // Don't nudge if session recovery exhausted rate limit
+  if (worker._sessionRecoverySuppressed) return false;
 
   // Don't nudge if worker keeps saying "done" — consecutive done-response loop detection
   if ((worker._consecutiveDoneResponses || 0) >= 2) {
@@ -1092,11 +1179,13 @@ function generateAutonomyNudge(worker) {
 function shouldContinueBulldoze(workerId) {
   const worker = workers.get(workerId);
   if (!worker || !worker.bulldozeMode || worker.bulldozePaused) return false;
-  if (worker.status !== 'running') return false;
+  if (worker.status !== 'running' && worker.status !== 'awaiting_review') return false;
   if (worker.health === 'crashed' || worker.health === 'dead') return false;
-
   // Don't bulldoze session-ended workers
   if (worker._sessionEnded) return false;
+
+  // Don't bulldoze if session recovery exhausted rate limit
+  if (worker._sessionRecoverySuppressed) return false;
 
   // Consecutive done-response loop detection
   if ((worker._consecutiveDoneResponses || 0) >= 2) {
@@ -1451,9 +1540,7 @@ export function updateWorkerSettings(workerId, settings, io = null) {
     if (settings.bulldozeMode) {
       // If worker is in awaiting_review, revert to running so bulldoze can operate
       if (worker.status === 'awaiting_review') {
-        worker.status = 'running';
-        worker.awaitingReviewAt = null;
-        logger.info(`[Bulldoze] ${worker.label} reverted from awaiting_review → running (bulldoze enabled)`);
+        import('./ralph.js').then(({ revertFromDone }) => revertFromDone(workerId, io, 'bulldoze_enabled')).catch(() => {});
       }
       worker.bulldozeStartedAt = new Date();
       worker.bulldozePaused = false;
@@ -1555,26 +1642,14 @@ export async function sendInput(workerId, input, io = null, { fromWorkerId, sour
     throw new Error(`Worker ${workerId} not found`);
   }
 
-  // Cancel auto-dismiss timer when worker receives new input (lazy import to avoid circular dep)
-  import('./ralph.js').then(({ cancelAutoDismissTimer }) => cancelAutoDismissTimer(workerId)).catch(() => {});
-
-  const isWorkerInput = fromWorkerId && workers.has(fromWorkerId);
-  if (worker.bulldozeMode && !worker.bulldozePaused && !isWorkerInput &&
-      typeof input === 'string' && !input.startsWith(BULLDOZE_CONTINUATION_PREFIX)) {
-    worker.bulldozePaused = true;
-    worker.bulldozePauseReason = 'human_input';
-    worker.bulldozeIdleCount = 0;
-    logger.info(`[Bulldoze] ${worker.label} auto-paused: human input detected`);
-    if (io) {
-      io.emit('worker:updated', normalizeWorker(worker));
-      io.emit('worker:bulldoze:paused', {
-        workerId,
-        reason: 'human_input',
-        cyclesCompleted: worker.bulldozeCyclesCompleted || 0
-      });
-    }
-    const { saveWorkerState } = await import('./persistence.js');
-    saveWorkerState().catch(err => logger.error(`[Bulldoze] State save failed: ${err.message}`));
+  // If worker is in awaiting_review and input is from a non-system source, revert to running
+  const systemSources = new Set(['health', 'stall_check', 'auto_continue', 'session_recovery', 'ralph:result_delivery']);
+  const effectiveSource = source || (fromWorkerId ? `worker:${fromWorkerId}` : 'unknown');
+  if (worker.status === 'awaiting_review' && !systemSources.has(effectiveSource)) {
+    import('./ralph.js').then(({ revertFromDone }) => revertFromDone(workerId, io, `sendInput:${effectiveSource}`)).catch(() => {});
+  } else {
+    // Cancel auto-dismiss timer for any input (lazy import to avoid circular dep)
+    import('./ralph.js').then(({ cancelAutoDismissTimer }) => cancelAutoDismissTimer(workerId)).catch(() => {});
   }
 
   // --- Input Audit Log ---
