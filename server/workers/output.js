@@ -1415,7 +1415,8 @@ async function handleBulldozeContinuation(workerId, io) {
 
     if (newCommits === 0) {
       worker._bulldozeNoCommitCycles = (worker._bulldozeNoCommitCycles || 0) + 1;
-      if (worker._bulldozeNoCommitCycles >= 5) {
+      // GENERALs delegate — they don't commit code, their children do. Skip no_commits pause.
+      if (!isProtectedWorker(worker) && worker._bulldozeNoCommitCycles >= 5) {
         logger.warn(`[Bulldoze] Worker ${workerId} stalled — ${worker._bulldozeNoCommitCycles} cycles without commits, auto-pausing`);
         worker.bulldozePaused = true;
         worker.bulldozePauseReason = 'no_commits';
@@ -1428,7 +1429,7 @@ async function handleBulldozeContinuation(workerId, io) {
           });
         }
         return;
-      } else if (worker._bulldozeNoCommitCycles >= 3) {
+      } else if (!isProtectedWorker(worker) && worker._bulldozeNoCommitCycles >= 3) {
         logger.warn(`[Bulldoze] Worker ${workerId} has gone ${worker._bulldozeNoCommitCycles} cycles without commits — possible stall`);
       }
     } else {
