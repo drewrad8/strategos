@@ -617,7 +617,7 @@ async function captureWorkerOutput(workerId, instance, io) {
 
     if (!outputChanged) {
       // Bulldoze continuation (existing)
-      if (worker && worker.bulldozeMode && !worker.bulldozePaused && worker.status === 'running') {
+      if (worker && worker.bulldozeMode && !worker.bulldozePaused && (worker.status === 'running' || worker.status === 'awaiting_review')) {
         worker.bulldozeIdleCount = (worker.bulldozeIdleCount || 0) + 1;
 
         if (worker.bulldozeIdleCount >= BULLDOZE_IDLE_THRESHOLD) {
