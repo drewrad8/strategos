@@ -166,21 +166,19 @@ async function checkWorkerHealth(workerId, io) {
 
   if (!crashDetected) {
     const timeSinceOutput = Date.now() - new Date(worker.lastOutput).getTime();
-    const outputStalled = timeSinceOutput > 10 * 60 * 1000;
+    const outputStalled = timeSinceOutput > 5 * 60 * 1000;
 
     // Determine if Ralph is recently active (within 30 min)
     const ralphRecentlyActive = worker.lastRalphSignalAt &&
       (Date.now() - new Date(worker.lastRalphSignalAt).getTime()) < 30 * 60 * 1000;
 
-    if (!outputStalled) {
-      worker.health = 'healthy';
-      // Reset graduated stall recovery flags when healthy
-      worker._stallNudged = false;
-      worker._stallWarningNudged = false;
-      worker._stallAutoKilled = false;
-      worker._stallCommanderNotified = false;
-    } else if (ralphRecentlyActive) {
-      // Output stalled but Ralph recently signaled — worker is alive, just no terminal output
+    // GENERALs with no active children are legitimately idle (awaiting Commander orders).
+    // Exempt them from stall detection entirely — they have nothing to monitor.
+    const isIdleGeneral = isProtectedWorker(worker) && !([...workers.values()].some(
+      w => w.parentWorkerId === workerId && w.status === 'running'
+    ));
+
+    if (!outputStalled || ralphRecentlyActive || isIdleGeneral) {
       worker.health = 'healthy';
       // Reset graduated stall recovery flags when healthy
       worker._stallNudged = false;
@@ -200,14 +198,8 @@ async function checkWorkerHealth(workerId, io) {
 
       // === Graduated stall recovery ===
 
-      // GENERALs with no active children are legitimately idle (awaiting Commander orders).
-      // Skip 10/20-min nudges for them — they have nothing to monitor.
-      const isIdleGeneral = isProtectedWorker(worker) && !([...workers.values()].some(
-        w => w.parentWorkerId === workerId && w.status === 'running'
-      ));
-
-      if (stalledMinutes >= 30 && !isProtectedWorker(worker) && !worker._stallAutoKilled) {
-        // 30 min stalled (non-GENERAL): auto-kill with parent notification
+      if (stalledMinutes >= 15 && !isProtectedWorker(worker) && !worker._stallAutoKilled) {
+        // 15 min stalled (non-GENERAL): auto-kill with parent notification
         worker._stallAutoKilled = true;
         logger.error(`[StallRecovery] Auto-killing stalled worker ${workerId} (${worker.label}) after ${stalledMinutes}m`);
         if (worker.parentWorkerId) {
@@ -226,7 +218,7 @@ async function checkWorkerHealth(workerId, io) {
             logger.error(`[StallRecovery] Auto-kill failed for ${workerId}: ${err.message}`);
           }
         });
-      } else if (stalledMinutes >= 30 && isProtectedWorker(worker)) {
+      } else if (stalledMinutes >= 15 && isProtectedWorker(worker)) {
         // GENERALs: never auto-kill, but notify Commander
         if (!worker._stallCommanderNotified) {
           worker._stallCommanderNotified = true;
@@ -240,15 +232,15 @@ async function checkWorkerHealth(workerId, io) {
             });
           }
         }
-      } else if (stalledMinutes >= 20 && !worker._stallWarningNudged && !isIdleGeneral) {
-        // 20 min stalled: send warning (skip for idle GENERALs with no active children)
+      } else if (stalledMinutes >= 10 && !worker._stallWarningNudged) {
+        // 10 min stalled: send warning (idle GENERALs never reach here — exempted above)
         worker._stallWarningNudged = true;
         logger.warn(`[StallRecovery] Sending stall WARNING to ${workerId} (${worker.label}) after ${stalledMinutes}m`);
-        sendInputDirect(workerId, 'STALL WARNING: You have been idle for 20 minutes. Signal your status via Ralph immediately or you will be terminated. If you are working on something that does not produce output, signal in_progress with your current step.', 'health:stall_warning').catch(e => {
+        sendInputDirect(workerId, 'STALL WARNING: You have been idle for 10 minutes. Signal your status via Ralph immediately or you will be terminated. If you are working on something that does not produce output, signal in_progress with your current step.', 'health:stall_warning').catch(e => {
           logger.warn(`[StallRecovery] Warning nudge failed for ${workerId}: ${e.message}`);
         });
-      } else if (stalledMinutes >= 10 && !worker._stallNudged && !isIdleGeneral) {
-        // 10 min stalled: send nudge (skip for idle GENERALs with no active children)
+      } else if (stalledMinutes >= 5 && !worker._stallNudged) {
+        // 5 min stalled: send nudge (idle GENERALs never reach here — exempted above)
         worker._stallNudged = true;
         logger.warn(`[StallRecovery] Sending stall nudge to ${workerId} (${worker.label}) after ${stalledMinutes}m`);
         sendInputDirect(workerId, 'You appear to be idle. If you are working on something that does not produce output, signal Ralph with your progress. If you are stuck, signal blocked via Ralph.', 'health:stall_nudge').catch(e => {

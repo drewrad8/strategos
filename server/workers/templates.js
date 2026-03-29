@@ -174,7 +174,7 @@ export const AUTO_ACCEPT_PAUSE_KEYWORDS = [
 // BULLDOZE MODE CONSTANTS
 // ============================================
 
-export const BULLDOZE_IDLE_THRESHOLD = 3;
+export const BULLDOZE_IDLE_THRESHOLD = 2;
 export const BULLDOZE_AUDIT_EVERY_N_CYCLES = 5;
 export const BULLDOZE_MAX_HOURS = 8;
 export const BULLDOZE_MAX_COMPACTIONS = 3;
@@ -184,8 +184,8 @@ export const BULLDOZE_CONTINUATION_PREFIX = '[BULLDOZE';
 // FORCED AUTONOMY CONSTANTS
 // ============================================
 
-export const FORCED_AUTONOMY_BASE_THRESHOLD = 3;       // First nudge: 15s (3 cycles × 5s)
-export const FORCED_AUTONOMY_MAX_THRESHOLD = 360;       // Cap: 30 minutes (360 × 5s)
+export const FORCED_AUTONOMY_BASE_THRESHOLD = 2;       // First nudge: 10s (2 cycles × 5s)
+export const FORCED_AUTONOMY_MAX_THRESHOLD = 60;        // Cap: 5 minutes (60 × 5s)
 export const FORCED_AUTONOMY_BACKOFF_FACTOR = 2;         // Double each time
 
 // ============================================

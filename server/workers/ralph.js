@@ -55,10 +55,14 @@ function deliverResultsToParent(worker, workerId, statusNote) {
   // Don't deliver results to parents that can no longer act on them
   const parentWorker = workers.get(worker.parentWorkerId);
   if (parentWorker) {
-    // Don't deliver cross-project results (e.g. financial_tracker child → thea GENERAL)
+    // Don't deliver cross-project results UNLESS this is an explicit parent-child relationship.
+    // e.g. a thea GENERAL that spawns a strategos child should still get results.
     if (worker.project && parentWorker.project && worker.project !== parentWorker.project) {
-      getLogger().warn(`Skipping cross-project result delivery: child ${workerId} (project: ${worker.project}) -> parent ${worker.parentWorkerId} (project: ${parentWorker.project})`, { workerId, parentWorkerId: worker.parentWorkerId });
-      return;
+      if (worker.parentWorkerId !== parentWorker.id) {
+        getLogger().warn(`Skipping cross-project result delivery: child ${workerId} (project: ${worker.project}) -> parent ${worker.parentWorkerId} (project: ${parentWorker.project})`, { workerId, parentWorkerId: worker.parentWorkerId });
+        return;
+      }
+      getLogger().info(`Allowing cross-project delivery for explicit parent-child: ${workerId} (${worker.project}) -> ${parentWorker.id} (${parentWorker.project})`, { workerId, parentWorkerId: worker.parentWorkerId });
     }
 
     const terminalStatuses = new Set(['completed', 'stopped', 'error']);
@@ -218,6 +222,36 @@ export function cancelAutoDismissTimer(workerId) {
   }
 }
 
+/**
+ * Revert a worker from awaiting_review back to running.
+ * Used when a "done" worker resumes activity (bulldoze, forced autonomy, child spawn, manual input).
+ * Resets status fields, cancels auto-dismiss timer, and emits socket event.
+ *
+ * @param {string} workerId - Worker ID
+ * @param {Object} io - Socket.io instance (nullable)
+ * @param {string} reason - Why the worker is reverting (for logging)
+ * @returns {boolean} True if the worker was reverted
+ */
+export function revertFromDone(workerId, io, reason) {
+  const worker = workers.get(workerId);
+  if (!worker || worker.status !== 'awaiting_review') return false;
+
+  worker.status = 'running';
+  worker.ralphStatus = 'in_progress';
+  worker.awaitingReviewAt = null;
+  worker._resultsDelivered = false;
+
+  cancelAutoDismissTimer(workerId);
+
+  getLogger().info(`Worker ${workerId} (${worker.label}) reverted from awaiting_review → running (${reason})`, { workerId, label: worker.label, reason });
+
+  if (io) {
+    io.emit('worker:updated', normalizeWorker(worker));
+  }
+
+  return true;
+}
+
 
 /**
  * Shared auto-promotion: checks if a worker should be promoted to "done" based on
@@ -285,11 +319,7 @@ export function updateWorkerRalphStatus(workerId, signalData, io = null) {
   // If worker is in awaiting_review and signals in_progress, revert to running.
   // This allows bulldoze to resume on workers that were previously done but got a new mission.
   if (status === 'in_progress' && worker.status === 'awaiting_review') {
-    cancelAutoDismissTimer(workerId);
-    worker.status = 'running';
-    worker.awaitingReviewAt = null;
-    worker._resultsDelivered = false; // Reset so results can be delivered again if worker re-completes
-    getLogger().info(`Worker ${workerId} (${worker.label}) reverted from awaiting_review → running (in_progress signal)`, { workerId, label: worker.label });
+    revertFromDone(workerId, io, 'in_progress_signal');
   }
 
   // Track that this worker has manually signaled (used to prevent child aggregation
