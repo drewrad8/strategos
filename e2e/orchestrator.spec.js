@@ -231,14 +231,14 @@ test.describe('API Endpoint Tests', () => {
     const response = await request.post('http://localhost:38007/api/workers', {
       data: {
         projectPath: 'strategos',
-        label: 'TEST: API Worker'
+        label: 'E2E_FIXTURE: API Worker'
       }
     });
     expect(response.ok()).toBeTruthy();
 
     const worker = await response.json();
     expect(worker.id).toBeDefined();
-    expect(worker.label).toBe('TEST: API Worker');
+    expect(worker.label).toBe('E2E_FIXTURE: API Worker');
     expect(worker.project).toBe('strategos');
     expect(worker.status).toBe('running');
 

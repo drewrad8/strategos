@@ -9,7 +9,7 @@
  * - Validation & error handling
  * - Worker relationships (parent/child)
  *
- * All test workers use the "TEST:" prefix so global-setup/teardown can clean them up.
+ * All e2e fixture workers use the "E2E_FIXTURE:" prefix so global-setup/teardown can clean them up.
  */
 import { test, expect } from '@playwright/test';
 
@@ -19,7 +19,7 @@ const API = 'http://localhost:38007/api';
 async function spawnTestWorker(request, overrides = {}) {
   const body = {
     projectPath: 'strategos',
-    label: overrides.label || `TEST: Lifecycle ${Date.now()}`,
+    label: overrides.label || `E2E_FIXTURE: Lifecycle ${Date.now()}`,
     autoAccept: true,
     ralphMode: false,
     allowDuplicate: true,
@@ -66,12 +66,12 @@ test.describe('Worker CRUD Operations', () => {
   });
 
   test('POST /workers - spawns a worker with correct defaults', async ({ request }) => {
-    const worker = await spawnTestWorker(request, { label: 'TEST: CRUD Spawn' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: CRUD Spawn' });
     workerId = worker.id;
 
     // Core identity
     expect(worker.id).toMatch(/^[a-f0-9]{8}$/);
-    expect(worker.label).toBe('TEST: CRUD Spawn');
+    expect(worker.label).toBe('E2E_FIXTURE: CRUD Spawn');
     expect(worker.project).toBe('strategos');
     expect(worker.status).toBe('running');
 
@@ -92,7 +92,7 @@ test.describe('Worker CRUD Operations', () => {
   });
 
   test('GET /workers/:id - retrieves a specific worker', async ({ request }) => {
-    const spawned = await spawnTestWorker(request, { label: 'TEST: CRUD Get' });
+    const spawned = await spawnTestWorker(request, { label: 'E2E_FIXTURE: CRUD Get' });
     workerId = spawned.id;
 
     const res = await request.get(`${API}/workers/${workerId}`);
@@ -100,7 +100,7 @@ test.describe('Worker CRUD Operations', () => {
 
     const worker = await res.json();
     expect(worker.id).toBe(workerId);
-    expect(worker.label).toBe('TEST: CRUD Get');
+    expect(worker.label).toBe('E2E_FIXTURE: CRUD Get');
     expect(worker.status).toBe('running');
   });
 
@@ -110,7 +110,7 @@ test.describe('Worker CRUD Operations', () => {
   });
 
   test('GET /workers - lists all workers including test worker', async ({ request }) => {
-    const spawned = await spawnTestWorker(request, { label: 'TEST: CRUD List' });
+    const spawned = await spawnTestWorker(request, { label: 'E2E_FIXTURE: CRUD List' });
     workerId = spawned.id;
 
     const res = await request.get(`${API}/workers`);
@@ -120,29 +120,29 @@ test.describe('Worker CRUD Operations', () => {
     expect(Array.isArray(workers)).toBeTruthy();
     const found = workers.find(w => w.id === workerId);
     expect(found).toBeDefined();
-    expect(found.label).toBe('TEST: CRUD List');
+    expect(found.label).toBe('E2E_FIXTURE: CRUD List');
   });
 
   test('PATCH /workers/:id - updates worker label', async ({ request }) => {
-    const spawned = await spawnTestWorker(request, { label: 'TEST: CRUD Patch' });
+    const spawned = await spawnTestWorker(request, { label: 'E2E_FIXTURE: CRUD Patch' });
     workerId = spawned.id;
 
     const res = await request.patch(`${API}/workers/${workerId}`, {
-      data: { label: 'TEST: CRUD Patch Updated' }
+      data: { label: 'E2E_FIXTURE: CRUD Patch Updated' }
     });
     expect(res.ok()).toBeTruthy();
 
     const worker = await res.json();
-    expect(worker.label).toBe('TEST: CRUD Patch Updated');
+    expect(worker.label).toBe('E2E_FIXTURE: CRUD Patch Updated');
 
     // Verify persistence via GET
     const getRes = await request.get(`${API}/workers/${workerId}`);
     const fetched = await getRes.json();
-    expect(fetched.label).toBe('TEST: CRUD Patch Updated');
+    expect(fetched.label).toBe('E2E_FIXTURE: CRUD Patch Updated');
   });
 
   test('DELETE /workers/:id - kills a worker', async ({ request }) => {
-    const spawned = await spawnTestWorker(request, { label: 'TEST: CRUD Delete' });
+    const spawned = await spawnTestWorker(request, { label: 'E2E_FIXTURE: CRUD Delete' });
     workerId = spawned.id;
 
     const res = await request.delete(`${API}/workers/${workerId}`);
@@ -179,7 +179,7 @@ test.describe('Worker Spawn Validation', () => {
 
   test('rejects spawn without projectPath', async ({ request }) => {
     const res = await request.post(`${API}/workers`, {
-      data: { label: 'TEST: No Path' }
+      data: { label: 'E2E_FIXTURE: No Path' }
     });
     expect(res.status()).toBe(400);
     const body = await res.json();
@@ -188,7 +188,7 @@ test.describe('Worker Spawn Validation', () => {
 
   test('rejects label with control characters', async ({ request }) => {
     const res = await request.post(`${API}/workers`, {
-      data: { projectPath: 'strategos', label: 'TEST: Bad\x00Label' }
+      data: { projectPath: 'strategos', label: 'E2E_FIXTURE: Bad\x00Label' }
     });
     expect(res.status()).toBe(400);
     const body = await res.json();
@@ -196,7 +196,7 @@ test.describe('Worker Spawn Validation', () => {
   });
 
   test('rejects label over 200 characters', async ({ request }) => {
-    const longLabel = 'TEST: ' + 'A'.repeat(200);
+    const longLabel = 'E2E_FIXTURE: ' + 'A'.repeat(200);
     const res = await request.post(`${API}/workers`, {
       data: { projectPath: 'strategos', label: longLabel }
     });
@@ -207,7 +207,7 @@ test.describe('Worker Spawn Validation', () => {
 
   test('rejects path traversal in projectPath', async ({ request }) => {
     const res = await request.post(`${API}/workers`, {
-      data: { projectPath: '../../../etc/passwd', label: 'TEST: Traversal' }
+      data: { projectPath: '../../../etc/passwd', label: 'E2E_FIXTURE: Traversal' }
     });
     expect(res.status()).toBe(400);
     const body = await res.json();
@@ -216,7 +216,7 @@ test.describe('Worker Spawn Validation', () => {
 
   test('rejects invalid dependsOn format', async ({ request }) => {
     const res = await request.post(`${API}/workers`, {
-      data: { projectPath: 'strategos', label: 'TEST: Bad Deps', dependsOn: 'not-an-array' }
+      data: { projectPath: 'strategos', label: 'E2E_FIXTURE: Bad Deps', dependsOn: 'not-an-array' }
     });
     expect(res.status()).toBe(400);
     const body = await res.json();
@@ -226,7 +226,7 @@ test.describe('Worker Spawn Validation', () => {
   test('rejects dependsOn with >50 entries', async ({ request }) => {
     const tooMany = Array.from({ length: 51 }, (_, i) => `abcd${String(i).padStart(4, '0')}`);
     const res = await request.post(`${API}/workers`, {
-      data: { projectPath: 'strategos', label: 'TEST: Too Many Deps', dependsOn: tooMany }
+      data: { projectPath: 'strategos', label: 'E2E_FIXTURE: Too Many Deps', dependsOn: tooMany }
     });
     expect(res.status()).toBe(400);
   });
@@ -234,7 +234,7 @@ test.describe('Worker Spawn Validation', () => {
   test('rejects initialInput over 1MB', async ({ request }) => {
     const hugeInput = 'X'.repeat(1048577); // 1MB + 1 byte
     const res = await request.post(`${API}/workers`, {
-      data: { projectPath: 'strategos', label: 'TEST: Big Input', initialInput: hugeInput }
+      data: { projectPath: 'strategos', label: 'E2E_FIXTURE: Big Input', initialInput: hugeInput }
     });
     expect(res.status()).toBe(400);
     const body = await res.json();
@@ -243,7 +243,7 @@ test.describe('Worker Spawn Validation', () => {
 
   test('spawns with task context object', async ({ request }) => {
     const worker = await spawnTestWorker(request, {
-      label: 'TEST: With Task',
+      label: 'E2E_FIXTURE: With Task',
       task: { description: 'Do something', type: 'testing', context: 'test ctx' },
     });
     workerId = worker.id;
@@ -255,18 +255,18 @@ test.describe('Worker Spawn Validation', () => {
 
   test('spawns with parent-child relationship', async ({ request }) => {
     // Spawn parent
-    const parent = await spawnTestWorker(request, { label: 'TEST: Parent Worker' });
+    const parent = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Parent Worker' });
 
     // Spawn child with parentWorkerId
     const child = await spawnTestWorker(request, {
-      label: 'TEST: Child Worker',
+      label: 'E2E_FIXTURE: Child Worker',
       parentWorkerId: parent.id,
-      parentLabel: 'TEST: Parent Worker',
+      parentLabel: 'E2E_FIXTURE: Parent Worker',
     });
     workerId = child.id;
 
     expect(child.parentWorkerId).toBe(parent.id);
-    expect(child.parentLabel).toBe('TEST: Parent Worker');
+    expect(child.parentLabel).toBe('E2E_FIXTURE: Parent Worker');
 
     // Parent should list child
     const parentRes = await request.get(`${API}/workers/${parent.id}`);
@@ -294,7 +294,7 @@ test.describe('Worker Input/Output', () => {
   });
 
   test('POST /workers/:id/input - sends input to a worker', async ({ request }) => {
-    const worker = await spawnTestWorker(request, { label: 'TEST: Input Test' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Input Test' });
     workerId = worker.id;
 
     // Wait a moment for worker to initialize
@@ -309,7 +309,7 @@ test.describe('Worker Input/Output', () => {
   });
 
   test('POST /workers/:id/input - rejects empty input', async ({ request }) => {
-    const worker = await spawnTestWorker(request, { label: 'TEST: Empty Input' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Empty Input' });
     workerId = worker.id;
 
     const res = await request.post(`${API}/workers/${workerId}/input`, {
@@ -319,7 +319,7 @@ test.describe('Worker Input/Output', () => {
   });
 
   test('POST /workers/:id/input - rejects non-string input', async ({ request }) => {
-    const worker = await spawnTestWorker(request, { label: 'TEST: Bad Input Type' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Bad Input Type' });
     workerId = worker.id;
 
     const res = await request.post(`${API}/workers/${workerId}/input`, {
@@ -329,7 +329,7 @@ test.describe('Worker Input/Output', () => {
   });
 
   test('POST /workers/:id/input - rejects input over 1MB', async ({ request }) => {
-    const worker = await spawnTestWorker(request, { label: 'TEST: Huge Input' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Huge Input' });
     workerId = worker.id;
 
     const res = await request.post(`${API}/workers/${workerId}/input`, {
@@ -346,7 +346,7 @@ test.describe('Worker Input/Output', () => {
   });
 
   test('GET /workers/:id/output - retrieves worker output', async ({ request }) => {
-    const worker = await spawnTestWorker(request, { label: 'TEST: Output Test' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Output Test' });
     workerId = worker.id;
 
     // Wait for some output to accumulate
@@ -378,7 +378,7 @@ test.describe('Worker Settings', () => {
   });
 
   test('POST /workers/:id/settings - toggles autoAccept', async ({ request }) => {
-    const worker = await spawnTestWorker(request, { label: 'TEST: Settings AutoAccept' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Settings AutoAccept' });
     workerId = worker.id;
 
     // Disable autoAccept
@@ -400,7 +400,7 @@ test.describe('Worker Settings', () => {
   });
 
   test('POST /workers/:id/settings - toggles autoAcceptPaused', async ({ request }) => {
-    const worker = await spawnTestWorker(request, { label: 'TEST: Settings Paused' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Settings Paused' });
     workerId = worker.id;
 
     const res = await request.post(`${API}/workers/${workerId}/settings`, {
@@ -414,7 +414,7 @@ test.describe('Worker Settings', () => {
   });
 
   test('POST /workers/:id/settings - rejects non-boolean autoAccept', async ({ request }) => {
-    const worker = await spawnTestWorker(request, { label: 'TEST: Settings Bad Type' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Settings Bad Type' });
     workerId = worker.id;
 
     const res = await request.post(`${API}/workers/${workerId}/settings`, {
@@ -426,7 +426,7 @@ test.describe('Worker Settings', () => {
   });
 
   test('POST /workers/:id/settings - rejects empty settings', async ({ request }) => {
-    const worker = await spawnTestWorker(request, { label: 'TEST: Settings Empty' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Settings Empty' });
     workerId = worker.id;
 
     const res = await request.post(`${API}/workers/${workerId}/settings`, {
@@ -458,7 +458,7 @@ test.describe('PATCH Label Validation', () => {
   });
 
   test('rejects PATCH with empty label', async ({ request }) => {
-    const worker = await spawnTestWorker(request, { label: 'TEST: Patch Empty' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Patch Empty' });
     workerId = worker.id;
 
     const res = await request.patch(`${API}/workers/${workerId}`, {
@@ -468,7 +468,7 @@ test.describe('PATCH Label Validation', () => {
   });
 
   test('rejects PATCH with non-string label', async ({ request }) => {
-    const worker = await spawnTestWorker(request, { label: 'TEST: Patch BadType' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Patch BadType' });
     workerId = worker.id;
 
     const res = await request.patch(`${API}/workers/${workerId}`, {
@@ -478,28 +478,28 @@ test.describe('PATCH Label Validation', () => {
   });
 
   test('rejects PATCH with label over 200 chars', async ({ request }) => {
-    const worker = await spawnTestWorker(request, { label: 'TEST: Patch Long' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Patch Long' });
     workerId = worker.id;
 
     const res = await request.patch(`${API}/workers/${workerId}`, {
-      data: { label: 'TEST: ' + 'B'.repeat(200) }
+      data: { label: 'E2E_FIXTURE: ' + 'B'.repeat(200) }
     });
     expect(res.status()).toBe(400);
   });
 
   test('rejects PATCH with control characters in label', async ({ request }) => {
-    const worker = await spawnTestWorker(request, { label: 'TEST: Patch Ctrl' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Patch Ctrl' });
     workerId = worker.id;
 
     const res = await request.patch(`${API}/workers/${workerId}`, {
-      data: { label: 'TEST: Bad\nLabel' }
+      data: { label: 'E2E_FIXTURE: Bad\nLabel' }
     });
     expect(res.status()).toBe(400);
   });
 
   test('returns 404 for PATCH on nonexistent worker', async ({ request }) => {
     const res = await request.patch(`${API}/workers/00000000`, {
-      data: { label: 'TEST: Ghost' }
+      data: { label: 'E2E_FIXTURE: Ghost' }
     });
     expect(res.status()).toBe(404);
   });
@@ -537,23 +537,40 @@ test.describe('Template Spawning', () => {
         template: 'test',
         label: 'Lifecycle Template',
         projectPath: 'strategos',
-        task: 'TEST: Template spawn validation - this is a test, exit immediately',
+        task: 'E2E_FIXTURE: Template spawn validation - this is a test, exit immediately',
       }
     });
     expect(res.ok()).toBeTruthy();
 
     const worker = await res.json();
     workerId = worker.id;
-    expect(worker.label).toMatch(/TEST:.*Lifecycle Template/i);
+    expect(worker.label).toMatch(/E2E_FIXTURE:.*Lifecycle Template/i);
     expect(worker.status).toBe('running');
     expect(worker.autoAccept).toBe(true);
+  });
+
+  test('POST /workers/spawn-from-template - impl template assigns sonnet model', async ({ request }) => {
+    const res = await request.post(`${API}/workers/spawn-from-template`, {
+      data: {
+        template: 'impl',
+        label: 'E2E_FIXTURE: Model Routing impl',
+        projectPath: 'strategos',
+        task: 'E2E_FIXTURE: Model routing verification — check spawn response and exit immediately.',
+        allowDuplicate: true,
+      }
+    });
+    expect(res.ok()).toBeTruthy();
+
+    const worker = await res.json();
+    workerId = worker.id;
+    expect(worker.model).toBe('sonnet');
   });
 
   test('POST /workers/spawn-from-template - rejects unknown template', async ({ request }) => {
     const res = await request.post(`${API}/workers/spawn-from-template`, {
       data: {
         template: 'nonexistent',
-        label: 'TEST: Bad Template',
+        label: 'E2E_FIXTURE: Bad Template',
         projectPath: 'strategos',
         task: 'test',
       }
@@ -565,7 +582,7 @@ test.describe('Template Spawning', () => {
     const res = await request.post(`${API}/workers/spawn-from-template`, {
       data: {
         template: 'test',
-        label: 'TEST: No Task',
+        label: 'E2E_FIXTURE: No Task',
         projectPath: 'strategos',
       }
     });
@@ -587,7 +604,7 @@ test.describe('Worker Completion', () => {
   });
 
   test('POST /workers/:id/complete - transitions worker to awaiting_review', async ({ request }) => {
-    const worker = await spawnTestWorker(request, { label: 'TEST: Complete Flow' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Complete Flow' });
     workerId = worker.id;
 
     const res = await request.post(`${API}/workers/${workerId}/complete`);
@@ -609,7 +626,7 @@ test.describe('Worker Completion', () => {
   });
 
   test('POST /workers/:id/dismiss - dismisses an awaiting_review worker', async ({ request }) => {
-    const worker = await spawnTestWorker(request, { label: 'TEST: Dismiss Flow' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Dismiss Flow' });
     workerId = worker.id;
 
     // Complete first
@@ -644,12 +661,12 @@ test.describe('Worker Dependencies', () => {
 
   test('spawns a worker with dependency', async ({ request }) => {
     // Create first worker
-    const w1 = await spawnTestWorker(request, { label: 'TEST: Dep Parent' });
+    const w1 = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Dep Parent' });
     workerIds.push(w1.id);
 
     // Create dependent worker
     const w2 = await spawnTestWorker(request, {
-      label: 'TEST: Dep Child',
+      label: 'E2E_FIXTURE: Dep Child',
       dependsOn: [w1.id],
     });
     workerIds.push(w2.id);
@@ -659,11 +676,11 @@ test.describe('Worker Dependencies', () => {
   });
 
   test('GET /workers/:id/dependencies - returns dependency info', async ({ request }) => {
-    const w1 = await spawnTestWorker(request, { label: 'TEST: Dep Info Parent' });
+    const w1 = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Dep Info Parent' });
     workerIds.push(w1.id);
 
     const w2 = await spawnTestWorker(request, {
-      label: 'TEST: Dep Info Child',
+      label: 'E2E_FIXTURE: Dep Info Child',
       dependsOn: [w1.id],
     });
     workerIds.push(w2.id);
@@ -675,11 +692,11 @@ test.describe('Worker Dependencies', () => {
   });
 
   test('GET /workers/:id/children - returns child workers', async ({ request }) => {
-    const parent = await spawnTestWorker(request, { label: 'TEST: Children Parent' });
+    const parent = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Children Parent' });
     workerIds.push(parent.id);
 
     const child = await spawnTestWorker(request, {
-      label: 'TEST: Children Child',
+      label: 'E2E_FIXTURE: Children Child',
       parentWorkerId: parent.id,
     });
     workerIds.push(child.id);
@@ -692,17 +709,17 @@ test.describe('Worker Dependencies', () => {
   });
 
   test('GET /workers/:id/siblings - returns sibling workers', async ({ request }) => {
-    const parent = await spawnTestWorker(request, { label: 'TEST: Sibling Parent' });
+    const parent = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Sibling Parent' });
     workerIds.push(parent.id);
 
     const child1 = await spawnTestWorker(request, {
-      label: 'TEST: Sibling 1',
+      label: 'E2E_FIXTURE: Sibling 1',
       parentWorkerId: parent.id,
     });
     workerIds.push(child1.id);
 
     const child2 = await spawnTestWorker(request, {
-      label: 'TEST: Sibling 2',
+      label: 'E2E_FIXTURE: Sibling 2',
       parentWorkerId: parent.id,
     });
     workerIds.push(child2.id);
@@ -750,7 +767,7 @@ test.describe('Worker Queries', () => {
   });
 
   test('GET /workers/:id/quick-status - returns heuristic status', async ({ request }) => {
-    const worker = await spawnTestWorker(request, { label: 'TEST: Quick Status' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Quick Status' });
     workerId = worker.id;
 
     // Wait for some output
@@ -763,7 +780,7 @@ test.describe('Worker Queries', () => {
   });
 
   test('GET /workers/:id/context - returns worker context', async ({ request }) => {
-    const worker = await spawnTestWorker(request, { label: 'TEST: Context' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Context' });
     workerId = worker.id;
 
     const res = await request.get(`${API}/workers/${workerId}/context`);
@@ -773,7 +790,7 @@ test.describe('Worker Queries', () => {
   });
 
   test('GET /workers/:id/sessions - returns session list', async ({ request }) => {
-    const worker = await spawnTestWorker(request, { label: 'TEST: Sessions' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Sessions' });
     workerId = worker.id;
 
     const res = await request.get(`${API}/workers/${workerId}/sessions`);
@@ -783,7 +800,7 @@ test.describe('Worker Queries', () => {
   });
 
   test('GET /workers/:id/history - returns paginated output history', async ({ request }) => {
-    const worker = await spawnTestWorker(request, { label: 'TEST: History' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: History' });
     workerId = worker.id;
 
     // Wait for some output
@@ -912,7 +929,7 @@ test.describe('Duplicate Detection', () => {
 
   test('blocks duplicate label+project by default', async ({ request }) => {
     const w1 = await spawnTestWorker(request, {
-      label: 'TEST: Dup Detection',
+      label: 'E2E_FIXTURE: Dup Detection',
       allowDuplicate: false,
     });
     workerIds.push(w1.id);
@@ -921,7 +938,7 @@ test.describe('Duplicate Detection', () => {
     const res = await request.post(`${API}/workers`, {
       data: {
         projectPath: 'strategos',
-        label: 'TEST: Dup Detection',
+        label: 'E2E_FIXTURE: Dup Detection',
         allowDuplicate: false,
       }
     });
@@ -931,19 +948,19 @@ test.describe('Duplicate Detection', () => {
 
   test('allows duplicate when allowDuplicate=true', async ({ request }) => {
     const w1 = await spawnTestWorker(request, {
-      label: 'TEST: Dup Allowed',
+      label: 'E2E_FIXTURE: Dup Allowed',
       allowDuplicate: true,
     });
     workerIds.push(w1.id);
 
     const w2 = await spawnTestWorker(request, {
-      label: 'TEST: Dup Allowed',
+      label: 'E2E_FIXTURE: Dup Allowed',
       allowDuplicate: true,
     });
     workerIds.push(w2.id);
 
     expect(w2.id).not.toBe(w1.id);
-    expect(w2.label).toBe('TEST: Dup Allowed');
+    expect(w2.label).toBe('E2E_FIXTURE: Dup Allowed');
   });
 });
 
@@ -961,7 +978,7 @@ test.describe('Worker Metrics', () => {
   });
 
   test('GET /metrics/worker/:id - returns per-worker metrics', async ({ request }) => {
-    const worker = await spawnTestWorker(request, { label: 'TEST: Worker Metrics' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Worker Metrics' });
     workerId = worker.id;
 
     const res = await request.get(`${API}/metrics/worker/${workerId}`);
@@ -993,7 +1010,7 @@ test.describe('Full Lifecycle Journey', () => {
 
     // Step 2: Spawn worker
     start = Date.now();
-    const worker = await spawnTestWorker(request, { label: 'TEST: Full Journey' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Full Journey' });
     metrics.steps.push({ name: 'spawn', durationMs: Date.now() - start, workerId: worker.id });
     expect(worker.status).toBe('running');
 
@@ -1093,7 +1110,7 @@ test.describe('Spawn Timing', () => {
     for (let i = 0; i < 3; i++) {
       const start = Date.now();
       const worker = await spawnTestWorker(request, {
-        label: `TEST: Timing ${i}`,
+        label: `E2E_FIXTURE: Timing ${i}`,
         allowDuplicate: true,
       });
       const elapsed = Date.now() - start;
@@ -1133,7 +1150,7 @@ test.describe('UI: Worker Appears in Grid', () => {
 
   test('spawned worker appears as a card in the Workers grid', async ({ page, request }) => {
     // Spawn worker via API
-    const worker = await spawnTestWorker(request, { label: 'TEST: UI Grid Appear' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: UI Grid Appear' });
     workerId = worker.id;
 
     // Load the UI
@@ -1146,7 +1163,7 @@ test.describe('UI: Worker Appears in Grid', () => {
     const workerCard = page.getByTestId(`worker-card-${workerId}`);
     await expect(workerCard).toBeVisible({ timeout: 10000 });
 
-    // Card should display the label (the UI strips the "TEST:" prefix via parseWorkerLabel)
+    // Card should display the label (the UI strips the "E2E_FIXTURE:" prefix via parseWorkerLabel)
     await expect(workerCard.locator('h3')).toContainText('UI Grid Appear');
 
     // Card should show running status
@@ -1159,7 +1176,7 @@ test.describe('UI: Worker Appears in Grid', () => {
   });
 
   test('worker card shows project name', async ({ page, request }) => {
-    const worker = await spawnTestWorker(request, { label: 'TEST: UI Project Name' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: UI Project Name' });
     workerId = worker.id;
 
     await page.goto('/');
@@ -1189,7 +1206,7 @@ test.describe('UI: Worker Terminal View', () => {
   });
 
   test('opening a worker shows focused view with Summary/Terminal tabs', async ({ page, request }) => {
-    const worker = await spawnTestWorker(request, { label: 'TEST: UI Focused View' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: UI Focused View' });
     workerId = worker.id;
 
     await page.goto('/');
@@ -1204,7 +1221,7 @@ test.describe('UI: Worker Terminal View', () => {
     await expect(page.locator('button:has-text("Back to Grid")')).toBeVisible({ timeout: 5000 });
 
     // Worker label should be in the header
-    await expect(page.locator('h2:has-text("TEST: UI Focused View")')).toBeVisible();
+    await expect(page.locator('h2:has-text("E2E_FIXTURE: UI Focused View")')).toBeVisible();
 
     // Summary and Terminal tabs should be visible
     await expect(page.locator('button:has-text("Summary")')).toBeVisible();
@@ -1212,7 +1229,7 @@ test.describe('UI: Worker Terminal View', () => {
   });
 
   test('terminal tab displays xterm terminal', async ({ page, request }) => {
-    const worker = await spawnTestWorker(request, { label: 'TEST: UI Terminal Display' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: UI Terminal Display' });
     workerId = worker.id;
 
     await page.goto('/');
@@ -1235,7 +1252,7 @@ test.describe('UI: Worker Terminal View', () => {
   });
 
   test('terminal shows output after worker initializes', async ({ page, request }) => {
-    const worker = await spawnTestWorker(request, { label: 'TEST: UI Terminal Output' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: UI Terminal Output' });
     workerId = worker.id;
 
     // Wait for worker to generate some output
@@ -1262,7 +1279,7 @@ test.describe('UI: Worker Terminal View', () => {
   });
 
   test('Back to Grid returns to worker cards', async ({ page, request }) => {
-    const worker = await spawnTestWorker(request, { label: 'TEST: UI Back to Grid' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: UI Back to Grid' });
     workerId = worker.id;
 
     await page.goto('/');
@@ -1289,7 +1306,7 @@ test.describe('UI: Worker Terminal View', () => {
 test.describe('UI: Kill Worker from Grid', () => {
   test('killing a worker removes it from the grid', async ({ page, request }) => {
     // Spawn a worker via API
-    const worker = await spawnTestWorker(request, { label: 'TEST: UI Kill Worker' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: UI Kill Worker' });
     const wId = worker.id;
 
     await page.goto('/');
@@ -1320,7 +1337,7 @@ test.describe('UI: Kill Worker from Grid', () => {
 test.describe('UI: Checkpoint Created After Kill', () => {
   test('killing a worker creates a checkpoint', async ({ request }) => {
     // Spawn a worker
-    const worker = await spawnTestWorker(request, { label: 'TEST: UI Checkpoint' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: UI Checkpoint' });
     const wId = worker.id;
 
     // Wait for worker to initialize
@@ -1340,15 +1357,15 @@ test.describe('UI: Checkpoint Created After Kill', () => {
 
     // Find checkpoint for our worker
     const ourCheckpoint = checkpoints.find(
-      cp => cp.label === 'TEST: UI Checkpoint' || cp.workerId === wId
+      cp => cp.label === 'E2E_FIXTURE: UI Checkpoint' || cp.workerId === wId
     );
     expect(ourCheckpoint).toBeDefined();
-    expect(ourCheckpoint.label).toBe('TEST: UI Checkpoint');
+    expect(ourCheckpoint.label).toBe('E2E_FIXTURE: UI Checkpoint');
   });
 
   test('checkpoint has expected fields', async ({ request }) => {
     // Spawn and kill a worker
-    const worker = await spawnTestWorker(request, { label: 'TEST: Checkpoint Fields' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Checkpoint Fields' });
     await new Promise(r => setTimeout(r, 2000));
     await request.delete(`${API}/workers/${worker.id}?force=true`);
     await new Promise(r => setTimeout(r, 1000));
@@ -1357,12 +1374,12 @@ test.describe('UI: Checkpoint Created After Kill', () => {
     const checkpointsRes = await request.get(`${API}/checkpoints`);
     const checkpoints = await checkpointsRes.json();
     const cp = checkpoints.find(
-      c => c.label === 'TEST: Checkpoint Fields' || c.workerId === worker.id
+      c => c.label === 'E2E_FIXTURE: Checkpoint Fields' || c.workerId === worker.id
     );
 
     expect(cp).toBeDefined();
     // Checkpoint should have core fields
-    expect(cp.label).toBe('TEST: Checkpoint Fields');
+    expect(cp.label).toBe('E2E_FIXTURE: Checkpoint Fields');
     expect(cp.diedAt || cp.createdAt).toBeTruthy();
     expect(cp.project).toBe('strategos');
   });
@@ -1374,7 +1391,7 @@ test.describe('UI: Checkpoint Created After Kill', () => {
 test.describe('UI: Full Lifecycle Journey', () => {
   test('spawn via API → see in grid → open terminal → kill → verify removed', async ({ page, request }) => {
     // Step 1: Spawn a worker via API
-    const worker = await spawnTestWorker(request, { label: 'TEST: Full UI Journey' });
+    const worker = await spawnTestWorker(request, { label: 'E2E_FIXTURE: Full UI Journey' });
     expect(worker.id).toBeDefined();
     expect(worker.status).toBe('running');
 
@@ -1391,7 +1408,7 @@ test.describe('UI: Full Lifecycle Journey', () => {
     // Step 3: Open worker and view terminal
     await page.getByTestId(`open-worker-${worker.id}`).click();
     await expect(page.locator('button:has-text("Back to Grid")')).toBeVisible({ timeout: 5000 });
-    await expect(page.locator('h2:has-text("TEST: Full UI Journey")')).toBeVisible();
+    await expect(page.locator('h2:has-text("E2E_FIXTURE: Full UI Journey")')).toBeVisible();
 
     // Switch to terminal tab
     await page.locator('button:has-text("Terminal")').click();
@@ -1413,7 +1430,7 @@ test.describe('UI: Full Lifecycle Journey', () => {
     const checkpointsRes = await request.get(`${API}/checkpoints`);
     const checkpoints = await checkpointsRes.json();
     const cp = checkpoints.find(
-      c => c.label === 'TEST: Full UI Journey' || c.workerId === worker.id
+      c => c.label === 'E2E_FIXTURE: Full UI Journey' || c.workerId === worker.id
     );
     expect(cp).toBeDefined();
   });

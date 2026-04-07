@@ -164,7 +164,7 @@ test.describe('Workers View Visual Verification', () => {
   test('Multi-Terminal View button appears when workers exist', async ({ page, request }) => {
     // Spawn a worker to ensure one exists
     await request.post(`${STRATEGOS_API}/api/workers`, {
-      data: { projectPath: 'strategos', label: 'TEST: Visual Worker' }
+      data: { projectPath: 'strategos', label: 'E2E_FIXTURE: Visual Worker' }
     });
 
     await page.reload();
@@ -177,7 +177,7 @@ test.describe('Workers View Visual Verification', () => {
     // Clean up
     const workersRes = await request.get(`${STRATEGOS_API}/api/workers`);
     const workers = await workersRes.json();
-    const testWorker = workers.find(w => w.label === 'TEST: Visual Worker');
+    const testWorker = workers.find(w => w.label === 'E2E_FIXTURE: Visual Worker');
     if (testWorker) {
       await request.delete(`${STRATEGOS_API}/api/workers/${testWorker.id}`);
     }
@@ -190,7 +190,7 @@ test.describe('Worker Card Visual Verification', () => {
   test.beforeAll(async ({ request }) => {
     // Spawn a worker for testing
     const response = await request.post(`${STRATEGOS_API}/api/workers`, {
-      data: { projectPath: 'strategos', label: 'TEST: Card Visual' }
+      data: { projectPath: 'strategos', label: 'E2E_FIXTURE: Card Visual' }
     });
     const worker = await response.json();
     testWorkerId = worker.id;
@@ -211,7 +211,7 @@ test.describe('Worker Card Visual Verification', () => {
     await expect(workerCard).toBeVisible({ timeout: 5000 });
 
     // Verify label
-    await expect(workerCard.locator('h3:has-text("TEST: Card Visual")')).toBeVisible();
+    await expect(workerCard.locator('h3:has-text("E2E_FIXTURE: Card Visual")')).toBeVisible();
 
     // Verify project name (use first() to handle multiple matches in terminal output)
     await expect(workerCard.locator('p', { hasText: 'strategos' }).first()).toBeVisible();
@@ -302,7 +302,7 @@ test.describe('Worker Card Visual Verification', () => {
     await expect(page.locator('button:has-text("Terminal")')).toBeVisible();
 
     // Verify worker label in header
-    await expect(page.locator('h2:has-text("TEST: Card Visual")')).toBeVisible();
+    await expect(page.locator('h2:has-text("E2E_FIXTURE: Card Visual")')).toBeVisible();
   });
 
   test('Summary/Terminal toggle works in focused view', async ({ page }) => {
@@ -520,7 +520,7 @@ test.describe('Activity Feed Visual Verification', () => {
   test('activity feed shows entries with correct icons', async ({ page, request }) => {
     // Spawn and kill a worker to generate activity
     const spawnRes = await request.post(`${STRATEGOS_API}/api/workers`, {
-      data: { projectPath: 'strategos', label: 'TEST: Activity Worker' }
+      data: { projectPath: 'strategos', label: 'E2E_FIXTURE: Activity Worker' }
     });
     const worker = await spawnRes.json();
     await request.delete(`${STRATEGOS_API}/api/workers/${worker.id}`);
@@ -685,7 +685,7 @@ test.describe('Multi-Terminal View Visual Verification', () => {
 
   test.beforeAll(async ({ request }) => {
     const response = await request.post(`${STRATEGOS_API}/api/workers`, {
-      data: { projectPath: 'strategos', label: 'TEST: Multi-Term' }
+      data: { projectPath: 'strategos', label: 'E2E_FIXTURE: Multi-Term' }
     });
     const worker = await response.json();
     testWorkerId = worker.id;
