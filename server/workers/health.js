@@ -38,6 +38,42 @@ import {
 
 const logger = getLogger();
 
+// Colonel max lifetime — colonels that run longer than this without completing
+// get a blocked signal with a scope-too-large warning. Only applies to colonels.
+const COLONEL_MAX_LIFETIME_MS = 75 * 60 * 1000; // 75 minutes (extended from 55 for multi-wave pipelines)
+
+// Completion guard defaults — workers running this long without signaling done get a nudge,
+// then a kill. Type-specific overrides are applied via getCompletionGuard() below.
+const COMPLETION_NUDGE_MS = 4 * 60 * 60 * 1000;  // 4 hours (GENERAL default)
+const COMPLETION_KILL_MS  = 8 * 60 * 60 * 1000;  // 8 hours (GENERAL default)
+
+/**
+ * Returns type-specific stall detection thresholds (in ms).
+ * RESEARCH workers get extra breathing room for silent read-heavy work.
+ * All others use the historical 5/10/15 minute defaults.
+ */
+function getStallProfile(workerLabel) {
+  const { prefix } = detectWorkerTypeForMetrics(workerLabel || '');
+  if (prefix === 'RESEARCH') {
+    return { nudgeMs: 8 * 60 * 1000, warnMs: 15 * 60 * 1000, killMs: 20 * 60 * 1000 };
+  }
+  // Default: IMPL, FIX, TEST, REVIEW, COLONEL, unknown
+  return { nudgeMs: 5 * 60 * 1000, warnMs: 10 * 60 * 1000, killMs: 15 * 60 * 1000 };
+}
+
+/**
+ * Returns type-specific completion guard thresholds (in ms).
+ * IMPL/FIX get tighter limits — a 2-hour IMPL worker is almost certainly stuck.
+ * GENERALs keep the generous 4h/8h defaults for long-running operations.
+ */
+function getCompletionGuard(workerLabel) {
+  const { prefix } = detectWorkerTypeForMetrics(workerLabel || '');
+  if (prefix === 'IMPL' || prefix === 'FIX') {
+    return { nudgeMs: 45 * 60 * 1000, killMs: 90 * 60 * 1000 };
+  }
+  return { nudgeMs: COMPLETION_NUDGE_MS, killMs: COMPLETION_KILL_MS };
+}
+
 // Global health monitor interval
 let globalHealthInterval = null;
 
@@ -46,6 +82,9 @@ let cleanupInterval = null;
 
 // Resource monitoring interval (60s)
 let resourceMonitorInterval = null;
+
+// Per-worker cooldown for "age" log messages (10 min between logs per worker)
+const _ageLogLastSeen = new Map();
 
 // ============================================
 // CRASH PATTERNS
@@ -119,11 +158,11 @@ async function checkWorkerHealth(workerId, io) {
   }
 
   if (worker.health === 'dead' || worker.beingCleanedUp) {
-    if (io) io.emit('worker:updated', normalizeWorker(worker));
+    if (io) io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(worker));
     return;
   }
 
-  if (worker.status === 'completed' || worker.status === 'stopped') {
+  if (worker.status === 'completed' || worker.status === 'stopped' || worker.status === 'awaiting_review') {
     return;
   }
 
@@ -197,9 +236,14 @@ async function checkWorkerHealth(workerId, io) {
       }
 
       // === Graduated stall recovery ===
+      const stallProfile = getStallProfile(worker.label);
+      const stallKillMin   = Math.round(stallProfile.killMs / 60000);
+      const stallWarnMin   = Math.round(stallProfile.warnMs / 60000);
+      const stallNudgeMin  = Math.round(stallProfile.nudgeMs / 60000);
+      const timeSinceOutputMs = timeSinceOutput;
 
-      if (stalledMinutes >= 15 && !isProtectedWorker(worker) && !worker._stallAutoKilled) {
-        // 15 min stalled (non-GENERAL): auto-kill with parent notification
+      if (timeSinceOutputMs >= stallProfile.killMs && !isProtectedWorker(worker) && !worker._stallAutoKilled) {
+        // Kill threshold (non-GENERAL): auto-kill with parent notification
         worker._stallAutoKilled = true;
         logger.error(`[StallRecovery] Auto-killing stalled worker ${workerId} (${worker.label}) after ${stalledMinutes}m`);
         if (worker.parentWorkerId) {
@@ -218,7 +262,7 @@ async function checkWorkerHealth(workerId, io) {
             logger.error(`[StallRecovery] Auto-kill failed for ${workerId}: ${err.message}`);
           }
         });
-      } else if (stalledMinutes >= 15 && isProtectedWorker(worker)) {
+      } else if (timeSinceOutputMs >= stallProfile.killMs && isProtectedWorker(worker)) {
         // GENERALs: never auto-kill, but notify Commander
         if (!worker._stallCommanderNotified) {
           worker._stallCommanderNotified = true;
@@ -232,15 +276,15 @@ async function checkWorkerHealth(workerId, io) {
             });
           }
         }
-      } else if (stalledMinutes >= 10 && !worker._stallWarningNudged) {
-        // 10 min stalled: send warning (idle GENERALs never reach here — exempted above)
+      } else if (timeSinceOutputMs >= stallProfile.warnMs && !worker._stallWarningNudged) {
+        // Warning threshold: send warning (idle GENERALs never reach here — exempted above)
         worker._stallWarningNudged = true;
         logger.warn(`[StallRecovery] Sending stall WARNING to ${workerId} (${worker.label}) after ${stalledMinutes}m`);
-        sendInputDirect(workerId, 'STALL WARNING: You have been idle for 10 minutes. Signal your status via Ralph immediately or you will be terminated. If you are working on something that does not produce output, signal in_progress with your current step.', 'health:stall_warning').catch(e => {
+        sendInputDirect(workerId, `STALL WARNING: You have been idle for ${stalledMinutes} minutes. Signal your status via Ralph immediately or you will be terminated. If you are working on something that does not produce output, signal in_progress with your current step.`, 'health:stall_warning').catch(e => {
           logger.warn(`[StallRecovery] Warning nudge failed for ${workerId}: ${e.message}`);
         });
-      } else if (stalledMinutes >= 5 && !worker._stallNudged) {
-        // 5 min stalled: send nudge (idle GENERALs never reach here — exempted above)
+      } else if (timeSinceOutputMs >= stallProfile.nudgeMs && !worker._stallNudged) {
+        // Nudge threshold: send nudge (idle GENERALs never reach here — exempted above)
         worker._stallNudged = true;
         logger.warn(`[StallRecovery] Sending stall nudge to ${workerId} (${worker.label}) after ${stalledMinutes}m`);
         sendInputDirect(workerId, 'You appear to be idle. If you are working on something that does not produce output, signal Ralph with your progress. If you are stuck, signal blocked via Ralph.', 'health:stall_nudge').catch(e => {
@@ -279,6 +323,108 @@ async function checkWorkerHealth(workerId, io) {
     }
   }
 
+  // === Colonel max-lifetime check ===
+  // If a colonel hasn't completed within COLONEL_MAX_LIFETIME_MS, signal blocked
+  // so its parent knows the scope was too large.
+  if (!worker._colonelMaxLifetimeTriggered && worker.status === 'running') {
+    const upperLabel = (worker.label || '').toUpperCase();
+    const isColonel = upperLabel.startsWith('COLONEL:') || upperLabel.startsWith('COL-') || upperLabel.startsWith('COL:');
+    if (isColonel) {
+      const startTime = worker.createdAt ? new Date(worker.createdAt).getTime() : null;
+      if (startTime && (Date.now() - startTime) > COLONEL_MAX_LIFETIME_MS) {
+        worker._colonelMaxLifetimeTriggered = true;
+        const lifetimeMin = Math.round((Date.now() - startTime) / 60000);
+        logger.error(`[ColonelLifetime] Colonel ${workerId} (${worker.label}) has been running for ${lifetimeMin}m — triggering max-lifetime blocked signal`);
+
+        // Notify the colonel itself to signal blocked via Ralph
+        const colonelMessage = `COLONEL MAX LIFETIME REACHED: You have been running for ${lifetimeMin} minutes without completing. Your scope may be too large. Signal blocked via Ralph immediately with reason: "Colonel max lifetime reached — scope may be too large. Consider splitting into smaller tasks." Your parent has also been notified.`;
+        sendInputDirect(workerId, colonelMessage, 'health:colonel_max_lifetime').catch(e => {
+          logger.warn(`[ColonelLifetime] Could not notify colonel ${workerId}: ${e.message}`);
+        });
+
+        // Notify the parent so it can act
+        if (worker.parentWorkerId) {
+          const parentMessage = `[COLONEL MAX LIFETIME] Your colonel worker "${worker.label}" (${workerId}) has been running for ${lifetimeMin} minutes without completing. The scope may be too large. Consider splitting the task into smaller colonels or specialists. The colonel has been instructed to signal blocked.`;
+          sendInputDirect(worker.parentWorkerId, parentMessage, 'health:colonel_max_lifetime_parent').catch(e => {
+            logger.warn(`[ColonelLifetime] Could not notify parent ${worker.parentWorkerId}: ${e.message}`);
+          });
+        }
+
+        if (io) {
+          io.emit('worker:colonel:max-lifetime', {
+            workerId,
+            label: worker.label,
+            lifetimeMin,
+            message: `Colonel exceeded max lifetime (${lifetimeMin}m) — scope may be too large`,
+          });
+        }
+      }
+    }
+  }
+
+  // === Completion guard (time-based, all worker types) ===
+  // Workers that finish but forget to signal done accumulate idle runtime.
+  // Thresholds are type-specific: IMPL/FIX get 45min/90min, others get 4h/8h.
+  if (worker.status === 'running' && worker.ralphStatus !== 'done') {
+    const startTime = worker.createdAt ? new Date(worker.createdAt).getTime() : null;
+    if (startTime) {
+      const runningMs = Date.now() - startTime;
+      const completionGuard = getCompletionGuard(worker.label);
+
+      // Skip CompletionGuard for generals that are actively reporting in_progress.
+      // A bulldoze-mode general signals every 15-30 min and should never be killed
+      // for running "too long". Only kill if the general has gone dark (>2h silence).
+      const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
+      const recentlySilent = !isProtectedWorker(worker) ||
+        !worker.lastRalphSignalAt ||
+        (Date.now() - new Date(worker.lastRalphSignalAt).getTime()) >= TWO_HOURS_MS;
+
+      if (!recentlySilent) {
+        const minutesAgo = Math.round((Date.now() - new Date(worker.lastRalphSignalAt).getTime()) / 60000);
+        logger.info(`[CompletionGuard] Skipping GENERAL ${workerId} (${worker.label}) — recently active (${minutesAgo}m ago)`);
+      } else if (runningMs >= completionGuard.killMs && !worker._completionKilled) {
+        worker._completionKilled = true;
+        const runningMin = Math.round(runningMs / 60000);
+        const runningHours = Math.round(runningMs / 3600000);
+        const runningDesc = runningMs < 3600000 ? `${runningMin} minutes` : `${runningHours} hours`;
+        logger.error(`[CompletionGuard] Auto-killing ${workerId} (${worker.label}) after ${runningDesc} without done signal`);
+        if (worker.parentWorkerId) {
+          sendInputDirect(worker.parentWorkerId,
+            `[COMPLETION AUTO-KILL] Your worker "${worker.label}" (${workerId}) was automatically terminated after ${runningDesc} without signaling done via Ralph. Consider respawning if the task is still needed.`,
+            'health:completion_kill_notification'
+          ).catch(e => {
+            logger.warn(`[CompletionGuard] Could not notify parent ${worker.parentWorkerId}: ${e.message}`);
+          });
+        }
+        import('./lifecycle.js').then(async ({ killWorker }) => {
+          try {
+            await killWorker(workerId, io, { force: true });
+            if (io) {
+              io.emit('worker:auto-killed:completion', { workerId, label: worker.label, runningHours });
+            }
+          } catch (err) {
+            logger.error(`[CompletionGuard] Auto-kill failed for ${workerId}: ${err.message}`);
+          }
+        });
+      } else if (runningMs >= completionGuard.nudgeMs && !worker._completionNudged) {
+        worker._completionNudged = true;
+        const runningMin = Math.round(runningMs / 60000);
+        const runningHours = Math.round(runningMs / 3600000);
+        const runningDesc = runningMs < 3600000 ? `${runningMin} minutes` : `${runningHours} hours`;
+        logger.warn(`[CompletionGuard] Nudging ${workerId} (${worker.label}) after ${runningDesc} without done signal`);
+        sendInputDirect(workerId,
+          `You have been running for over ${runningDesc}. If you have completed your task, please signal done via Ralph now.`,
+          'health:completion_nudge'
+        ).catch(e => {
+          logger.warn(`[CompletionGuard] Nudge failed for ${workerId}: ${e.message}`);
+        });
+        if (io) {
+          io.emit('worker:completion-nudge', { workerId, label: worker.label, runningHours });
+        }
+      }
+    }
+  }
+
   // Auto-promotion sweep — delegates to shared function which handles the full
   // done-path: status change, parent delivery, parent aggregation, socket events.
   // (P2/P3 fix: was previously inline and skipped parent delivery)
@@ -294,7 +440,7 @@ async function checkWorkerHealth(workerId, io) {
   }
 
   if (io) {
-    io.emit('worker:updated', normalizeWorker(worker));
+    io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(worker));
   }
 }
 
@@ -370,6 +516,11 @@ export async function handleCrashedWorker(workerId, worker, io) {
       if (worker.ralphSignalCount > 0) recordWorkerRalphSignals(worker, worker.ralphSignalCount, template);
       if (worker.delegationMetrics?.roleViolations > 0) recordWorkerRoleViolations(worker, worker.delegationMetrics.roleViolations, template);
     } catch { /* best effort */ }
+    // Record failure in learnings DB — worker is truly dead
+    try {
+      const { persistFailureLearning } = await import('./ralph.js');
+      persistFailureLearning(worker, workerId, `crashed: ${worker.crashReason || 'unknown'}`);
+    } catch { /* best effort */ }
     try {
       const failedDependents = markWorkerFailed(workerId);
       for (const depId of failedDependents) {
@@ -380,7 +531,7 @@ export async function handleCrashedWorker(workerId, worker, io) {
       }
     } catch (e) { /* Worker may not be in dependency graph */ }
     if (io) {
-      io.emit('worker:updated', normalizeWorker(worker));
+      io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(worker));
     }
     return;
   }
@@ -410,13 +561,28 @@ export async function handleCrashedWorker(workerId, worker, io) {
         worker.health = 'healthy';
         worker.crashReason = null;
         worker.crashedAt = null;
-        if (io) io.emit('worker:updated', normalizeWorker(worker));
+        if (io) io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(worker));
         return;
       } catch {
         // Session is dead — proceed with marking dead
       }
     }
-    logger.error(`[CrashRecovery] GENERAL worker ${workerId} (${worker.label}) crashed. NOT respawning.`);
+    logger.error(`[CrashRecovery] GENERAL worker ${workerId} (${worker.label}) crashed. NOT respawning (unless auto-respawn registered).`);
+
+    // Trigger auto-respawn if the worker was registered for it
+    if (worker.autoRespawn) {
+      const workerSnapshot = {
+        ralphProgress: worker.ralphProgress,
+        ralphCurrentStep: worker.ralphCurrentStep,
+        ralphLearnings: worker.ralphLearnings,
+      };
+      import('../services/autoRespawnService.js').then(({ handleGeneralDeath }) => {
+        handleGeneralDeath(workerId, 'crashed', io, workerSnapshot).catch(e =>
+          logger.error(`[AutoRespawn] handleGeneralDeath (crash) failed for ${workerId}: ${e.message}`)
+        );
+      }).catch(e => logger.error(`[AutoRespawn] Import failed in crash handler: ${e.message}`));
+    }
+
     worker.health = 'dead';
     worker.status = 'error';
     try {
@@ -509,7 +675,7 @@ export async function handleCrashedWorker(workerId, worker, io) {
         }
       } catch (e) { /* Worker may not be in dependency graph */ }
       if (io) {
-        io.emit('worker:updated', normalizeWorker(worker));
+        io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(worker));
       }
     } else {
       const retryDelayMs = RESPAWN_COOLDOWN_MS + 5000;
@@ -677,8 +843,8 @@ export function startPeriodicCleanup(io = null) {
     }
 
     const depCleanup = cleanupFinishedWorkflows();
-    if (depCleanup.workflowsCleaned > 0 || depCleanup.nodesCleaned > 0) {
-      logger.info(`[PeriodicCleanup] Cleaned ${depCleanup.workflowsCleaned} finished workflows, ${depCleanup.nodesCleaned} dep nodes`);
+    if (depCleanup.nodesCleaned > 0) {
+      logger.info(`[PeriodicCleanup] Cleaned ${depCleanup.nodesCleaned} dep nodes`);
     }
 
     if (_contextWriteLocks.size > 0) {
@@ -767,7 +933,11 @@ export function startResourceMonitor(io) {
 
       // Check worker ages
       const agedWorkers = checkWorkerAges();
+      const now = Date.now();
       for (const aged of agedWorkers) {
+        const lastLogged = _ageLogLastSeen.get(aged.id) ?? 0;
+        if (now - lastLogged < 10 * 60 * 1000) continue;
+        _ageLogLastSeen.set(aged.id, now);
         logger.warn(`[ResourceMonitor] Worker age ${aged.severity}: ${aged.id} (${aged.label}) — ${aged.message}`);
         if (io) {
           io.emit('worker:age:warning', {

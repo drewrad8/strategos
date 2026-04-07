@@ -90,6 +90,10 @@ systemctl --user restart strategos
 cd client && npm run build   # Then human restarts server to serve new build
 ```
 
+## Context Compaction Protocol (MANDATORY)
+
+If context compaction occurs mid-task, immediately re-orient by checking: (1) your current task description, (2) files you've modified (`git status`, `git diff HEAD`), (3) test commands you ran and their results, (4) any blocking issues encountered, and (5) your current git branch (`git branch --show-current`). Do not re-do completed work — git history is ground truth.
+
 ## Project Commands
 - `npm run server` - Start server only (serves built client from 38007)
 - `npm run build` - Build client (run this after client changes)

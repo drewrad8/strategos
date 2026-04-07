@@ -256,6 +256,33 @@ class MetricsService {
   }
 
   /**
+   * Get metrics with optional label filters pushed into SQL WHERE clause.
+   * Avoids fetching all rows into JS for post-query filtering.
+   * Uses json_extract() for label filtering (SQLite JSON1, available since 3.38).
+   */
+  getMetricsFiltered(type, startTime, endTime, limit = 1000, filterTemplate = null, filterProject = null) {
+    if (!filterTemplate && !filterProject) {
+      return this._stmts.getMetrics.all(type, startTime, endTime, limit);
+    }
+
+    const conditions = ['type = ?', 'timestamp >= ?', 'timestamp <= ?'];
+    const params = [type, startTime, endTime];
+
+    if (filterTemplate) {
+      conditions.push("json_extract(labels, '$.template') = ?");
+      params.push(filterTemplate);
+    }
+    if (filterProject) {
+      conditions.push("json_extract(labels, '$.project') = ?");
+      params.push(filterProject);
+    }
+
+    params.push(limit);
+    const sql = `SELECT * FROM metrics WHERE ${conditions.join(' AND ')} ORDER BY timestamp DESC LIMIT ?`;
+    return this.db.prepare(sql).all(...params);
+  }
+
+  /**
    * Get the latest metric for a type
    */
   getLatest(type) {
@@ -537,7 +564,7 @@ class MetricsService {
 
     const result = this._stmts.cleanupMetrics.run(cutoff);
 
-    // Also clean aggregated metrics (keep 30 days regardless)
+    // Also clean aggregated metrics (same 7-day retention)
     const aggResult = this._stmts.cleanupAggregated.run(cutoff);
 
     // Clean up old sessions (was previously skipped — sessions accumulated forever)

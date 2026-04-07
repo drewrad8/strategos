@@ -54,6 +54,44 @@ function getToolRestrictionArgs(label) {
   return [];
 }
 
+// ============================================
+// EFFORT LEVEL BY WORKER TYPE
+// ============================================
+
+const EFFORT_LEVELS = {
+  GENERAL: 'high',     // strategic decisions need deep reasoning
+  COLONEL: 'medium',   // coordination
+  RESEARCH: 'medium',  // balanced exploration
+  IMPL: 'medium',      // balanced
+  FIX: 'medium',       // balanced debugging
+  REVIEW: 'low',       // pattern-matching, not deep reasoning
+  TEST: 'low',         // running tests is straightforward
+};
+
+const DEFAULT_EFFORT = 'medium';
+const VALID_EFFORTS = new Set(['low', 'medium', 'high']);
+
+/**
+ * Returns the effort level for a worker based on its type.
+ * An explicit override (from spawn options) takes precedence over the default mapping.
+ */
+function getEffortLevel(label, override = null) {
+  if (override && VALID_EFFORTS.has(override)) {
+    return override;
+  }
+  const { prefix } = detectWorkerType(label);
+  return (prefix && EFFORT_LEVELS[prefix]) || DEFAULT_EFFORT;
+}
+
+/**
+ * Returns CLI args for claude --effort flag and environment variable.
+ */
+function getEffortArgs(label, override = null) {
+  const effort = getEffortLevel(label, override);
+  logger.info(`[SpawnWorker] Effort level: ${effort} for ${label}${override ? ' (override)' : ''}`);
+  return ['--effort', effort];
+}
+
 import {
   startPtyCapture, stopPtyCapture, sendInputDirect, sendInput,
 } from './output.js';
@@ -78,7 +116,6 @@ import {
   markWorkerFailed,
   removeWorkerDependencies,
   canWorkerStart,
-  registerWorkflowWorker,
 } from '../dependencyGraph.js';
 import { MAX_SYSTEM_PROMPT_LENGTH, MAX_TIMEOUT_MS } from '../validation.js';
 import { invalidateWorkersCache } from './queries.js';
@@ -131,6 +168,7 @@ function initializeWorker(id, config, io) {
     parentWorkerId, parentLabel, task, initialInput,
     autoAccept, ralphMode, backend, model,
     autoDismissAfterDone,
+    autoRespawn, autoRespawnConfig,
   } = config;
 
   const worker = {
@@ -190,6 +228,9 @@ function initializeWorker(id, config, io) {
     // Intelligence improvements
     autoDismissAfterDone: autoDismissAfterDone !== false, // default true
     taskReceivedAt: task ? new Date() : null,
+    // Auto-respawn support
+    autoRespawn: autoRespawn === true,
+    autoRespawnConfig: autoRespawnConfig || null,
   };
 
   workers.set(id, worker);
@@ -201,6 +242,13 @@ function initializeWorker(id, config, io) {
   dbStartSession(worker);
   startPtyCapture(id, sessionName, io);
   startHealthMonitor(id, io);
+
+  // Register for auto-respawn if requested
+  if (autoRespawn === true && autoRespawnConfig) {
+    import('../services/autoRespawnService.js').then(({ registerAutoRespawn }) => {
+      registerAutoRespawn(id, autoRespawnConfig);
+    }).catch(e => logger.error(`[InitWorker] Failed to register auto-respawn for ${id}: ${e.message}`));
+  }
 
   // Track parent-child relationship
   if (parentWorkerId) {
@@ -242,35 +290,46 @@ function initializeWorker(id, config, io) {
   }
 
   // Send task/initial input after Claude initializes
+  // 3s delay (up from 1.5s) — tmux pane needs time to be ready after session creation
   setTimeout(async () => {
-    try {
-      const currentWorker = workers.get(id);
-      if (currentWorker && currentWorker.status === 'running') {
-        const workerType = detectWorkerType(label);
-        let stdinMsg = null;
-
-        if (initialInput) {
-          stdinMsg = initialInput;
-        } else if (task) {
-          if (typeof task === 'string') {
-            stdinMsg = `Here is your task:\n\n${escapePromptXml(task)}`;
-          } else if (typeof task === 'object' && task.description) {
-            let taskMsg = `Here is your task:\n\n${escapePromptXml(task.description)}`;
-            if (task.purpose) taskMsg += `\n\nPurpose: ${escapePromptXml(task.purpose)}`;
-            if (task.endState) taskMsg += `\nSuccess criteria: ${escapePromptXml(task.endState)}`;
-            if (task.keyTasks && Array.isArray(task.keyTasks)) {
-              taskMsg += `\n\nKey steps:\n${task.keyTasks.map(t => '- ' + escapePromptXml(t)).join('\n')}`;
-            }
-            if (task.constraints && Array.isArray(task.constraints)) {
-              taskMsg += `\n\nConstraints:\n${task.constraints.map(c => '- ' + escapePromptXml(c)).join('\n')}`;
-            }
-            stdinMsg = taskMsg;
+    const TMUX_MAX_CHARS = 8000; // safe tmux send-keys limit; longer strings kill IMPL workers
+    const buildTaskMsg = () => {
+      if (initialInput) return initialInput;
+      if (task) {
+        if (typeof task === 'string') {
+          return `Here is your task:\n\n${escapePromptXml(task)}`;
+        } else if (typeof task === 'object' && task.description) {
+          let taskMsg = `Here is your task:\n\n${escapePromptXml(task.description)}`;
+          if (task.purpose) taskMsg += `\n\nPurpose: ${escapePromptXml(task.purpose)}`;
+          if (task.endState) taskMsg += `\nSuccess criteria: ${escapePromptXml(task.endState)}`;
+          if (task.keyTasks && Array.isArray(task.keyTasks)) {
+            taskMsg += `\n\nKey steps:\n${task.keyTasks.map(t => '- ' + escapePromptXml(t)).join('\n')}`;
           }
-        } else if (workerType.isGeneral) {
+          if (task.constraints && Array.isArray(task.constraints)) {
+            taskMsg += `\n\nConstraints:\n${task.constraints.map(c => '- ' + escapePromptXml(c)).join('\n')}`;
+          }
+          return taskMsg;
+        }
+      }
+      return null;
+    };
+
+    const tryDeliver = async (attemptsLeft) => {
+      try {
+        const currentWorker = workers.get(id);
+        if (!currentWorker || currentWorker.status !== 'running') return;
+        const workerType = detectWorkerType(label);
+        let stdinMsg = buildTaskMsg();
+        if (!stdinMsg && workerType.isGeneral) {
           stdinMsg = 'Awaiting orders. You have no assigned task yet — wait for the human to provide one. Do NOT begin autonomous operations or start scouting.';
         }
 
         if (stdinMsg) {
+          // Truncate before tmux send-keys — "command too long" kills IMPL workers silently
+          if (stdinMsg.length > TMUX_MAX_CHARS) {
+            logger.warn(`[TaskDelivery] Task message too long (${stdinMsg.length} chars) for ${label}, truncating to ${TMUX_MAX_CHARS}`);
+            stdinMsg = stdinMsg.slice(0, TMUX_MAX_CHARS) + '\n\n[...truncated, full task in context file...]';
+          }
           // Aider treats each newline as a prompt submission, so collapse
           // multi-line task messages into a single line for aider workers
           if (currentWorker.backend === 'aider') {
@@ -279,11 +338,19 @@ function initializeWorker(id, config, io) {
           await sendInputDirect(id, stdinMsg, 'lifecycle:stdin');
           logger.info(`Sent initial task to ${label}`);
         }
+      } catch (err) {
+        // Retry on "can't find pane" — pane occasionally not ready even at 3s
+        if (attemptsLeft > 0 && err.message && err.message.includes("can't find pane")) {
+          logger.warn(`[TaskDelivery] Pane not ready for ${label}, retrying in 1s (${attemptsLeft} attempts left)`);
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          return tryDeliver(attemptsLeft - 1);
+        }
+        logger.error(`Failed to send initial task to ${label}:`, err.message);
       }
-    } catch (err) {
-      logger.error(`Failed to send initial task to ${label}:`, err.message);
-    }
-  }, 1500);
+    };
+
+    await tryDeliver(3);
+  }, 3000);
 
   // Ralph adoption reminder
   if (ralphMode && ralphToken) {
@@ -296,6 +363,60 @@ function initializeWorker(id, config, io) {
         logger.info(`[Ralph] Sent 60s reminder to ${label}`);
       }
     }, 60000);
+  }
+
+  // Task re-delivery: if worker hasn't signaled Ralph and has minimal output at 3min,
+  // re-send the task — handles the ~8% of workers that silently fail to receive their task
+  if (task || initialInput) {
+    setTimeout(async () => {
+      try {
+        const w = workers.get(id);
+        if (!w || w.status !== 'running') return;
+        // A Ralph signal is definitive proof the worker received its task — never re-deliver
+        if (w.ralphSignalCount > 0) return;
+        if (w.ralphStatus && w.ralphStatus !== 'pending') return;
+
+        const buf = outputBuffers.get(id) || '';
+        if (buf.length >= 2000) return;
+
+        // Worker still pending with minimal output — re-send task
+        logger.warn(`[TaskRedelivery] ${label} hasn't signaled after 3min, re-sending task`);
+
+        let redeliveryMsg = null;
+        if (initialInput) {
+          redeliveryMsg = initialInput;
+        } else if (task) {
+          if (typeof task === 'string') {
+            redeliveryMsg = `Here is your task:\n\n${escapePromptXml(task)}`;
+          } else if (typeof task === 'object' && task.description) {
+            let taskMsg = `Here is your task:\n\n${escapePromptXml(task.description)}`;
+            if (task.purpose) taskMsg += `\n\nPurpose: ${escapePromptXml(task.purpose)}`;
+            if (task.endState) taskMsg += `\nSuccess criteria: ${escapePromptXml(task.endState)}`;
+            if (task.keyTasks && Array.isArray(task.keyTasks)) {
+              taskMsg += `\n\nKey steps:\n${task.keyTasks.map(t => '- ' + escapePromptXml(t)).join('\n')}`;
+            }
+            if (task.constraints && Array.isArray(task.constraints)) {
+              taskMsg += `\n\nConstraints:\n${task.constraints.map(c => '- ' + escapePromptXml(c)).join('\n')}`;
+            }
+            redeliveryMsg = taskMsg;
+          }
+        }
+
+        if (redeliveryMsg) {
+          if (redeliveryMsg.length > 8000) {
+            logger.warn(`[TaskRedelivery] Redelivery message too long (${redeliveryMsg.length} chars) for ${label}, truncating`);
+            redeliveryMsg = redeliveryMsg.slice(0, 8000) + '\n\n[...truncated, full task in context file...]';
+          }
+          if (w.backend === 'aider') {
+            redeliveryMsg = redeliveryMsg.replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim();
+          }
+          await sendInputDirect(id, redeliveryMsg, 'lifecycle:task_redelivery');
+          logger.info(`[TaskRedelivery] Re-sent task to ${label}`);
+        }
+      } catch (err) {
+        logger.error(`[TaskRedelivery] Failed to re-send task to ${label}:`, err.message);
+      }
+    }, 180000);
   }
 
   return worker;
@@ -331,6 +452,9 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
     backend = 'claude',
     model = null,
     autoDismissAfterDone = true,
+    effortLevel = null,
+    autoRespawn = false,
+    autoRespawnConfig = null,
   } = options;
 
   const id = uuidv4().slice(0, 8);
@@ -426,12 +550,9 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
       externalRalphToken,
       backend,
       model,
+      effortLevel,
       createdAt: Date.now()
     });
-
-    if (workflowId && taskId) {
-      registerWorkflowWorker(workflowId, taskId, id);
-    }
 
     const activity = addActivity('worker_pending', id, workerLabel, projectName,
       `Worker "${workerLabel}" waiting on ${dependsOn.length} dependencies`);
@@ -512,13 +633,17 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
       ]);
     } else {
       const toolArgs = getToolRestrictionArgs(workerLabel);
+      const effortArgs = getEffortArgs(workerLabel, effortLevel);
+      const modelArgs = model ? ['--model', model] : [];
       await spawnTmux([
         'new-session', '-d',
         '-s', sessionName,
         '-x', String(DEFAULT_COLS),
         '-y', String(DEFAULT_ROWS),
+        '-e', `CLAUDE_CODE_EFFORT_LEVEL=${getEffortLevel(workerLabel, effortLevel)}`,
+        '-e', 'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=65',
         '-c', projectPath,
-        'claude', ...toolArgs
+        'claude', ...modelArgs, ...toolArgs, ...effortArgs
       ]);
     }
     logger.info(`[SpawnWorker] tmux session ${sessionName} created successfully`);
@@ -536,13 +661,10 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
       dependsOn, workflowId, taskId,
       parentWorkerId, parentLabel, task, initialInput,
       autoAccept, ralphMode, backend, model, autoDismissAfterDone,
+      autoRespawn, autoRespawnConfig,
     }, io);
 
     inFlightSpawns.delete(spawnKey);
-
-    if (workflowId && taskId) {
-      registerWorkflowWorker(workflowId, taskId, id);
-    }
 
     const activity = addActivity('worker_started', id, workerLabel, projectName,
       `Started worker "${workerLabel}" in ${projectPath}`);
@@ -550,6 +672,8 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
     if (io) {
       io.emit('worker:created', normalizeWorker(worker));
       io.emit('activity:new', activity);
+      // Add all connected sockets to this worker's room for worker:updated events
+      io.socketsJoin(`worker:${id}`);
     }
 
     const { saveWorkerState } = await import('./persistence.js');
@@ -669,13 +793,17 @@ async function startPendingWorker(workerId, io = null) {
       ]);
     } else {
       const toolArgs = getToolRestrictionArgs(pending.label);
+      const effortArgs = getEffortArgs(pending.label, pending.effortLevel || null);
+      const modelArgs = pending.model ? ['--model', pending.model] : [];
       await spawnTmux([
         'new-session', '-d',
         '-s', sessionName,
         '-x', String(DEFAULT_COLS),
         '-y', String(DEFAULT_ROWS),
+        '-e', `CLAUDE_CODE_EFFORT_LEVEL=${getEffortLevel(pending.label, pending.effortLevel || null)}`,
+        '-e', 'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=65',
         '-c', pending.projectPath,
-        'claude', ...toolArgs
+        'claude', ...modelArgs, ...toolArgs, ...effortArgs
       ]);
     }
     resetCircuitBreakerOnSuccess();
@@ -696,6 +824,8 @@ async function startPendingWorker(workerId, io = null) {
       effectiveIo.emit('worker:created', normalizeWorker(worker));
       effectiveIo.emit('worker:dependencies_satisfied', { workerId });
       effectiveIo.emit('activity:new', activity);
+      // Add all connected sockets to this worker's room for worker:updated events
+      effectiveIo.socketsJoin(`worker:${workerId}`);
     }
 
     const { saveWorkerState } = await import('./persistence.js');
@@ -746,10 +876,24 @@ async function startPendingWorker(workerId, io = null) {
 // WORKER TEARDOWN / CLEANUP / KILL
 // ============================================
 
-async function teardownWorker(workerId, worker, io, { activityMessage, logPrefix = 'Teardown', skipTmuxKill = false } = {}) {
+async function teardownWorker(workerId, worker, io, { activityMessage, logPrefix = 'Teardown', skipTmuxKill = false, reason = 'killed', skipAutoRespawn = false } = {}) {
   const deathCb = getWorkerDeathCallback();
   if (deathCb && worker.ralphToken) {
     try { deathCb(worker); } catch (e) { /* ignore */ }
+  }
+
+  // Trigger auto-respawn for generals that die unexpectedly (not dismissed/completed)
+  if (!skipAutoRespawn && worker.autoRespawn && reason !== 'dismissed' && reason !== 'completed') {
+    const workerSnapshot = {
+      ralphProgress: worker.ralphProgress,
+      ralphCurrentStep: worker.ralphCurrentStep,
+      ralphLearnings: worker.ralphLearnings,
+    };
+    import('../services/autoRespawnService.js').then(({ handleGeneralDeath }) => {
+      handleGeneralDeath(workerId, reason, io, workerSnapshot).catch(e =>
+        logger.error(`[AutoRespawn] handleGeneralDeath failed for ${workerId}: ${e.message}`)
+      );
+    }).catch(e => logger.error(`[AutoRespawn] Import failed: ${e.message}`));
   }
 
   stopPtyCapture(workerId);
@@ -849,6 +993,14 @@ export async function cleanupWorker(workerId, io) {
 
   const { writeWorkerCheckpoint } = await import('./persistence.js');
   writeWorkerCheckpoint(workerId, 'cleanup');
+
+  // Record failure in learnings DB if worker never signaled done.
+  // Skip if worker completed successfully (awaiting_review = signaled done but not yet dismissed).
+  const { persistFailureLearning } = await import('./ralph.js');
+  const successfulRalphStatuses = new Set(['done', 'awaiting_review']);
+  if (!successfulRalphStatuses.has(worker.ralphStatus)) {
+    persistFailureLearning(worker, workerId, 'cleanup');
+  }
 
   addRespawnSuggestion(workerId, worker);
 
@@ -950,6 +1102,14 @@ export async function killWorker(workerId, io = null, options = {}) {
   const { writeWorkerCheckpoint } = await import('./persistence.js');
   writeWorkerCheckpoint(workerId, options.reason || 'killed');
 
+  // Record failure in learnings DB if worker never signaled done.
+  // Skip if: worker was dismissed/killed after completing (awaiting_review = signaled done but not yet dismissed).
+  const { persistFailureLearning } = await import('./ralph.js');
+  const successfulRalphStatuses = new Set(['done', 'awaiting_review']);
+  if (!successfulRalphStatuses.has(worker.ralphStatus)) {
+    persistFailureLearning(worker, workerId, options.reason || 'killed');
+  }
+
   try {
     validateSessionName(worker.tmuxSession);
   } catch (validationError) {
@@ -1007,6 +1167,8 @@ export async function killWorker(workerId, io = null, options = {}) {
     activityMessage: `Stopped worker "${worker.label}"`,
     logPrefix: 'KillWorker',
     skipTmuxKill: true,
+    reason: options.reason || 'killed',
+    skipAutoRespawn: options.reason === 'dismissed' || options.reason === 'completed',
   });
 
   return true;
@@ -1014,7 +1176,11 @@ export async function killWorker(workerId, io = null, options = {}) {
 
 export async function dismissWorker(workerId, io = null) {
   const worker = workers.get(workerId);
-  if (!worker) throw new Error(`Worker ${workerId} not found`);
+  if (!worker) {
+    // Worker already dismissed, completed, or cleaned up — idempotent success.
+    // Avoids 404 when the MCP layer retries a dismiss after the worker was auto-dismissed.
+    return { dismissed: true, alreadyGone: true };
+  }
 
   let uncommittedWarning = null;
   try {
@@ -1250,7 +1416,7 @@ export function updateWorkerLabel(workerId, newLabel, io = null) {
   worker.lastActivity = new Date();
 
   if (io) {
-    io.emit('worker:updated', normalizeWorker(worker));
+    io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(worker));
   }
 
   import('./persistence.js').then(({ saveWorkerState }) => {

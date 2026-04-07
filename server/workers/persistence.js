@@ -197,6 +197,7 @@ function serializeWorker(w) {
     autoContinueCount: w.autoContinueCount ?? 0,
     autoDismissAfterDone: w.autoDismissAfterDone ?? true,
     taskReceivedAt: w.taskReceivedAt ?? null,
+    taskQualityScore: w.taskQualityScore ?? null,
   };
 }
 
@@ -344,6 +345,22 @@ export async function restoreWorkerState(io = null) {
             }
           }
         }
+        // Checkpoint dead-session workers so the operator has visibility into what was lost
+        try {
+          const checkpoint = {
+            ...savedWorker,
+            reason: 'tmux session died during server downtime',
+            diedAt: new Date().toISOString(),
+            uptime: savedWorker.createdAt
+              ? Math.max(0, Date.now() - new Date(savedWorker.createdAt).getTime())
+              : 0,
+          };
+          const checkpointPath = path.join(CHECKPOINT_DIR, `${savedWorker.id}.json`);
+          writeFileSync(checkpointPath, JSON.stringify(checkpoint, null, 2));
+          console.warn(`[Restore] ⚠ Dead-session worker checkpointed: ${savedWorker.label} (${savedWorker.id}) — last progress: ${savedWorker.ralphProgress ?? 'unknown'}%, step: ${savedWorker.ralphCurrentStep ?? 'unknown'}`);
+        } catch (cpErr) {
+          console.error(`[Restore] Failed to write checkpoint for dead worker ${savedWorker.id}:`, cpErr.message);
+        }
         continue;
       }
 
@@ -361,6 +378,22 @@ export async function restoreWorkerState(io = null) {
         await spawnTmux(['capture-pane', '-t', savedWorker.tmuxSession, '-p']);
       } catch {
         console.warn(`  Skipping ${savedWorker.label} (${savedWorker.id}) - session exists but capture-pane failed (zombie session)`);
+        // Checkpoint zombie-session workers so the operator has visibility into what was lost
+        try {
+          const checkpoint = {
+            ...savedWorker,
+            reason: 'zombie tmux session (capture-pane failed) during server restore',
+            diedAt: new Date().toISOString(),
+            uptime: savedWorker.createdAt
+              ? Math.max(0, Date.now() - new Date(savedWorker.createdAt).getTime())
+              : 0,
+          };
+          const checkpointPath = path.join(CHECKPOINT_DIR, `${savedWorker.id}.json`);
+          writeFileSync(checkpointPath, JSON.stringify(checkpoint, null, 2));
+          console.warn(`[Restore] ⚠ Zombie-session worker checkpointed: ${savedWorker.label} (${savedWorker.id}) — last progress: ${savedWorker.ralphProgress ?? 'unknown'}%, step: ${savedWorker.ralphCurrentStep ?? 'unknown'}`);
+        } catch (cpErr) {
+          console.error(`[Restore] Failed to write checkpoint for zombie worker ${savedWorker.id}:`, cpErr.message);
+        }
         continue;
       }
 
@@ -378,6 +411,18 @@ export async function restoreWorkerState(io = null) {
           const checkpointPath = path.join(CHECKPOINT_DIR, `${savedWorker.id}.json`);
           writeFileSync(checkpointPath, JSON.stringify(savedWorker, null, 2));
         } catch { /* best-effort checkpoint */ }
+        continue;
+      }
+
+      // Skip ephemeral workers that should not survive a server restart.
+      // Auto-bulldoze workers are spawned on-demand by external watchdogs and should
+      // not be reanimated from persistence — the watchdog will re-create them if needed.
+      const workerLabel = typeof savedWorker.label === 'string' ? savedWorker.label.toLowerCase() : '';
+      if (workerLabel.startsWith('auto-bulldoze')) {
+        console.log(`[Restore] Skipping ephemeral worker ${savedWorker.label} (${savedWorker.id}) — auto-bulldoze workers are not restored`);
+        try {
+          await spawnTmux(['kill-session', '-t', savedWorker.tmuxSession]);
+        } catch { /* session may already be gone */ }
         continue;
       }
 
@@ -499,6 +544,7 @@ export async function restoreWorkerState(io = null) {
         autoDismissAfterDone: savedWorker.autoDismissAfterDone !== false, // default true
         // Task received timestamp
         taskReceivedAt: savedWorker.taskReceivedAt ? new Date(savedWorker.taskReceivedAt) : null,
+        taskQualityScore: savedWorker.taskQualityScore ?? null,
       };
 
       // Per-worker try-catch: if one worker fails to initialize, continue restoring others
@@ -518,6 +564,8 @@ export async function restoreWorkerState(io = null) {
         // Notify UI about restored worker
         if (io) {
           io.emit('worker:created', normalizeWorker(worker));
+          // Add all connected sockets to this worker's room for worker:updated events
+          io.socketsJoin(`worker:${savedWorker.id}`);
         }
 
         // Start database session for output persistence

@@ -138,7 +138,7 @@ async function testSummaryQuality() {
       },
       {
         name: 'Has valid status',
-        test: () => ['idle', 'thinking', 'coding', 'running_command', 'waiting_input', 'error'].includes(summary.status),
+        test: () => ['idle', 'thinking', 'coding', 'running_command', 'waiting_input', 'error', 'unknown'].includes(summary.status),
         value: () => summary.status
       },
       {

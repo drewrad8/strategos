@@ -61,6 +61,7 @@ export {
 // From persistence.js — save/restore, checkpoints
 export {
   saveWorkerState,
+  saveWorkerStateImmediate,
   saveWorkerStateSync,
   restoreWorkerState,
 } from './workers/persistence.js';

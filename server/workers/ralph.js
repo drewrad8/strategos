@@ -13,6 +13,12 @@ import {
 
 import { sendInputDirect } from './output.js';
 import { getLogger } from '../logger.js';
+import { addLearning } from '../learningsDb.js';
+import { detectWorkerType } from './templates.js';
+import { triggerAnalysis } from '../services/insightAnalyzer.js';
+import { generateReflection } from '../services/reflexionService.js';
+import { runReviewGate } from '../services/reviewGateService.js';
+import { getHierarchyRootId, appendBlackboardEntry } from '../blackboardDb.js';
 
 // Shared completion keyword regex — used for keyword-based auto-promotion.
 // Centralized here so ralph.js, health.js, and persistence.js all use the same pattern.
@@ -90,9 +96,110 @@ function deliverResultsToParent(worker, workerId, statusNote) {
   // Mark results as delivered to prevent duplicate deliveries
   worker._resultsDelivered = true;
 
+  // Backup capture: persist learnings if not already persisted
+  if (!worker._learningsPersisted) {
+    _persistLearning(worker, workerId);
+  }
+
   sendInputDirect(worker.parentWorkerId, resultSummary, 'ralph:result_delivery').catch(e => {
     getLogger().warn(`Could not deliver results to parent ${worker.parentWorkerId}`, { workerId, parentWorkerId: worker.parentWorkerId, error: e.message });
   });
+}
+
+/**
+ * Persist a worker's learnings to the learnings database.
+ * Called when a worker signals done or is auto-promoted.
+ */
+function _persistLearning(worker, workerId) {
+  // Idempotency guard: prevents double-entry if called from both the done-signal
+  // handler and deliverResultsToParent's backup capture in the same lifecycle.
+  if (worker._learningsPersisted) return;
+
+  try {
+    const typeInfo = detectWorkerType(worker.label);
+    const taskDesc = worker.taskDescription || worker.task?.description || worker.task || null;
+    const uptime = worker.createdAt
+      ? Math.max(0, Date.now() - new Date(worker.createdAt).getTime())
+      : null;
+
+    addLearning({
+      workerId,
+      label: worker.label,
+      templateType: typeInfo.prefix ? typeInfo.prefix.toLowerCase() : null,
+      templateHash: null,
+      learnings: worker.ralphLearnings || null,
+      outputs: worker.ralphOutputs || null,
+      artifacts: worker.ralphArtifacts || null,
+      taskDescription: typeof taskDesc === 'string' ? taskDesc : (taskDesc ? JSON.stringify(taskDesc) : null),
+      parentWorkerId: worker.parentWorkerId || null,
+      effortLevel: worker.effortLevel || null,
+      success: 1,
+      uptime,
+      taskQualityScore: worker.taskQualityScore != null ? worker.taskQualityScore : null,
+    });
+    worker._learningsPersisted = true;
+
+    // Trigger event-driven insight analysis when new learnings arrive
+    triggerAnalysis();
+  } catch (err) {
+    getLogger().warn(`Failed to persist learning for ${workerId}: ${err.message}`, { workerId });
+  }
+}
+
+/**
+ * Record a failure learning when a worker dies without signaling done.
+ * Guards against double-recording: skips if worker already persisted a success learning.
+ * @param {Object} worker - The worker object
+ * @param {string} workerId - Worker ID
+ * @param {string} reason - Death reason (e.g. 'killed', 'crashed', 'session_died')
+ */
+export function persistFailureLearning(worker, workerId, reason) {
+  if (!worker) return;
+  // Don't overwrite a success: worker already signaled done or is awaiting review after done
+  if (worker._learningsPersisted || worker.ralphStatus === 'done' || worker.ralphStatus === 'awaiting_review') return;
+  // Don't count dismissed/completed workers as failures — they finished their task
+  if (worker.status === 'dismissed' || worker.status === 'completed') return;
+
+  try {
+    const typeInfo = detectWorkerType(worker.label);
+    const taskDesc = worker.taskDescription || worker.task?.description || worker.task || null;
+    const uptime = worker.createdAt
+      ? Math.max(0, Date.now() - new Date(worker.createdAt).getTime())
+      : null;
+
+    // Ephemeral test fixtures (no task description, or killed in <120s before Claude
+    // could even start typing) are recorded as neutral (null) rather than failure (0)
+    // so they don't inflate failure counts in success-rate metrics.
+    const isEphemeral = !taskDesc || (uptime !== null && uptime < 120000);
+
+    addLearning({
+      workerId,
+      label: worker.label,
+      templateType: typeInfo.prefix ? typeInfo.prefix.toLowerCase() : null,
+      templateHash: null,
+      learnings: worker.ralphLearnings || null,
+      outputs: worker.ralphOutputs || null,
+      artifacts: worker.ralphArtifacts || null,
+      taskDescription: typeof taskDesc === 'string' ? taskDesc : (taskDesc ? JSON.stringify(taskDesc) : null),
+      parentWorkerId: worker.parentWorkerId || null,
+      effortLevel: worker.effortLevel || null,
+      success: isEphemeral ? null : 0,
+      uptime,
+      taskQualityScore: worker.taskQualityScore != null ? worker.taskQualityScore : null,
+    });
+    worker._learningsPersisted = true;
+
+    getLogger().info(`[LearningsDB] Recorded failure for ${workerId} (${worker.label}), reason: ${reason}`);
+
+    // Fire-and-forget reflexion generation — async, non-blocking
+    const templateType = typeInfo.prefix ? typeInfo.prefix.toLowerCase() : null;
+    if (templateType) {
+      const taskDescStr = typeof taskDesc === 'string' ? taskDesc : (taskDesc ? JSON.stringify(taskDesc) : null);
+      setImmediate(() => generateReflection(workerId, templateType, taskDescStr).catch(() => {}));
+    }
+  } catch (err) {
+    getLogger().warn(`Failed to persist failure learning for ${workerId}: ${err.message}`, { workerId });
+  }
 }
 
 /**
@@ -104,7 +211,7 @@ function deliverResultsToParent(worker, workerId, statusNote) {
  */
 function emitDoneEvents(worker, workerId, io) {
   if (!io) return;
-  io.emit('worker:updated', normalizeWorker(worker));
+  io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(worker));
   io.emit('worker:awaiting_review', {
     workerId,
     label: worker.label,
@@ -143,6 +250,19 @@ function transitionToDone(worker, workerId, io, statusNote) {
   worker.ralphSignaledAt = new Date();
   worker.status = 'awaiting_review';
   worker.awaitingReviewAt = new Date();
+
+  // Clear blackboard for GENERAL hierarchy roots when they signal done
+  const upperLabel = (worker.label || '').toUpperCase();
+  if ((upperLabel.startsWith('GENERAL:') || upperLabel.startsWith('GENERAL ')) && worker.projectPath) {
+    import('../blackboardDb.js').then(({ getHierarchyRootId, clearBlackboard }) => {
+      const rootId = getHierarchyRootId(workerId, workers);
+      if (rootId === workerId) {
+        clearBlackboard(worker.projectPath, rootId).catch(err => {
+          getLogger().warn(`Failed to clear blackboard for ${workerId}: ${err.message}`, { workerId });
+        });
+      }
+    }).catch(() => {});
+  }
 
   emitDoneEvents(worker, workerId, io);
   deliverResultsToParent(worker, workerId, statusNote);
@@ -246,7 +366,7 @@ export function revertFromDone(workerId, io, reason) {
   getLogger().info(`Worker ${workerId} (${worker.label}) reverted from awaiting_review → running (${reason})`, { workerId, label: worker.label, reason });
 
   if (io) {
-    io.emit('worker:updated', normalizeWorker(worker));
+    io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(worker));
   }
 
   return true;
@@ -339,7 +459,9 @@ export function updateWorkerRalphStatus(workerId, signalData, io = null) {
   }
 
   // Auto-suppress forced autonomy nudges on done/blocked signals
-  if ((status === 'done' || status === 'blocked') && worker.forcedAutonomy) {
+  // Exception: GENERALs are continuous-ops workers — they routinely signal done after each
+  // wave of work but should always be nudged to find the next wave. Never suppress them.
+  if ((status === 'done' || status === 'blocked') && worker.forcedAutonomy && !isPersistentTier(worker)) {
     console.log(`[ForcedAutonomy] Auto-suppressing nudges for ${worker.label} — worker signaled ${status}`);
     worker._forcedAutonomySuppressed = true;
   }
@@ -429,25 +551,71 @@ export function updateWorkerRalphStatus(workerId, signalData, io = null) {
     }
   }
 
-  // Emit update event (skip if auto-promoted or if done handler will emit below)
-  const willEnterDoneHandler = (status === 'done' || autoPromoted) && worker.status !== 'awaiting_review';
+  // Emit update event (skip if done handler will emit below via emitDoneEvents)
+  // Note: auto-promotion is fully handled by transitionToDone() above — no need to check it here.
+  const willEnterDoneHandler = status === 'done' && worker.status !== 'awaiting_review';
   if (!autoPromoted && !willEnterDoneHandler && io) {
-    io.emit('worker:updated', normalizeWorker(worker));
+    io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(worker));
   }
 
-  // On "done": transition to awaiting_review (only if not already handled by auto-promotion)
-  if ((status === 'done' || autoPromoted) && worker.status !== 'awaiting_review') {
+  // On "done": transition to awaiting_review.
+  // Auto-promotion is already handled by transitionToDone() — only fire for explicit done signals.
+  if (status === 'done' && worker.status !== 'awaiting_review') {
     worker.status = 'awaiting_review';
     worker.awaitingReviewAt = new Date();
     getLogger().info(`Worker ${workerId} (${worker.label}) → awaiting_review`, { workerId, label: worker.label });
 
     emitDoneEvents(worker, workerId, io);
 
-    // Auto-deliver structured results to parent worker
-    deliverResultsToParent(worker, workerId, 'Complete');
+    // Persist learnings immediately (before review gate, so it's not lost if gate is slow)
+    _persistLearning(worker, workerId);
 
     // Start auto-dismiss countdown
     startAutoDismissTimer(workerId, io);
+
+    // Run review gate async — annotates delivery but never blocks it.
+    // Gate runs only for impl/fix/colonel; all others deliver immediately.
+    const typeInfo = detectWorkerType(worker.label);
+    const templateType = typeInfo.prefix ? typeInfo.prefix.toLowerCase() : null;
+
+    runReviewGate(worker, workerId, templateType).then(({ decision, annotation }) => {
+      if (annotation) {
+        worker.ralphLearnings = worker.ralphLearnings
+          ? `${annotation}\n${worker.ralphLearnings}`
+          : annotation;
+      }
+
+      // Write blackboard warning so sibling workers see the flag immediately
+      const projectDir = worker.workingDir || worker.projectPath;
+      if ((decision === 'fail' || decision === 'conditional') && projectDir) {
+        const rootId = getHierarchyRootId(workerId, workers);
+        const workerLabel = worker.label || workerId;
+        const summary = annotation
+          ? `${workerLabel}: ${annotation}`
+          : `${workerLabel} flagged as ${decision} by review gate`;
+        appendBlackboardEntry(
+          projectDir,
+          rootId,
+          workerId,
+          workerLabel,
+          'warning',
+          'review_gate',
+          summary.slice(0, 200)
+        ).catch(err => {
+          getLogger().warn(`[ReviewGate] Failed to write blackboard warning for ${workerId}: ${err.message}`, { workerId });
+        });
+      }
+
+      const statusNote = decision === 'fail'
+        ? 'Complete (review flagged issues)'
+        : decision === 'conditional'
+          ? 'Complete (with review annotation)'
+          : 'Complete';
+      deliverResultsToParent(worker, workerId, statusNote);
+    }).catch(() => {
+      // Review gate error: deliver normally without annotation
+      deliverResultsToParent(worker, workerId, 'Complete');
+    });
   }
 
   // Also notify parent worker if exists (for non-done signals)
@@ -526,7 +694,7 @@ function _updateParentAggregation(parentWorkerId, io) {
       parent.ralphProgress = avgProgress;
       parent.ralphCurrentStep = stepSummary.slice(0, 500);
       if (io) {
-        io.emit('worker:updated', normalizeWorker(parent));
+        io.to(`worker:${parent.id}`).emit('worker:updated', normalizeWorker(parent));
       }
     }
   } else {
@@ -534,7 +702,7 @@ function _updateParentAggregation(parentWorkerId, io) {
     parent.ralphProgress = avgProgress;
     parent.ralphCurrentStep = stepSummary.slice(0, 500);
     if (io) {
-      io.emit('worker:updated', normalizeWorker(parent));
+      io.to(`worker:${parent.id}`).emit('worker:updated', normalizeWorker(parent));
     }
   }
 

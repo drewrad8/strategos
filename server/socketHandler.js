@@ -77,6 +77,43 @@ function createSocketRateLimiter() {
   };
 }
 
+/**
+ * ORPHANED SERVER EVENTS (emitted but no client handler as of R50 audit, 2026-04-05)
+ * These events are emitted for observability and available for future client toast handlers.
+ * See research/50-socket-realtime-audit.md §1.2 and recommendation R1 for details.
+ *
+ * Health events (server/workers/health.js):
+ *   worker:general:stalled          — GENERAL worker has stalled
+ *   worker:auto-killed:stall        — Worker auto-killed for stalling
+ *   worker:auto-killed:completion   — Worker auto-killed after completion timeout
+ *   worker:completion-nudge         — Worker nudged toward completion
+ *   worker:signal-overdue           — Ralph signal overdue warning
+ *   worker:colonel:max-lifetime     — Colonel exceeded max lifetime
+ *   worker:age:warning              — Worker age warning
+ *   system:resource:critical        — System resource threshold exceeded
+ *
+ * Ralph events (server/workers/ralph.js):
+ *   worker:auto-dismissed           — Worker auto-dismissed after Ralph done signal
+ *
+ * Output events (server/workers/output.js):
+ *   worker:role:violation           — GENERAL worker detected coding (role guard)
+ *   worker:rate_limited             — Worker output rate-limited
+ *   worker:autocontinue             — Auto-continue triggered
+ *   worker:autocontinue:exhausted   — Auto-continue limit reached
+ *   worker:session-recovery-exhausted — Session recovery failed after all retries
+ *   worker:session-recovered        — Session recovered after failure
+ *
+ * Lifecycle events (server/workers/lifecycle.js):
+ *   worker:dependencies_satisfied   — All dependencies met, worker unblocked
+ *
+ * System events (server/index.js):
+ *   sentinel:status                 — Watchdog sentinel status update
+ *
+ * Retest events (server/services/retestService.js):
+ *   retest:started, retest:completed, retest:spec:started,
+ *   retest:spec:completed, retest:cancelled
+ */
+
 export function setupSocketHandlers(io, theaRoot) {
   // Handle server-level socket errors
   io.engine.on('connection_error', (err) => {
@@ -92,6 +129,11 @@ export function setupSocketHandlers(io, theaRoot) {
 
     // Per-socket rate limiter
     const rateLimiter = createSocketRateLimiter();
+
+    // Per-socket worker association: tracks which worker rooms this socket has
+    // explicitly joined. Mutation events (kill, input, settings, etc.) require
+    // the socket to have joined the target worker's room first.
+    const joinedWorkers = new Set();
 
     // Per-socket middleware: rate-limit all incoming events before they reach handlers
     socket.use(([event, ...args], next) => {
@@ -117,6 +159,11 @@ export function setupSocketHandlers(io, theaRoot) {
       // Cap at 4KB per worker to avoid flooding the socket on connect
       const workers = getWorkers();
       for (const worker of workers) {
+        // Auto-join worker room and register ownership so the socket can
+        // immediately mutate any existing worker (single-user UI behavior)
+        socket.join(`worker:${worker.id}`);
+        joinedWorkers.add(worker.id);
+
         const output = getWorkerOutput(worker.id);
         if (output) {
           const preview = output.length > 4096 ? output.slice(-4096) : output;
@@ -244,6 +291,11 @@ export function setupSocketHandlers(io, theaRoot) {
 
         const worker = await spawnWorker(resolvedPath, label, io, options);
 
+        // Auto-join the spawning socket to the new worker's room so it can
+        // immediately interact with the worker it just created.
+        socket.join(`worker:${worker.id}`);
+        joinedWorkers.add(worker.id);
+
         // If Ralph mode enabled, register with ralphService (match routes.js behavior)
         if (worker.ralphMode && worker.ralphToken) {
           const ralphService = socket.server?.app?.locals?.ralphService;
@@ -267,6 +319,9 @@ export function setupSocketHandlers(io, theaRoot) {
       if (force !== undefined && typeof force !== 'boolean') {
         return socket.emit('error', { message: 'force must be a boolean' });
       }
+      if (!joinedWorkers.has(workerId)) {
+        return socket.emit('error', { message: 'Not subscribed to this worker', workerId });
+      }
       console.log(`[Socket] Received worker:kill for ${workerId} (force: ${!!force})`);
       try {
         await killWorker(workerId, io, { force: !!force });
@@ -285,6 +340,9 @@ export function setupSocketHandlers(io, theaRoot) {
         }
         if (typeof input !== 'string' || input.length > MAX_INPUT_LENGTH) {
           return socket.emit('error', { message: 'Input too large or invalid', workerId });
+        }
+        if (!joinedWorkers.has(workerId)) {
+          return socket.emit('error', { message: 'Not subscribed to this worker', workerId });
         }
 
         // Cross-project guard: block workers from sending input to workers in different projects
@@ -315,6 +373,9 @@ export function setupSocketHandlers(io, theaRoot) {
         if (typeof keys !== 'string' || keys.length > MAX_INPUT_LENGTH) {
           return socket.emit('error', { message: 'Keys too large or invalid', workerId });
         }
+        if (!joinedWorkers.has(workerId)) {
+          return socket.emit('error', { message: 'Not subscribed to this worker', workerId });
+        }
         await sendRawInput(workerId, keys);
       } catch (error) {
         socket.emit('error', { message: sanitizeErrorMessage(error), workerId });
@@ -333,6 +394,9 @@ export function setupSocketHandlers(io, theaRoot) {
         if (CONTROL_CHAR_RE.test(label)) {
           return socket.emit('error', { message: 'label must not contain control characters', workerId });
         }
+        if (!joinedWorkers.has(workerId)) {
+          return socket.emit('error', { message: 'Not subscribed to this worker', workerId });
+        }
         updateWorkerLabel(workerId, label, io);
       } catch (error) {
         socket.emit('error', { message: sanitizeErrorMessage(error), workerId });
@@ -346,6 +410,9 @@ export function setupSocketHandlers(io, theaRoot) {
       }
       if (!settings || typeof settings !== 'object') {
         return socket.emit('error', { message: 'Invalid settings', workerId });
+      }
+      if (!joinedWorkers.has(workerId)) {
+        return socket.emit('error', { message: 'Not subscribed to this worker', workerId });
       }
       try {
         // Get worker before update to check previous Ralph state (internal — needs ralphToken)
@@ -418,8 +485,9 @@ curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Co
       try {
         const output = getWorkerOutput(workerId);
         socket.emit('worker:output', { workerId, output });
-        // Auto-subscribe to output updates for this worker
+        // Subscribe to output updates and register ownership
         socket.join(`worker:${workerId}`);
+        joinedWorkers.add(workerId);
       } catch (error) {
         socket.emit('error', { message: sanitizeErrorMessage(error), workerId });
       }
@@ -427,14 +495,16 @@ curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Co
 
     // Handle output subscription (join room for worker output updates)
     socket.on('worker:output:subscribe', ({ workerId }) => {
-      if (typeof workerId !== 'string' || !workerId) return;
+      if (typeof workerId !== 'string' || !VALID_WORKER_ID.test(workerId)) return;
       socket.join(`worker:${workerId}`);
+      joinedWorkers.add(workerId);
     });
 
     // Handle output unsubscription (leave room)
     socket.on('worker:output:unsubscribe', ({ workerId }) => {
-      if (typeof workerId !== 'string' || !workerId) return;
+      if (typeof workerId !== 'string' || !VALID_WORKER_ID.test(workerId)) return;
       socket.leave(`worker:${workerId}`);
+      joinedWorkers.delete(workerId);
     });
 
     // Handle terminal resize
@@ -444,6 +514,9 @@ curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Co
       }
       if (typeof cols !== 'number' || typeof rows !== 'number' || cols < 1 || rows < 1 || cols > 1000 || rows > 500) {
         return socket.emit('error', { message: 'Invalid resize dimensions', workerId });
+      }
+      if (!joinedWorkers.has(workerId)) {
+        return socket.emit('error', { message: 'Not subscribed to this worker', workerId });
       }
       try {
         await resizeWorkerTerminal(workerId, cols, rows, io);
@@ -457,6 +530,9 @@ curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Co
     socket.on('worker:complete', async ({ workerId }) => {
       if (typeof workerId !== 'string' || !workerId) {
         return socket.emit('error', { message: 'Invalid workerId' });
+      }
+      if (!joinedWorkers.has(workerId)) {
+        return socket.emit('error', { message: 'Not subscribed to this worker', workerId });
       }
       try {
         await completeWorker(workerId, io);
@@ -533,8 +609,9 @@ curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Co
     socket.on('disconnect', (reason) => {
       try {
         console.log(`Client disconnected: ${socket.id}, reason: ${reason}`);
-        // Clean up rate limiter to prevent memory leak
+        // Clean up rate limiter and ownership set to prevent memory leak
         rateLimiter.destroy();
+        joinedWorkers.clear();
 
         // Socket.io automatically removes socket from rooms on disconnect.
         // Stop broadcast if metrics room is now empty.

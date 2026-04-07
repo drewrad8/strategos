@@ -100,18 +100,9 @@ class StatusWriter {
     this.interval = setInterval(() => this._write(), UPDATE_INTERVAL);
     this.interval.unref(); // Don't prevent process exit
 
-    // Also write on systemd watchdog ping if available
-    if (process.send) {
-      // Running under systemd with Type=notify
-      this.watchdogInterval = setInterval(() => {
-        try {
-          process.send('WATCHDOG=1');
-        } catch {
-          // Not under systemd, ignore
-        }
-      }, UPDATE_INTERVAL);
-      this.watchdogInterval.unref(); // Don't prevent process exit
-    }
+    // TODO: real systemd watchdog requires sd_notify via NOTIFY_SOCKET env var (process.send
+    // only reaches a Node.js parent process, not systemd). Use a native addon or exec
+    // `systemd-notify WATCHDOG=1` as a subprocess when WATCHDOG_USEC is set.
   }
 
   /**
@@ -178,7 +169,9 @@ class StatusWriter {
       uptime: uptimeSeconds,
       error: {
         message: error?.message || String(error),
-        stack: error?.stack?.split('\n').slice(0, 5).join('\n')
+        stack: error?.stack?.split('\n').slice(0, 5)
+          .map(line => line.replace(/\/(home|var|tmp|usr|etc|opt)(\/[\w/.-]*)/g, '<redacted>'))
+          .join('\n')
       }
     };
 

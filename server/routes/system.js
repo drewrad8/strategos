@@ -638,18 +638,8 @@ export function createSystemRoutes(theaRoot, io) {
 
       const summaries = {};
       for (const type of intelligenceTypes) {
-        // Get raw metrics for filtering
-        const rawMetrics = metricsService.getMetrics(type, startTime, endTime, 10000);
-
-        // Apply label filters
-        const filtered = rawMetrics.filter(m => {
-          if (!filterTemplate && !filterProject) return true;
-          let labels = {};
-          try { labels = m.labels ? JSON.parse(m.labels) : {}; } catch { return true; }
-          if (filterTemplate && labels.template !== filterTemplate) return false;
-          if (filterProject && labels.project !== filterProject) return false;
-          return true;
-        });
+        // Fetch metrics with label filters pushed into SQL WHERE clause
+        const filtered = metricsService.getMetricsFiltered(type, startTime, endTime, 10000, filterTemplate, filterProject);
 
         // Calculate summary stats from filtered data
         if (filtered.length === 0) {
@@ -811,6 +801,13 @@ export function createSystemRoutes(theaRoot, io) {
       if (level !== undefined && !VALID_LOG_LEVELS.includes(normalizedLevel)) {
         return res.status(400).json({ error: `Invalid log level: "${level}". Valid levels: ${VALID_LOG_LEVELS.join(', ')}` });
       }
+      const ISO8601_RE = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?)?$/;
+      if (from !== undefined && !ISO8601_RE.test(from)) {
+        return res.status(400).json({ error: 'from must be an ISO 8601 date (e.g. 2024-01-01 or 2024-01-01T00:00:00Z)' });
+      }
+      if (to !== undefined && !ISO8601_RE.test(to)) {
+        return res.status(400).json({ error: 'to must be an ISO 8601 date (e.g. 2024-01-01 or 2024-01-01T00:00:00Z)' });
+      }
       const logs = logger.queryLogs({
         level: normalizedLevel,
         from,
@@ -932,24 +929,23 @@ export function createSystemRoutes(theaRoot, io) {
     return sanitized;
   }
 
-  router.get('/checkpoints', (req, res) => {
+  router.get('/checkpoints', async (req, res) => {
     try {
       const checkpointDir = path.join(path.dirname(new URL(import.meta.url).pathname), '..', '.tmp', 'checkpoints');
-      if (!fs.existsSync(checkpointDir)) {
+      let entries;
+      try {
+        entries = await fs.promises.readdir(checkpointDir);
+      } catch {
         return res.json([]);
       }
-      const files = fs.readdirSync(checkpointDir)
-        .filter(f => f.endsWith('.json'))
-        .slice(0, 200) // Cap to prevent reading thousands of files
-        .map(f => {
-          try {
-            const data = JSON.parse(fs.readFileSync(path.join(checkpointDir, f), 'utf8'));
-            return sanitizeCheckpoint(data);
-          } catch { return null; }
-        })
-        .filter(Boolean)
-        .sort((a, b) => new Date(b.diedAt) - new Date(a.diedAt));
-      res.json(files);
+      const filenames = entries.filter(f => f.endsWith('.json')).slice(0, 200); // Cap to prevent reading thousands of files
+      const results = await Promise.all(filenames.map(async f => {
+        try {
+          const data = JSON.parse(await fs.promises.readFile(path.join(checkpointDir, f), 'utf8'));
+          return sanitizeCheckpoint(data);
+        } catch { return null; }
+      }));
+      res.json(results.filter(Boolean).sort((a, b) => new Date(b.diedAt) - new Date(a.diedAt)));
     } catch (err) {
       res.status(500).json({ error: sanitizeErrorMessage(err) });
     }
@@ -979,12 +975,11 @@ export function createSystemRoutes(theaRoot, io) {
 
   router.get('/usage', async (req, res) => {
 
+    try {
     const now = Date.now();
     if (_usageCache && (now - _usageCacheTime) < USAGE_CACHE_TTL) {
       return res.json(_usageCache);
     }
-
-    try {
       const credsPath = path.join(os.homedir(), '.claude', '.credentials.json');
       if (!fs.existsSync(credsPath)) {
         return res.status(404).json({ error: 'No Claude credentials found' });
@@ -1029,6 +1024,8 @@ export function createSystemRoutes(theaRoot, io) {
         return res.status(502).json({ error: `Anthropic API returned ${apiRes.status} without rate limit headers` });
       }
 
+      const policy = (process.env.STRATEGOS_USAGE_POLICY || 'unlimited').toLowerCase();
+
       const usage = {
         status: h('anthropic-ratelimit-unified-status') || 'unknown',
         session: {
@@ -1046,6 +1043,7 @@ export function createSystemRoutes(theaRoot, io) {
         overageStatus: h('anthropic-ratelimit-unified-overage-status'),
         subscription: creds.claudeAiOauth?.subscriptionType || 'unknown',
         tier: creds.claudeAiOauth?.rateLimitTier || 'unknown',
+        policy,
         fetchedAt: new Date().toISOString()
       };
 
@@ -1057,6 +1055,155 @@ export function createSystemRoutes(theaRoot, io) {
         return res.status(504).json({ error: 'Anthropic API timeout' });
       }
       res.status(500).json({ error: sanitizeErrorMessage(err) });
+    }
+  });
+
+  // ============================================
+  // INSIGHTS (Learnings / Self-Improvement)
+  // ============================================
+
+  // Lazy-load learningsDb — it may not exist yet (created by parallel worker)
+  let _learningsDb = null;
+
+  // Lazy-load insightAnalyzer — it may not exist yet (created by parallel worker)
+  let _insightAnalyzer = null;
+  async function getInsightAnalyzer() {
+    if (_insightAnalyzer) return _insightAnalyzer;
+    try {
+      _insightAnalyzer = await import('../services/insightAnalyzer.js');
+      return _insightAnalyzer;
+    } catch {
+      return null;
+    }
+  }
+  async function getLearningsDb() {
+    if (_learningsDb) return _learningsDb;
+    try {
+      _learningsDb = await import('../learningsDb.js');
+      return _learningsDb;
+    } catch {
+      return null;
+    }
+  }
+
+  // GET /api/insights/learnings?type=impl&days=7
+  router.get('/insights/learnings', async (req, res) => {
+    try {
+      const db = await getLearningsDb();
+      if (!db) {
+        return res.json([]);
+      }
+
+      const type = req.query.type ? String(req.query.type) : undefined;
+      const days = req.query.days !== undefined ? parseInt(req.query.days, 10) : 30;
+      if (req.query.days !== undefined && (!Number.isInteger(days) || days <= 0)) {
+        return res.status(400).json({ error: 'days must be a positive integer' });
+      }
+
+      const learnings = db.getLearnings(type, days);
+      res.json(learnings);
+    } catch (error) {
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
+    }
+  });
+
+  // GET /api/insights/success-rate?type=impl&days=7
+  router.get('/insights/success-rate', async (req, res) => {
+    try {
+      const db = await getLearningsDb();
+      if (!db) {
+        return res.json({});
+      }
+
+      const type = req.query.type ? String(req.query.type) : undefined;
+      const days = req.query.days !== undefined ? parseInt(req.query.days, 10) : 30;
+      if (req.query.days !== undefined && (!Number.isInteger(days) || days <= 0)) {
+        return res.status(400).json({ error: 'days must be a positive integer' });
+      }
+
+      const rate = db.getSuccessRate(type, days);
+      res.json(rate);
+    } catch (error) {
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
+    }
+  });
+
+  // GET /api/insights/summary
+  router.get('/insights/summary', async (req, res) => {
+    try {
+      const db = await getLearningsDb();
+      if (!db) {
+        return res.json({
+          totalLearnings: 0,
+          successRateByType: {},
+          recentFailures: 0,
+          timeRange: null
+        });
+      }
+
+      const summary = db.getSummaryStats();
+      res.json(summary);
+    } catch (error) {
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
+    }
+  });
+
+  // GET /api/insights/analysis — latest analysis results
+  router.get('/insights/analysis', async (req, res) => {
+    try {
+      const analyzer = await getInsightAnalyzer();
+      if (!analyzer) return res.json({ error: 'Insight analyzer not available' });
+      res.json(analyzer.getLatestAnalysis() || { message: 'No analysis run yet' });
+    } catch (error) {
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
+    }
+  });
+
+  // GET /api/insights/proposals — list improvement proposals
+  router.get('/insights/proposals', async (req, res) => {
+    try {
+      const analyzer = await getInsightAnalyzer();
+      if (!analyzer) return res.json([]);
+      res.json(analyzer.getProposals());
+    } catch (error) {
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
+    }
+  });
+
+  // POST /api/insights/proposals/:id/approve
+  router.post('/insights/proposals/:id/approve', async (req, res) => {
+    try {
+      const analyzer = await getInsightAnalyzer();
+      if (!analyzer) return res.status(503).json({ error: 'Insight analyzer not available' });
+      const result = analyzer.approveProposal(req.params.id);
+      if (!result) return res.status(404).json({ error: 'Proposal not found' });
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
+    }
+  });
+
+  // POST /api/insights/proposals/:id/reject
+  router.post('/insights/proposals/:id/reject', async (req, res) => {
+    try {
+      const analyzer = await getInsightAnalyzer();
+      if (!analyzer) return res.status(503).json({ error: 'Insight analyzer not available' });
+      const result = analyzer.rejectProposal(req.params.id);
+      if (!result) return res.status(404).json({ error: 'Proposal not found' });
+      res.json(result);
+    } catch (error) {
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
+    }
+  });
+
+  // GET /api/insights/overrides — current auto-tuner overrides
+  router.get('/insights/overrides', async (req, res) => {
+    try {
+      const analyzer = await getInsightAnalyzer();
+      if (!analyzer) return res.json({});
+      res.json(analyzer.getOverrides() || {});
+    } catch (error) {
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
     }
   });
 

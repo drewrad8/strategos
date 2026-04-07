@@ -25,7 +25,7 @@ export const MULTILINE_CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/;
 export const MAX_LABEL_LENGTH = 200;
 
 /** Max task/prompt length sent to workers */
-export const MAX_TASK_LENGTH = 10000;
+export const MAX_TASK_LENGTH = 500000;
 
 /** Max prompt length for headless/batch/integration endpoints */
 export const MAX_PROMPT_LENGTH = 50000;

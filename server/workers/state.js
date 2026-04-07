@@ -213,8 +213,9 @@ const QUIET_TMUX_COMMANDS = new Set(['capture-pane', 'has-session']);
 export const TMUX_SOCKET = 'strategos';
 
 const TMUX_TIMEOUT_MS = 30_000; // 30s timeout for tmux commands
+export const TMUX_CAPTURE_TIMEOUT_MS = 5_000; // 5s timeout for capture-pane (dead sessions won't respond)
 
-export function spawnTmux(args) {
+export function spawnTmux(args, timeoutMs = TMUX_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const fullArgs = ['-L', TMUX_SOCKET, ...args];
 
@@ -236,8 +237,8 @@ export function spawnTmux(args) {
       if (settled) return;
       settled = true;
       try { proc.kill('SIGKILL'); } catch { /* already dead */ }
-      reject(new Error(`tmux command timed out after ${TMUX_TIMEOUT_MS / 1000}s: tmux ${args.join(' ')}`));
-    }, TMUX_TIMEOUT_MS);
+      reject(new Error(`tmux command timed out after ${timeoutMs / 1000}s: tmux ${args.join(' ')}`));
+    }, timeoutMs);
 
     proc.stdout.on('data', data => stdout += data.toString());
     proc.stderr.on('data', data => stderr += data.toString());
@@ -388,5 +389,7 @@ export function normalizeWorker(worker) {
     rateLimitResetAt: worker.rateLimitResetAt ?? null,
     autoDismissAfterDone: worker.autoDismissAfterDone ?? true,
     taskReceivedAt: worker.taskReceivedAt ?? null,
+    taskQualityScore: worker.taskQualityScore ?? null,
+    autoRespawn: worker.autoRespawn ?? false,
   };
 }
