@@ -1,0 +1,60 @@
+{
+  "capturedAt": "2026-04-07T01:21:48.705Z",
+  "metrics": {
+    "totalWorkers": 1350,
+    "byType": {
+      "test": {
+        "total": 108,
+        "successes": 85,
+        "failures": 23,
+        "successRate": 0.7870370370370371,
+        "avgUptime": 186917
+      },
+      "impl": {
+        "total": 362,
+        "successes": 339,
+        "failures": 23,
+        "successRate": 0.93646408839779,
+        "avgUptime": 437191
+      },
+      "general": {
+        "total": 24,
+        "successes": 15,
+        "failures": 9,
+        "successRate": 0.625,
+        "avgUptime": 28674964
+      },
+      "fix": {
+        "total": 334,
+        "successes": 304,
+        "failures": 30,
+        "successRate": 0.9101796407185628,
+        "avgUptime": 435782
+      },
+      "research": {
+        "total": 423,
+        "successes": 417,
+        "failures": 6,
+        "successRate": 0.9858156028368794,
+        "avgUptime": 360654
+      },
+      "colonel": {
+        "total": 41,
+        "successes": 35,
+        "failures": 6,
+        "successRate": 0.8536585365853658,
+        "avgUptime": 1157795
+      },
+      "review": {
+        "total": 58,
+        "successes": 58,
+        "failures": 0,
+        "successRate": 1,
+        "avgUptime": 274454
+      }
+    },
+    "overallSuccessRate": 0.9281481481481482,
+    "overallAvgUptime": 909737,
+    "effortDistribution": {}
+  }
+}

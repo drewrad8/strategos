@@ -211,6 +211,9 @@ export const SERVER_TO_TESTS = {
   'server/workers/templates.js':    ['general-enforcement.test.js'],
   'server/sentinel.js':             ['api-verification.test.js'],
   'server/socketHandler.js':        ['orchestrator.spec.js', 'visual-verification.spec.js'],
+  'server/retestService.js':        ['api-verification.test.js'],
+  'server/retestMapper.js':         ['api-verification.test.js'],
+  'server/routes/retest.js':        ['api-verification.test.js'],
 };
 
 // ─── Directory-based fallback patterns ──────────────────
@@ -308,7 +311,7 @@ export function resolveTests(changedFiles) {
  */
 export async function getChangedFiles(ref = 'HEAD~1') {
   try {
-    const { stdout } = await execFileAsync('git', ['diff', '--name-only', ref], {
+    const { stdout } = await execFileAsync('git', ['diff', '--name-only', `${ref}..HEAD`], {
       cwd: process.cwd(),
       timeout: 10000,
     });

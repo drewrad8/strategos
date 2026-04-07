@@ -8,8 +8,6 @@
  * - Track worker completion status for dependency resolution
  */
 
-import { v4 as uuidv4 } from 'uuid';
-
 // ============================================
 // STATE
 // ============================================
@@ -20,9 +18,6 @@ const dependencyNodes = new Map();
 // Map of workerId -> array of workerIds that depend on this worker
 const dependents = new Map();
 
-// Map of workflowId -> Workflow object
-const workflows = new Map();
-
 /**
  * @typedef {Object} DependencyNode
  * @property {string} workerId - The worker ID
@@ -30,26 +25,12 @@ const workflows = new Map();
  * @property {Object|null} onComplete - Action to trigger when worker completes
  * @property {'pending'|'waiting'|'ready'|'running'|'completed'|'failed'} status
  * @property {Date|null} completedAt
- * @property {string|null} workflowId - If part of a workflow
  */
 
 /**
  * @typedef {Object} OnCompleteAction
  * @property {'spawn'|'webhook'|'emit'} type
  * @property {Object} config - Type-specific configuration
- */
-
-/**
- * @typedef {Object} Workflow
- * @property {string} id
- * @property {string} name
- * @property {string} description
- * @property {Object[]} tasks - Task definitions with dependencies
- * @property {'pending'|'running'|'completed'|'failed'} status
- * @property {Date} createdAt
- * @property {Date|null} startedAt
- * @property {Date|null} completedAt
- * @property {string[]} workerIds - Worker IDs created by this workflow
  */
 
 // ============================================
@@ -131,10 +112,9 @@ export function detectCycle(fromId, toId) {
  * @param {string} workerId
  * @param {string[]} dependsOn - Array of worker IDs to wait for
  * @param {Object|null} onComplete - Action to trigger on completion
- * @param {string|null} workflowId - Associated workflow ID
  * @returns {{success: boolean, error?: string, node?: DependencyNode}}
  */
-export function registerWorkerDependencies(workerId, dependsOn = [], onComplete = null, workflowId = null) {
+export function registerWorkerDependencies(workerId, dependsOn = [], onComplete = null) {
   // Reject self-dependencies and deduplicate
   const filteredDeps = [...new Set(dependsOn.filter(depId => depId !== workerId))];
   if (filteredDeps.length !== dependsOn.length) {
@@ -187,8 +167,7 @@ export function registerWorkerDependencies(workerId, dependsOn = [], onComplete 
     dependsOn: validDeps,
     onComplete,
     status,
-    completedAt: null,
-    workflowId
+    completedAt: null
   };
 
   dependencyNodes.set(workerId, node);
@@ -256,11 +235,6 @@ export function markWorkerCompleted(workerId) {
     }
   }
 
-  // Check if workflow is complete
-  if (node.workflowId) {
-    checkWorkflowCompletion(node.workflowId);
-  }
-
   return {
     triggeredWorkers: nowReady,
     onCompleteAction: node.onComplete
@@ -304,25 +278,7 @@ export function markWorkerFailed(workerId) {
         allFailedDependents.push(waitingId);
         // Continue cascading from this newly failed node
         queue.push(waitingId);
-
-        // Mark workflow as failed if applicable — but never regress a completed workflow
-        if (waitingNode.workflowId) {
-          const workflow = workflows.get(waitingNode.workflowId);
-          if (workflow && workflow.status !== 'completed') {
-            workflow.status = 'failed';
-            if (!workflow.completedAt) workflow.completedAt = new Date();
-          }
-        }
       }
-    }
-  }
-
-  // Mark workflow as failed if applicable — but never regress a completed workflow
-  if (node.workflowId) {
-    const workflow = workflows.get(node.workflowId);
-    if (workflow && workflow.status !== 'completed') {
-      workflow.status = 'failed';
-      if (!workflow.completedAt) workflow.completedAt = new Date();
     }
   }
 
@@ -389,7 +345,6 @@ export function getWorkerDependencies(workerId) {
     dependencies,
     dependents: dependentWorkers,
     onComplete: node.onComplete,
-    workflowId: node.workflowId,
     completedAt: node.completedAt
   };
 }
@@ -406,119 +361,24 @@ export function canWorkerStart(workerId) {
 }
 
 // ============================================
-// WORKFLOW MANAGEMENT
-// ============================================
-
-/**
- * Register a worker as part of a workflow task
- * @param {string} workflowId
- * @param {string} taskId
- * @param {string} workerId
- */
-export function registerWorkflowWorker(workflowId, taskId, workerId) {
-  const workflow = workflows.get(workflowId);
-  if (!workflow) return;
-
-  workflow.workerIds.push(workerId);
-  workflow.taskToWorker.set(taskId, workerId);
-}
-
-/**
- * Check if workflow is complete and update status
- * @param {string} workflowId
- */
-function checkWorkflowCompletion(workflowId) {
-  const workflow = workflows.get(workflowId);
-  if (!workflow || workflow.status !== 'running') return;
-
-  // Check if all workers are completed
-  let allComplete = true;
-  let anyFailed = false;
-
-  for (const workerId of workflow.workerIds) {
-    const node = dependencyNodes.get(workerId);
-    if (!node) continue;
-
-    if (node.status === 'failed') {
-      anyFailed = true;
-      break;
-    }
-    if (node.status !== 'completed') {
-      allComplete = false;
-    }
-  }
-
-  if (anyFailed) {
-    workflow.status = 'failed';
-    if (!workflow.completedAt) workflow.completedAt = new Date();
-  } else if (allComplete && workflow.workerIds.length >= workflow.tasks.length) {
-    // Use >= because a single task may spawn multiple workers (parallel execution)
-    workflow.status = 'completed';
-    workflow.completedAt = new Date();
-  }
-}
-
-// ============================================
 // STATISTICS
 // ============================================
 
 /**
- * Clean up finished workflows and their completed/failed dependency nodes.
- * Prevents unbounded memory growth from accumulated workflows.
- * Called every 60s by startPeriodicCleanup() in workerManager.js.
- * @param {number} maxAgeMs - Max age for completed/failed workflows (default 1 hour)
+ * Clean up completed/failed dependency nodes to prevent unbounded memory growth.
+ * Called every 60s by startPeriodicCleanup() in health.js.
+ * @param {number} maxAgeMs - Max age for completed/failed nodes (default 1 hour)
  * @returns {{workflowsCleaned: number, nodesCleaned: number}}
  */
 export function cleanupFinishedWorkflows(maxAgeMs = 60 * 60 * 1000) {
   const now = Date.now();
-  let workflowsCleaned = 0;
   let nodesCleaned = 0;
 
-  // Snapshot keys before iterating — Map mutation during iteration is unsafe
-  const workflowIds = Array.from(workflows.keys());
-  for (const workflowId of workflowIds) {
-    const workflow = workflows.get(workflowId);
-    if (!workflow) continue; // Deleted by concurrent operation
-
-    // Clean up completed/failed workflows after maxAgeMs
-    // Also clean up stuck 'running' workflows after 24 hours (likely orphaned)
-    const STUCK_WORKFLOW_AGE = 24 * 60 * 60 * 1000;
-    if (workflow.status === 'completed' || workflow.status === 'failed') {
-      const finishedAt = workflow.completedAt || workflow.startedAt || workflow.createdAt;
-      if (!finishedAt || now - finishedAt.getTime() < maxAgeMs) continue;
-    } else {
-      // Running/pending — only clean if stuck for 24h
-      const startedAt = workflow.startedAt || workflow.createdAt;
-      if (!startedAt || now - startedAt.getTime() < STUCK_WORKFLOW_AGE) continue;
-      console.warn(`[DepGraph] Cleaning stuck workflow ${workflowId} (status: ${workflow.status}, age: ${Math.round((now - startedAt.getTime()) / 3600000)}h)`);
-    }
-
-    // Clean up dependency nodes for this workflow's workers
-    // But skip nodes that have active dependents outside this workflow
-    for (const workerId of workflow.workerIds) {
-      if (!dependencyNodes.has(workerId)) continue;
-      const deps = dependents.get(workerId) || [];
-      const hasExternalActiveDeps = deps.some(depId => {
-        const depNode = dependencyNodes.get(depId);
-        return depNode && depNode.workflowId !== workflowId &&
-          depNode.status !== 'completed' && depNode.status !== 'failed';
-      });
-      if (hasExternalActiveDeps) continue;
-      removeWorkerDependencies(workerId);
-      nodesCleaned++;
-    }
-
-    workflows.delete(workflowId);
-    workflowsCleaned++;
-  }
-
-  // Also clean up completed/failed nodes NOT part of any workflow (standalone deps)
   // Snapshot keys before iterating — removeWorkerDependencies mutates dependencyNodes
-  const standaloneNodeIds = Array.from(dependencyNodes.keys());
-  for (const workerId of standaloneNodeIds) {
+  const nodeIds = Array.from(dependencyNodes.keys());
+  for (const workerId of nodeIds) {
     const node = dependencyNodes.get(workerId);
     if (!node) continue; // Already removed
-    if (node.workflowId) continue; // Already handled above
     if (node.status !== 'completed' && node.status !== 'failed') continue;
     if (node.completedAt && now - node.completedAt.getTime() < maxAgeMs) continue;
 
@@ -534,7 +394,7 @@ export function cleanupFinishedWorkflows(maxAgeMs = 60 * 60 * 1000) {
     nodesCleaned++;
   }
 
-  return { workflowsCleaned, nodesCleaned };
+  return { workflowsCleaned: 0, nodesCleaned };
 }
 
 /**
@@ -547,17 +407,8 @@ export function getDependencyStats() {
     if (node.status in nodeStatus) nodeStatus[node.status]++;
   }
 
-  const wfStatus = { pending: 0, running: 0, completed: 0, failed: 0 };
-  for (const wf of workflows.values()) {
-    if (wf.status in wfStatus) wfStatus[wf.status]++;
-  }
-
   return {
     totalNodes: dependencyNodes.size,
-    byStatus: nodeStatus,
-    workflows: {
-      total: workflows.size,
-      ...wfStatus
-    }
+    byStatus: nodeStatus
   };
 }

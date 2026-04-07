@@ -14,7 +14,7 @@ import { createRalphRoutes } from './routes/ralph.js';
 import { createRalphService } from './services/ralphService.js';
 import { createRetestService } from './retestService.js';
 import { setupSocketHandlers, stopMetricsBroadcast } from './socketHandler.js';
-import { checkTmux, discoverExistingWorkers, restoreWorkerState, saveWorkerState, saveWorkerStateSync, getWorkers, getWorkerInternal, spawnWorker, killWorker, startPeriodicCleanup, stopPeriodicCleanup, stopAllHealthMonitors, stopAllPtyCaptures, getResourceStats, closeOutputDb, setWorkerDeathCallback } from './workerManager.js';
+import { checkTmux, discoverExistingWorkers, restoreWorkerState, saveWorkerState, saveWorkerStateImmediate, saveWorkerStateSync, getWorkers, getWorkerInternal, spawnWorker, killWorker, startPeriodicCleanup, stopPeriodicCleanup, stopAllHealthMonitors, stopAllPtyCaptures, getResourceStats, closeOutputDb, setWorkerDeathCallback } from './workerManager.js';
 import { THEA_ROOT } from './workers/state.js';
 import { authenticateRequest, authenticateSocket, logAuthStatus } from './middleware/auth.js';
 
@@ -22,6 +22,8 @@ import { authenticateRequest, authenticateSocket, logAuthStatus } from './middle
 import { initLogger, getLogger, LifecycleEvent } from './logger.js';
 import { getStatusWriter } from './statusWriter.js';
 import { resetMetricsService } from './metricsService.js';
+import { close as closeLearningsDb, seedFromCheckpoints as seedLearnings } from './learningsDb.js';
+import { startInsightAnalyzer, stopInsightAnalyzer } from './services/insightAnalyzer.js';
 import { startSentinel, stopSentinel, runDiagnostics, getLastDiagnostics, getDiagnosticsHistory, getSentinelStatus } from './sentinel.js';
 
 
@@ -275,6 +277,10 @@ async function main() {
     if (err.message === 'Only image files are allowed') {
       return res.status(400).json({ error: err.message });
     }
+    // JSON parse errors from express.json() middleware — return the actual parse message
+    if (err.type === 'entity.parse.failed' || (err instanceof SyntaxError && err.status === 400)) {
+      return res.status(400).json({ error: 'Invalid JSON: ' + err.message });
+    }
     log.error('Unhandled Express error', { method: req.method, path: req.path, error: err.message });
     res.status(err.status || 500).json({ error: 'Internal server error' });
   });
@@ -306,6 +312,31 @@ async function main() {
   log.info('Discovering existing workers...');
   const existingWorkers = await discoverExistingWorkers(io);
   log.info('Worker discovery complete', { found: existingWorkers.length });
+
+  // Seed learnings DB from existing checkpoints
+  try {
+    const seeded = seedLearnings();
+    if (seeded > 0) log.info('Seeded learnings from checkpoints', { count: seeded });
+  } catch (err) {
+    log.warn('Failed to seed learnings from checkpoints', { error: err.message });
+  }
+
+  // Clean up orphaned blackboard files older than 24h
+  try {
+    const { cleanupStaleBlackboards } = await import('./blackboardDb.js');
+    const cleaned = await cleanupStaleBlackboards(THEA_ROOT);
+    if (cleaned > 0) log.info('Cleaned up stale blackboard files', { count: cleaned });
+  } catch (err) {
+    log.warn('Failed to clean up stale blackboards', { error: err.message });
+  }
+
+  // Start insight analyzer (30-minute cycle)
+  try {
+    startInsightAnalyzer();
+    log.info('Insight analyzer started');
+  } catch (err) {
+    log.warn('Failed to start insight analyzer', { error: err.message });
+  }
 
   // Socket.io authentication middleware
   io.use(authenticateSocket);
@@ -441,6 +472,7 @@ async function gracefulShutdown(signal) {
   // Stop all timers before saving state (prevent races)
   stopSentinel();
   stopPeriodicCleanup();
+  stopInsightAnalyzer();
   stopAllHealthMonitors();
   stopAllPtyCaptures();
   stopMetricsBroadcast();
@@ -457,7 +489,7 @@ async function gracefulShutdown(signal) {
   }
 
   try {
-    await saveWorkerState();
+    await saveWorkerStateImmediate();
     log.info('Worker state saved successfully');
   } catch (err) {
     log.error('Error saving worker state', { error: err.message });
@@ -475,6 +507,13 @@ async function gracefulShutdown(signal) {
     resetMetricsService();
   } catch (err) {
     log.error('Error closing metrics service', { error: err.message });
+  }
+
+  // Close learnings database
+  try {
+    closeLearningsDb();
+  } catch (err) {
+    log.error('Error closing learnings database', { error: err.message });
   }
 
   // Close logger last — must await so final entries flush to disk
@@ -624,6 +663,7 @@ main().catch((err) => {
   // Close databases that may have been opened during partial startup
   try { closeOutputDb(); } catch { /* best effort */ }
   try { resetMetricsService(); } catch { /* best effort */ }
+  try { closeLearningsDb(); } catch { /* best effort */ }
   // Close logger before exit
   if (globalLogger) {
     globalLogger.close();

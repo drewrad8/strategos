@@ -20,6 +20,8 @@ import { createProjectRoutes } from './routes/projects.js';
 import { createSystemRoutes } from './routes/system.js';
 import { createSettingsRoutes } from './routes/settings.js';
 import { createRetestRoutes } from './routes/retest.js';
+import { createMetricsComparisonRoutes } from './routes/metrics-comparison.js';
+import { createResearchRoutes } from './routes/research.js';
 
 export function createRoutes(theaRoot, io, { retestService } = {}) {
   const router = express.Router();
@@ -33,6 +35,12 @@ export function createRoutes(theaRoot, io, { retestService } = {}) {
   if (retestService) {
     router.use('/retest', createRetestRoutes(retestService));
   }
+
+  // Metrics comparison (baseline snapshots + before/after deltas)
+  router.use('/metrics', createMetricsComparisonRoutes());
+
+  // Research library index and search
+  router.use('/research', createResearchRoutes(theaRoot));
 
   // System routes have no shared prefix — mounted at root
   router.use('/', createSystemRoutes(theaRoot, io));

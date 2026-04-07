@@ -11,7 +11,7 @@ import {
   SESSION_FAIL_THRESHOLD, PROCESS_QUEUE_MAX_DRAIN, PROCESS_QUEUE_DELAY_MS, MAX_QUEUE_SIZE,
   path, fs, execAsync,
   simpleHash, stripAnsiCodes, normalizeWorker, addActivity,
-  spawnTmux, safeSendKeys, validateSessionName,
+  spawnTmux, TMUX_CAPTURE_TIMEOUT_MS, safeSendKeys, validateSessionName,
   getWorkerDeathCallback, STRATEGOS_API,
 } from './state.js';
 
@@ -94,6 +94,17 @@ function getActivePatterns(backend) {
   return CLAUDE_CODE_ACTIVE_PATTERNS;
 }
 
+/**
+ * Strip completed-thinking indicator lines from text before active pattern matching.
+ * Claude Code shows "✻ Sautéed for 43s" (with ✻ prefix) after finishing a thinking step.
+ * These past-tense markers persist in the terminal and falsely trigger active patterns
+ * like /Sautéed/i, making idle workers appear actively working.
+ * Only lines starting with ✻ are stripped — active spinner lines (⠋ Thinking...) are kept.
+ */
+function stripCompletedThinking(text) {
+  return text.replace(/^✻\s+.+$/gm, '');
+}
+
 function getAcceptPatterns(backend) {
   if (backend === 'gemini') return GEMINI_AUTO_ACCEPT_PATTERNS;
   if (backend === 'aider') return AIDER_AUTO_ACCEPT_PATTERNS;
@@ -123,10 +134,14 @@ const DONE_RESPONSE_PATTERNS = [
   /^\d{1}$/,  // Single digit response (1, 2, 3) after nudge
 ];
 
-// Session-end patterns (Claude's feedback survey = session is over)
-const SESSION_END_PATTERNS = [
+// Session-end detection: Claude's feedback survey = session is over.
+// The survey renders as a distinct UI block with Bad/Fine/Good/Dismiss rating buttons.
+// This is the REQUIRED anchor pattern — it's unique to the survey and cannot appear in
+// normal code output. The supporting patterns confirm context but must not be used alone
+// because "Give feedback" and "How is Claude doing" appear in worker templates/instructions.
+const SESSION_END_ANCHOR = /Bad.*Fine.*Good.*Dismiss/;
+const SESSION_END_SUPPORTING = [
   /how is claude doing this session/i,
-  /Bad.*Fine.*Good.*Dismiss/,
   /Give feedback|Report bug/i,
 ];
 
@@ -151,16 +166,25 @@ function isWorkerSignalingCompletion(lastOutput) {
 /**
  * Check if the worker's session has ended (Claude feedback survey).
  * When detected, all continuation nudges should be suppressed.
+ *
+ * Requires the anchor pattern (Bad/Fine/Good/Dismiss rating row) to be present.
+ * This prevents false positives from "Give feedback" or "How is Claude doing"
+ * appearing in worker instructions or output text.
  */
 function isSessionEnded(lastOutput) {
   if (!lastOutput || typeof lastOutput !== 'string') return false;
   const cleaned = stripAnsiCodes(lastOutput).trimEnd();
   const tail = cleaned.slice(-1000);
-  return SESSION_END_PATTERNS.some(p => p.test(tail));
+  // Anchor pattern is required — it's unique to the survey UI
+  if (!SESSION_END_ANCHOR.test(tail)) return false;
+  // At least one supporting pattern should also be present for confidence
+  return SESSION_END_SUPPORTING.some(p => p.test(tail));
 }
 
 // Session recovery rate-limit: max 3 recoveries per 30 minutes per worker
+// GENERALs are long-running and will hit context limits multiple times — they get a higher limit.
 const SESSION_RECOVERY_MAX = 3;
+const SESSION_RECOVERY_MAX_GENERAL = 10;
 const SESSION_RECOVERY_WINDOW_MS = 30 * 60 * 1000;
 
 /**
@@ -174,6 +198,19 @@ async function trySessionRecovery(workerId, io) {
   if (!worker.bulldozeMode && !worker.forcedAutonomy) return false;
   if (worker._sessionRecoverySuppressed) return false;
 
+  // If the worker has signaled Ralph within the last 30 minutes, the session is healthy —
+  // the worker is alive and idle (e.g., a GENERAL waiting for Commander input), not dead.
+  // Sending a recovery prompt to a healthy worker is wasteful and confusing.
+  const RALPH_RECENCY_WINDOW_MS = 30 * 60 * 1000;
+  if (worker.lastRalphSignalAt) {
+    const msSinceSignal = Date.now() - new Date(worker.lastRalphSignalAt).getTime();
+    if (msSinceSignal < RALPH_RECENCY_WINDOW_MS) {
+      logger.info(`[SessionRecovery] Worker ${workerId} (${worker.label}) signaled Ralph ${Math.round(msSinceSignal / 60000)}min ago — session is healthy, skipping recovery`);
+      worker._sessionEnded = false;  // Clear the false flag
+      return false;
+    }
+  }
+
   // Rate-limit check
   if (!worker._sessionRecoveryTimestamps) worker._sessionRecoveryTimestamps = [];
   const now = Date.now();
@@ -181,12 +218,28 @@ async function trySessionRecovery(workerId, io) {
     ts => now - ts < SESSION_RECOVERY_WINDOW_MS
   );
 
-  if (worker._sessionRecoveryTimestamps.length >= SESSION_RECOVERY_MAX) {
+  const recoveryMax = detectWorkerType(worker.label).isGeneral ? SESSION_RECOVERY_MAX_GENERAL : SESSION_RECOVERY_MAX;
+  if (worker._sessionRecoveryTimestamps.length >= recoveryMax) {
     worker._sessionRecoverySuppressed = true;
-    logger.warn(`[SessionRecovery] Worker ${workerId} (${worker.label}) hit recovery rate limit (${SESSION_RECOVERY_MAX}/${SESSION_RECOVERY_WINDOW_MS / 60000}min) — suppressing further recoveries`);
+    logger.warn(`[SessionRecovery] Worker ${workerId} (${worker.label}) hit recovery rate limit (${recoveryMax}/${SESSION_RECOVERY_WINDOW_MS / 60000}min) — suppressing further recoveries`);
     if (io) {
       io.emit('worker:session-recovery-exhausted', { workerId, label: worker.label });
     }
+
+    // Trigger auto-respawn if the worker was registered for it
+    if (worker.autoRespawn) {
+      const workerSnapshot = {
+        ralphProgress: worker.ralphProgress,
+        ralphCurrentStep: worker.ralphCurrentStep,
+        ralphLearnings: worker.ralphLearnings,
+      };
+      import('../services/autoRespawnService.js').then(({ handleGeneralDeath }) => {
+        handleGeneralDeath(workerId, 'session_exhausted', io, workerSnapshot).catch(e =>
+          logger.error(`[AutoRespawn] handleGeneralDeath (session_exhausted) failed for ${workerId}: ${e.message}`)
+        );
+      }).catch(e => logger.error(`[AutoRespawn] Import failed in session recovery: ${e.message}`));
+    }
+
     return false;
   }
 
@@ -225,7 +278,7 @@ async function trySessionRecovery(workerId, io) {
     // Emit socket event for UI awareness
     if (io) {
       io.emit('worker:session-recovered', { workerId, label: worker.label, recoveryCount: attempt });
-      io.emit('worker:updated', normalizeWorker(worker));
+      io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(worker));
     }
 
     return true;
@@ -270,14 +323,14 @@ const GENERAL_IMPL_BASH_RE = /^(?:● )?Bash[:(]\s?.*?\b(npm|node|python|python3
 // Bash: followed by legitimate commander actions (git, curl, ls, cat, jq, etc.)
 const GENERAL_ALLOWED_BASH_RE = /^(?:● )?Bash[:(]\s?.*?\b(git|curl|ls|cat|head|tail|jq|wc|echo|printf|pwd|whoami|date|uptime|df|du|ps|grep|find|which|env|export)\b/;
 
-async function checkGeneralRoleViolation(workerId, output, io) {
+async function checkGeneralRoleViolation(workerId, output, io, cleanedOutput = null) {
   const worker = workers.get(workerId);
   if (!worker) return;
 
   // Only check GENERAL-labeled workers
   if (!isProtectedWorker(worker)) return;
 
-  const cleaned = stripAnsiCodes(output);
+  const cleaned = cleanedOutput ?? stripAnsiCodes(output);
   const tail = cleaned.slice(-2000);
 
   // Deduplicate: don't re-trigger on the same output
@@ -365,7 +418,7 @@ async function checkGeneralRoleViolation(workerId, output, io) {
       count: worker.roleViolations,
       timestamp: new Date().toISOString(),
     });
-    io.emit('worker:updated', normalizeWorker(worker));
+    io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(worker));
   }
 
   // Interrupt the worker with correction
@@ -425,14 +478,14 @@ function parseRateLimitResetTime(hours, minutes, ampm, timezone) {
  * Detect rate limits and compaction in worker output (called when output changes).
  * Sets flags on the worker object for the idle-phase handler to act on.
  */
-function detectSessionLimits(workerId, stdout, io) {
+function detectSessionLimits(workerId, stdout, io, cleanedOutput = null) {
   const worker = workers.get(workerId);
   if (!worker || worker.autoContinue === false) return;
   if (worker.backend === 'gemini' || worker.backend === 'aider') return; // Non-Claude rate limit patterns TBD
 
   // trimEnd() strips trailing whitespace from empty tmux pane rows
   // that can push rate limit text beyond the 1500-char tail window
-  const cleaned = stripAnsiCodes(stdout).trimEnd();
+  const cleaned = (cleanedOutput ?? stripAnsiCodes(stdout)).trimEnd();
   const tail = cleaned.slice(-1500);
 
   // --- Rate limit detection ---
@@ -461,7 +514,7 @@ function detectSessionLimits(workerId, stdout, io) {
 
     if (io) {
       io.emit('worker:rate_limited', { workerId, label: worker.label, resetAt: worker.rateLimitResetAt });
-      io.emit('worker:updated', normalizeWorker(worker));
+      io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(worker));
     }
   } else if (!isRateLimited && worker._rateLimitDetected) {
     // Rate limit text scrolled off terminal tail — clear the detection guard only.
@@ -524,7 +577,7 @@ async function handleAutoContinue(workerId, io) {
         attempt: worker._autoContinueAttempts,
         trigger,
       });
-      io.emit('worker:updated', normalizeWorker(worker));
+      io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(worker));
     }
   } catch (err) {
     logger.error(`[AutoContinue] Failed for ${worker.label} (${workerId}): ${err.message}`);
@@ -562,19 +615,33 @@ function startGlobalPtyCapture(io) {
   if (globalCaptureInterval) return;
   logger.info('[PtyCapture] Starting global capture interval (every 5s)');
 
+  const CAPTURE_CONCURRENCY = 5;
+
   globalCaptureInterval = setInterval(async () => {
-    const entries = [...ptyInstances.entries()];
-    for (const [workerId, instance] of entries) {
+    const entries = [...ptyInstances.entries()].filter(([workerId]) => {
       if (!workers.has(workerId)) {
         ptyInstances.delete(workerId);
-        continue;
+        return false;
       }
-      try {
-        await captureWorkerOutput(workerId, instance, io);
-      } catch (err) {
-        logger.error(`[PtyCapture] Unhandled error for ${workerId}: ${err.message}`);
+      return true;
+    });
+
+    // Run captures in parallel with bounded concurrency (max 5).
+    // A hung tmux session (5s timeout) blocks only its own slot, not the fleet.
+    let idx = 0;
+    async function runNext() {
+      while (idx < entries.length) {
+        const [workerId, instance] = entries[idx++];
+        try {
+          await captureWorkerOutput(workerId, instance, io);
+        } catch (err) {
+          logger.error(`[PtyCapture] Unhandled error for ${workerId}: ${err.message}`);
+        }
       }
     }
+
+    const slots = Array.from({ length: Math.min(CAPTURE_CONCURRENCY, entries.length) }, runNext);
+    await Promise.all(slots);
   }, 5000);
 
   if (globalCaptureInterval.unref) {
@@ -586,7 +653,7 @@ async function captureWorkerOutput(workerId, instance, io) {
   try {
     let { stdout } = await spawnTmux([
       'capture-pane', '-t', instance.sessionName, '-p', '-e', '-S', '-500'
-    ]);
+    ], TMUX_CAPTURE_TIMEOUT_MS);
 
     if (sessionFailCounts.has(workerId)) {
       sessionFailCounts.delete(workerId);
@@ -598,13 +665,6 @@ async function captureWorkerOutput(workerId, instance, io) {
 
     const worker = workers.get(workerId);
 
-    if (worker) {
-      handleAutoAcceptCheck(workerId, stdout, io).catch(err =>
-        logger.error(`[PtyCapture] autoAcceptCheck failed for ${workerId}: ${err.message}`));
-      checkGeneralRoleViolation(workerId, stdout, io).catch(err =>
-        logger.error(`[PtyCapture] generalRoleViolation check failed for ${workerId}: ${err.message}`));
-    }
-
     const MAX_OUTPUT_BUFFER = 2 * 1024 * 1024;
     if (stdout.length > MAX_OUTPUT_BUFFER) {
       if (!worker?._outputTruncationLogged) {
@@ -612,8 +672,15 @@ async function captureWorkerOutput(workerId, instance, io) {
         if (worker) worker._outputTruncationLogged = true;
       }
       stdout = stdout.slice(-MAX_OUTPUT_BUFFER);
+    } else if (worker?._outputTruncationLogged) {
+      worker._outputTruncationLogged = false;  // Buffer shrunk below limit, allow future warnings
     }
     outputBuffers.set(workerId, stdout);
+    let _cleanedStdout = null;
+    const getCleanedStdout = () => {
+      if (_cleanedStdout === null) _cleanedStdout = stripAnsiCodes(stdout);
+      return _cleanedStdout;
+    };
 
     if (!outputChanged) {
       // Bulldoze continuation (existing)
@@ -621,7 +688,7 @@ async function captureWorkerOutput(workerId, instance, io) {
         worker.bulldozeIdleCount = (worker.bulldozeIdleCount || 0) + 1;
 
         if (worker.bulldozeIdleCount >= BULLDOZE_IDLE_THRESHOLD) {
-          const cleaned = stripAnsiCodes(stdout);
+          const cleaned = getCleanedStdout();
           const bulldozeTailSize = getBackendTailSize(worker.backend, 'wide');
           const tail = cleaned.slice(-bulldozeTailSize);
 
@@ -629,11 +696,11 @@ async function captureWorkerOutput(workerId, instance, io) {
           const activePatterns = getActivePatterns(worker.backend);
           const isAtIdlePrompt = idlePatterns.some(p => p.test(tail));
           const narrowTailSize = getBackendTailSize(worker.backend, 'narrow');
-          const narrowTail = cleaned.slice(-narrowTailSize);
+          const narrowTail = stripCompletedThinking(cleaned.slice(-narrowTailSize));
           const isActivelyWorking = activePatterns.some(p => p.test(narrowTail));
 
           if (worker.bulldozeIdleCount === BULLDOZE_IDLE_THRESHOLD) {
-            logger.info(`[Bulldoze] ${workerId} idle check: atPrompt=${isAtIdlePrompt} activeWork=${isActivelyWorking} idleCount=${worker.bulldozeIdleCount}`);
+            logger.debug(`[Bulldoze] ${workerId} idle check: atPrompt=${isAtIdlePrompt} activeWork=${isActivelyWorking} idleCount=${worker.bulldozeIdleCount}`);
             if (!isAtIdlePrompt) {
               const lastChars = tail.slice(-100).replace(/\n/g, '\\n');
               logger.info(`[Bulldoze] ${workerId} tail (last 100): ${lastChars}`);
@@ -660,13 +727,13 @@ async function captureWorkerOutput(workerId, instance, io) {
         );
 
         if (worker._forcedAutonomyIdleCount >= currentThreshold) {
-          const cleaned = stripAnsiCodes(stdout);
+          const cleaned = getCleanedStdout();
           const tailSize = getBackendTailSize(worker.backend, 'wide');
           const tail = cleaned.slice(-tailSize);
           const idlePatterns = getIdlePatterns(worker.backend);
           const activePatterns = getActivePatterns(worker.backend);
           const isAtIdlePrompt = idlePatterns.some(p => p.test(tail));
-          const narrowTail = cleaned.slice(-getBackendTailSize(worker.backend, 'narrow'));
+          const narrowTail = stripCompletedThinking(cleaned.slice(-getBackendTailSize(worker.backend, 'narrow')));
           const isActivelyWorking = activePatterns.some(p => p.test(narrowTail));
 
           if (isAtIdlePrompt && !isActivelyWorking) {
@@ -704,10 +771,10 @@ async function captureWorkerOutput(workerId, instance, io) {
           const threshold = AUTO_CONTINUE_RATE_LIMIT_COOLDOWN;
 
           if (worker._autoContinueIdleCount >= threshold) {
-            const cleaned = stripAnsiCodes(stdout).trimEnd();
+            const cleaned = getCleanedStdout();
             const tail = cleaned.slice(-1500);
             const isIdle = CLAUDE_CODE_IDLE_PATTERNS.some(p => p.test(tail));
-            const isActive = CLAUDE_CODE_ACTIVE_PATTERNS.some(p => p.test(cleaned.slice(-200)));
+            const isActive = CLAUDE_CODE_ACTIVE_PATTERNS.some(p => p.test(stripCompletedThinking(cleaned.slice(-200))));
 
             if (isIdle && !isActive) {
               handleAutoContinue(workerId, io).catch(err =>
@@ -724,12 +791,23 @@ async function captureWorkerOutput(workerId, instance, io) {
 
     // --- Output changed path ---
 
+    if (worker) {
+      handleAutoAcceptCheck(workerId, stdout, io, getCleanedStdout()).catch(err =>
+        logger.error(`[PtyCapture] autoAcceptCheck failed for ${workerId}: ${err.message}`));
+      checkGeneralRoleViolation(workerId, stdout, io, getCleanedStdout()).catch(err =>
+        logger.error(`[PtyCapture] generalRoleViolation check failed for ${workerId}: ${err.message}`));
+    }
+
     if (worker && worker.bulldozeMode) {
       worker.bulldozeIdleCount = 0;
     }
     if (worker && worker.forcedAutonomy) {
-      worker._forcedAutonomyIdleCount = 0;
-      worker._forcedAutonomyNudgeCount = 0;  // Reset backoff on activity
+      worker._forcedAutonomyIdleCount = 0;  // Any output change means not idle
+      // Only reset nudge backoff on substantive output (>50 new chars), not cursor blinks/spinners
+      const prevLength = instance.lastCaptureHash ? parseInt(instance.lastCaptureHash.split(':')[0]) || 0 : 0;
+      if ((stdout.length - prevLength) > 50) {
+        worker._forcedAutonomyNudgeCount = 0;
+      }
     }
 
     // Track consecutive done responses for loop detection
@@ -762,7 +840,7 @@ async function captureWorkerOutput(workerId, instance, io) {
 
     // Auto-continue: detect rate limits in fresh output
     if (worker) {
-      detectSessionLimits(workerId, stdout, io);
+      detectSessionLimits(workerId, stdout, io, getCleanedStdout());
       worker._autoContinueIdleCount = 0;
     }
 
@@ -777,7 +855,7 @@ async function captureWorkerOutput(workerId, instance, io) {
       io.to(`worker:${workerId}`).emit('worker:output', { workerId, output: stdout });
     }
 
-    if (worker) {
+    if (worker && worker.status === 'running') {
       if (!worker._dbWriteCount) worker._dbWriteCount = 0;
       worker._dbWriteCount++;
       if (worker._dbWriteCount % 10 === 0) {
@@ -811,7 +889,7 @@ async function captureWorkerOutput(workerId, instance, io) {
       clearWorkerContext(workerId);
       try { markWorkerFailed(workerId); } catch (e) { /* may not be registered */ }
       if (io) {
-        io.emit('worker:updated', normalizeWorker(w));
+        io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(w));
         io.emit('worker:general:dead', { workerId, label: w.label, message: 'GENERAL tmux session died - requires human intervention' });
       }
       return;
@@ -832,6 +910,12 @@ async function captureWorkerOutput(workerId, instance, io) {
     // Import persistence lazily
     const { writeWorkerCheckpoint } = await import('./persistence.js');
     writeWorkerCheckpoint(workerId, 'session_died');
+
+    // Record failure in learnings DB if worker never signaled done
+    try {
+      const { persistFailureLearning } = await import('./ralph.js');
+      persistFailureLearning(w, workerId, 'session_died');
+    } catch { /* best effort */ }
 
     ptyInstances.delete(workerId);
 
@@ -929,11 +1013,11 @@ export function stopAllPtyCaptures() {
 // AUTO-ACCEPT LOGIC
 // ============================================
 
-async function handleAutoAcceptCheck(workerId, output, io) {
+async function handleAutoAcceptCheck(workerId, output, io, cleanedOutput = null) {
   const worker = workers.get(workerId);
   if (!worker) return;
 
-  const cleaned = stripAnsiCodes(output);
+  const cleaned = cleanedOutput ?? stripAnsiCodes(output);
   // Gemini CLI renders large TUI boxes with padding — prompt text can be 3000+ chars from end
   const tailSize = worker.backend === 'gemini' ? 5000 : worker.backend === 'aider' ? 1000 : 500;
   const tail = cleaned.slice(-tailSize);
@@ -972,7 +1056,7 @@ async function handleAutoAcceptCheck(workerId, output, io) {
 
   if (promptDetected !== !!worker.waitingAtPrompt) {
     worker.waitingAtPrompt = promptDetected;
-    if (io) io.emit('worker:updated', normalizeWorker(worker));
+    if (io) io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(worker));
   }
 
   if (worker.autoAccept && !worker.autoAcceptPaused) {
@@ -981,7 +1065,7 @@ async function handleAutoAcceptCheck(workerId, output, io) {
     const idlePats = getIdlePatterns(worker.backend);
     const activePats = getActivePatterns(worker.backend);
     const isIdle = idlePats.some(p => p.test(wideTail)) &&
-                   !activePats.some(p => p.test(wideTail));
+                   !activePats.some(p => p.test(stripCompletedThinking(wideTail)));
     if (isIdle) {
       for (const { pattern, command, description } of AUTO_COMMAND_PATTERNS) {
         if (pattern.test(wideTail)) {
@@ -1033,7 +1117,7 @@ async function handleAutoAcceptCheck(workerId, output, io) {
     logger.info(`[AutoAccept] Pausing for ${worker.label} - detected pause keyword`);
     worker.autoAcceptPaused = true;
     if (io) {
-      io.emit('worker:updated', normalizeWorker(worker));
+      io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(worker));
     }
     return;
   } else if (!pauseKeywordFound && worker.autoAcceptPaused) {
@@ -1041,7 +1125,7 @@ async function handleAutoAcceptCheck(workerId, output, io) {
     worker.autoAcceptPaused = false;
     worker.lastAutoAcceptHash = null;
     if (io) {
-      io.emit('worker:updated', normalizeWorker(worker));
+      io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(worker));
     }
   }
 
@@ -1066,7 +1150,7 @@ async function handleAutoAcceptCheck(workerId, output, io) {
     await withTmuxLock(workerId, async () => {
       await safeSendKeys(worker.tmuxSession, ['Enter']);
     });
-    logger.info(`[AutoAccept] Sent Enter to ${worker.label}`);
+    logger.debug(`[AutoAccept] Sent Enter to ${worker.label}`);
 
     setTimeout(() => {
       const w = workers.get(workerId);
@@ -1115,8 +1199,11 @@ function shouldContinueForcedAutonomy(workerId) {
   }
 
   // Don't nudge if last output signals completion
+  // Exception: GENERALs naturally output completion-like text ("all workers complete",
+  // "results delivered") after each wave — they should still be nudged to find more work.
   const stdout = outputBuffers.get(workerId);
-  if (stdout && isWorkerSignalingCompletion(stdout)) return false;
+  const workerTypeInfo = detectWorkerType(worker.label);
+  if (stdout && !workerTypeInfo.isGeneral && isWorkerSignalingCompletion(stdout)) return false;
 
   // Check for session end (Claude feedback survey)
   if (stdout && isSessionEnded(stdout)) {
@@ -1139,7 +1226,7 @@ function shouldContinueForcedAutonomy(workerId) {
       const child = workers.get(cid);
       if (!child) return false;
       if (child.health === 'dead' || child.health === 'crashed') return false;
-      return child.status === 'running' && child.ralphStatus === 'in_progress';
+      return child.status === 'running' && (child.ralphStatus === 'in_progress' || child.ralphStatus === 'pending');
     });
     if (activeChildren.length > 0) return false;
   }
@@ -1153,7 +1240,31 @@ function shouldContinueForcedAutonomy(workerId) {
  */
 function generateAutonomyNudge(worker) {
   const nudgeCount = worker._forcedAutonomyNudgeCount || 0;
+  const workerType = detectWorkerType(worker.label);
 
+  // GENERALs get special nudges — they must spawn workers, never idle
+  if (workerType.isGeneral) {
+    // Check actual child count to avoid misleading "no active workers" when children are pending/done
+    const childIds = worker.childWorkerIds || [];
+    const childStates = childIds.map(cid => workers.get(cid)).filter(Boolean);
+    const pendingChildren = childStates.filter(c => c.status === 'running' && c.ralphStatus === 'pending');
+    if (pendingChildren.length > 0) {
+      return `You have ${pendingChildren.length} worker(s) still initializing (pending first Ralph signal). Wait for them to report in before spawning more. Check /children to monitor their status.`;
+    }
+
+    if (nudgeCount === 0) {
+      return 'You have no active workers. Spawn new ones NOW. Research improvements, run tests, optimize code, fix bugs. A GENERAL must always have workers running. Check git log for recent changes that need testing, check /api/insights/learnings for failure patterns, search the codebase for TODOs and bugs.';
+    }
+    if (nudgeCount === 1) {
+      return 'You are STILL idle with zero active children. This is a FAILURE STATE. Immediately: 1) Check git log --oneline -20 for recent work to validate. 2) Check /api/insights/success-rate for underperforming areas. 3) Spawn at least 2 workers RIGHT NOW. Do NOT signal done — your mission is continuous.';
+    }
+    if (nudgeCount === 2) {
+      return 'CRITICAL: A GENERAL with no children is failing its mission. Spawn workers IMMEDIATELY. If you have run out of ideas, use WebSearch to research improvements for this project. Check the codebase for any bugs, missing tests, performance issues, or code quality problems. You must NEVER be idle.';
+    }
+    return 'Spawn workers NOW. You must always have active children. Research new improvements if needed.';
+  }
+
+  // Non-GENERAL workers: standard nudges
   // First nudge: gentle
   if (nudgeCount === 0) {
     return 'You appear to be idle. Continue working on your current task. If you need information, use WebSearch, Grep, or Read to find it yourself. Do not wait for human input.';
@@ -1208,7 +1319,7 @@ function shouldContinueBulldoze(workerId) {
     return false;
   }
 
-  if (worker.bulldozeStartedAt) {
+  if (worker.bulldozeStartedAt && !isProtectedWorker(worker)) {
     const hoursElapsed = (Date.now() - new Date(worker.bulldozeStartedAt).getTime()) / 3600000;
     if (hoursElapsed >= BULLDOZE_MAX_HOURS) {
       logger.info(`[Bulldoze] Worker ${workerId} hit time limit (${BULLDOZE_MAX_HOURS}h), pausing`);
@@ -1237,7 +1348,7 @@ function shouldContinueBulldoze(workerId) {
       if (!child) return false;
       // Dead/crashed children should not block bulldoze even if ralphStatus is still in_progress
       if (child.health === 'dead' || child.health === 'crashed') return false;
-      return child.status === 'running' && child.ralphStatus === 'in_progress';
+      return child.status === 'running' && (child.ralphStatus === 'in_progress' || child.ralphStatus === 'pending');
     });
     if (activeChildren.length > 0) {
       return false;
@@ -1256,13 +1367,13 @@ function generateBulldozeContinuation(worker) {
 
   if (isAuditCycle) {
     if (workerType.isGeneral) {
-      return `${BULLDOZE_CONTINUATION_PREFIX} cycle ${cycleNum} - AUDIT]\nCommander, conduct a strategic review. State file: ${stateFilePath}\n\nASSESS: git log --oneline -20, check children status, run test suites, review error logs. What improved since last cycle? What degraded? What's the highest-impact work remaining?\n\nACT: Update the state file with fresh findings. Spawn workers for the top discovery. If your domain is genuinely healthy with no meaningful work remaining, write "## Status: EXHAUSTED" in the state file.${autonomyReminder}`;
+      return `${BULLDOZE_CONTINUATION_PREFIX} cycle ${cycleNum} - AUDIT]\nCommander, conduct a strategic review. State file: ${stateFilePath}\n\nASSESS: git log --oneline -20, check children status via /children endpoint, review error logs. What improved since last cycle? What degraded? What's the highest-impact work remaining?\n\nACT: Update the state file with fresh findings. Spawn workers for the top discoveries. If you have zero active children, IMMEDIATELY spawn workers for new improvement tracks.\n\nIMPORTANT: Do NOT write EXHAUSTED. Do NOT signal done. Your mission is CONTINUOUS. Check /api/insights/learnings for past failure patterns to fix. Check /api/insights/success-rate for worker types that need improvement. If your backlog is empty, research new improvements via WebSearch, audit the codebase, or review git log for untested changes.${autonomyReminder}`;
     }
     return `${BULLDOZE_CONTINUATION_PREFIX} cycle ${cycleNum} - AUDIT]\nConduct a fresh audit of your domain. State file: ${stateFilePath}\n\nASSESS: git log --oneline -20, run test suites, review error logs, compare to best practices. Add NEW findings to your backlog.\n\nACT: Pick the highest-impact finding and implement it. Commit. Update state file.${autonomyReminder}`;
   }
 
   if (workerType.isGeneral) {
-    return `${BULLDOZE_CONTINUATION_PREFIX} cycle ${cycleNum}]\nCommander, next mission cycle. State file: ${stateFilePath}\n\nSITREP: Read state file. Check git log --oneline -10. Check children status.\n\nEXECUTE: Identify the highest-priority incomplete item. Spawn a worker for it — do NOT implement it yourself. Monitor and drive to completion. Update the state file.\n\nIf all remaining items need human action, write "## Status: NEEDS_HUMAN" in the state file. If genuinely nothing left, write "## Status: EXHAUSTED".${autonomyReminder}`;
+    return `${BULLDOZE_CONTINUATION_PREFIX} cycle ${cycleNum}]\nCommander, next mission cycle. State file: ${stateFilePath}\n\nSITREP: Read state file. Check git log --oneline -10. Check children status via /children endpoint.\n\nEXECUTE: Identify the highest-priority incomplete item. Spawn a worker for it — do NOT implement it yourself. Monitor and drive to completion. Update the state file.\n\nIf you have zero active children, IMMEDIATELY spawn workers for new improvement tracks. Check git log for recent changes that need testing, check the codebase for bugs, research optimizations. A GENERAL with no children is FAILING.\n\nDo NOT write EXHAUSTED. Do NOT signal done. If all current items need human action, write "## Status: NEEDS_HUMAN" for those items but FIND NEW WORK for everything else.${autonomyReminder}`;
   }
 
   return `${BULLDOZE_CONTINUATION_PREFIX} cycle ${cycleNum}]\nNext mission cycle. State file: ${stateFilePath}\n\nSITREP: Read state file. Check git log --oneline -10 to avoid redoing committed work.\n\nEXECUTE: Pick the highest-priority incomplete item. Implement it thoroughly. Test. Commit with descriptive message. Update state file — mark complete, add any new discoveries. Signal Ralph.\n\nIf all remaining items are low-impact or need human action, write "## Status: EXHAUSTED" in the state file.${autonomyReminder}`;
@@ -1281,6 +1392,7 @@ export async function createBulldozeStateFile(worker, settings = {}) {
 
   await fs.mkdir(stateDir, { recursive: true });
 
+  const workerType = detectWorkerType(worker.label);
   const mission = settings.bulldozeMission || 'Autonomous improvement of this project';
   const backlog = settings.bulldozeBacklog || '';
   const standingOrders = settings.bulldozeStandingOrders || '';
@@ -1289,9 +1401,13 @@ export async function createBulldozeStateFile(worker, settings = {}) {
     ? backlog.split('\n').filter(line => line.trim()).map(line => `- [ ] ${line.trim()}`).join('\n')
     : '- [ ] Audit codebase for improvements\n- [ ] Run tests and fix failures\n- [ ] Review error handling';
 
+  const defaultStandingOrders = workerType.isGeneral
+    ? '- NEVER write "## Status: EXHAUSTED" — your mission is continuous\n- NEVER signal done via Ralph — you operate indefinitely\n- Always maintain 3-5 active child workers\n- If backlog is empty, FIND MORE WORK: check git log, search for TODOs, research optimizations, review code quality\n- Check /api/insights/learnings for past failure patterns to fix\n- Check /api/insights/success-rate for underperforming worker types\n- Git commit after every meaningful change\n- A GENERAL with zero active children is in a FAILURE STATE'
+    : '- Git commit after every meaningful change\n- Run tests before and after changes\n- Never break existing functionality';
+
   const standingOrdersSection = standingOrders
     ? standingOrders.split('\n').filter(line => line.trim()).map(line => `- ${line.trim()}`).join('\n')
-    : '- Git commit after every meaningful change\n- Run tests before and after changes\n- Never break existing functionality';
+    : defaultStandingOrders;
 
   const template = `# Bulldoze State — ${worker.label}
 
@@ -1391,12 +1507,13 @@ async function handleBulldozeContinuation(workerId, io) {
   if (!worker) return;
 
   const stateStatus = await checkBulldozeStateFile(worker);
-  if (stateStatus !== 'ok') {
+  const isExhaustedProtected = stateStatus === 'exhausted' && worker.forcedAutonomy;
+  if (stateStatus !== 'ok' && !isExhaustedProtected) {
     logger.info(`[Bulldoze] Worker ${workerId} state file says "${stateStatus}", pausing`);
     worker.bulldozePaused = true;
     worker.bulldozePauseReason = stateStatus;
     if (io) {
-      io.emit('worker:updated', normalizeWorker(worker));
+      io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(worker));
       io.emit('worker:bulldoze:paused', {
         workerId,
         reason: stateStatus,
@@ -1404,6 +1521,10 @@ async function handleBulldozeContinuation(workerId, io) {
       });
     }
     return;
+  }
+  if (isExhaustedProtected) {
+    logger.info(`[Bulldoze] Worker ${workerId} EXHAUSTED ignored (forcedAutonomy), resetting state file`);
+    await resetBulldozeStateFileStatus(worker);
   }
 
   const metrics = await collectBulldozeMetrics(worker);
@@ -1421,7 +1542,7 @@ async function handleBulldozeContinuation(workerId, io) {
         worker.bulldozePaused = true;
         worker.bulldozePauseReason = 'no_commits';
         if (io) {
-          io.emit('worker:updated', normalizeWorker(worker));
+          io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(worker));
           io.emit('worker:bulldoze:paused', {
             workerId,
             reason: 'no_commits',
@@ -1454,7 +1575,7 @@ async function handleBulldozeContinuation(workerId, io) {
     logger.info(`[Bulldoze] Sent cycle ${worker.bulldozeCyclesCompleted} to ${worker.label} (${workerId})${isAudit ? ' [AUDIT]' : ''}`);
 
     if (io) {
-      io.emit('worker:updated', normalizeWorker(worker));
+      io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(worker));
       io.emit('worker:bulldoze:cycle', {
         workerId,
         cycle: worker.bulldozeCyclesCompleted,
@@ -1626,8 +1747,15 @@ export function updateWorkerSettings(workerId, settings, io = null) {
   }
 
   if (io) {
-    io.emit('worker:updated', normalizeWorker(worker));
+    io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(worker));
   }
+
+  // Persist settings to disk so they survive server restarts.
+  // Without this, toggles (e.g. forcedAutonomy OFF) only take effect in memory
+  // and revert to old values on restart.
+  import('./persistence.js').then(({ saveWorkerState }) => {
+    saveWorkerState().catch(err => logger.error(`[Settings] State save failed: ${err.message}`));
+  });
 
   return worker;
 }
@@ -1669,7 +1797,7 @@ export async function sendInput(workerId, input, io = null, { fromWorkerId, sour
     worker.queuedCommands = queue.length;
 
     if (io) {
-      io.emit('worker:updated', normalizeWorker(worker));
+      io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(worker));
     }
     return true;
   }
@@ -1792,7 +1920,7 @@ export async function processQueue(workerId, io = null) {
 
       worker.queuedCommands = currentQueue.length;
       if (io) {
-        io.emit('worker:updated', normalizeWorker(worker));
+        io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(worker));
       }
 
       try {

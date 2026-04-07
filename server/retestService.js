@@ -19,7 +19,7 @@ import { resolveTests, getChangedFiles } from './retestMapper.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 
-// All known Playwright spec files in e2e/
+// All known test files in e2e/ (both Playwright .spec.js and standalone .test.js)
 const ALL_SPECS = [
   'orchestrator.spec.js',
   'visual-verification.spec.js',
@@ -31,6 +31,13 @@ const ALL_SPECS = [
   'multi-terminal.spec.js',
   'quick-check.spec.js',
   'strategos-architect-integration.spec.js',
+  'api-verification.test.js',
+  'general-enforcement.test.js',
+  'ralph-signal.test.js',
+  'reflexion-features.test.js',
+  'review-gate.test.js',
+  'blackboard.test.js',
+  'improvement-wave-features.test.js',
 ];
 
 const MAX_RUNS = 50;

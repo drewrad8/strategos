@@ -173,9 +173,9 @@ class Logger {
     // Circuit breaker to prevent infinite logging loops
     this.consoleDisabled = false;
     this._isLogging = false;  // Reentrancy guard
-    this._errorCount = 0;     // Track consecutive errors
-    this._lastErrorReset = Date.now();
-    this._maxErrorsPerSecond = 100;  // Rate limit
+    this._logCount = 0;       // Track logs per second (all levels)
+    this._lastLogReset = Date.now();
+    this._maxLogsPerSecond = 100;  // Rate limit
 
     this._initDatabase();
     this._initFiles();
@@ -368,16 +368,16 @@ class Logger {
 
     // Rate limiting - reset counter every second
     const now = Date.now();
-    if (now - this._lastErrorReset > 1000) {
-      this._errorCount = 0;
-      this._lastErrorReset = now;
+    if (now - this._lastLogReset > 1000) {
+      this._logCount = 0;
+      this._lastLogReset = now;
     }
 
     // If we're getting too many logs per second, drop them
-    if (this._errorCount >= this._maxErrorsPerSecond) {
+    if (this._logCount >= this._maxLogsPerSecond) {
       return;
     }
-    this._errorCount++;
+    this._logCount++;
 
     this._isLogging = true;
     try {

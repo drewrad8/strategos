@@ -163,7 +163,7 @@ export function createIntegrationRoutes(theaRoot, io) {
   router.get('/worker/:id/status', (req, res) => {
     try {
       // Validate worker ID format (consistent with workflow-execute)
-      if (!/^[a-zA-Z0-9-]{1,36}$/.test(req.params.id)) {
+      if (!VALID_WORKER_ID.test(req.params.id)) {
         return res.status(400).json({ error: 'Invalid workerId format' });
       }
       const worker = getWorker(req.params.id);

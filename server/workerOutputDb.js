@@ -279,6 +279,13 @@ export function storeOutput(workerId, output, chunkType = 'stdout') {
     insertOutput.run(sessionId, workerId, output, chunkType, chunkHash);
     return true;
   } catch (err) {
+    // FK constraint means the session row was deleted (e.g. by cleanup) after we
+    // looked up the sessionId. Clear the stale cache entry so future calls skip
+    // gracefully. This is expected after worker dismiss/kill — not a real error.
+    if (err.message && err.message.includes('FOREIGN KEY constraint failed')) {
+      activeSessionIds.delete(workerId);
+      return false;
+    }
     console.error('[WorkerOutputDb] Failed to store output:', err.message);
     return false;
   }
@@ -557,8 +564,16 @@ const MAX_DB_SIZE_BYTES = 200 * 1024 * 1024;
  */
 export function enforceDbSizeLimit() {
   try {
-    // Checkpoint WAL first so size reflects actual data
-    try { db.pragma('wal_checkpoint(PASSIVE)'); } catch (e) { /* ignore */ }
+    // Checkpoint WAL first so size reflects actual data.
+    // PASSIVE may not fully flush if there are active readers; escalate to RESTART
+    // if pages remain uncheckpointed so the file-size measurement is accurate.
+    try {
+      const walResult = db.pragma('wal_checkpoint(PASSIVE)');
+      const walInfo = walResult[0];
+      if (walInfo && walInfo.log !== walInfo.checkpointed) {
+        db.pragma('wal_checkpoint(RESTART)');
+      }
+    } catch (e) { /* best effort */ }
 
     // Check total size including WAL file
     const mainSize = fs.statSync(DB_PATH).size;
@@ -620,7 +635,7 @@ let _startupCleanupTimer = setTimeout(() => {
 }, 5000);
 if (_startupCleanupTimer.unref) _startupCleanupTimer.unref();
 
-// Schedule periodic cleanup (every 30 minutes instead of 6 hours)
+// Schedule periodic cleanup every 30 minutes
 let _periodicCleanupInterval = setInterval(() => {
   try {
     cleanupOldData(1);

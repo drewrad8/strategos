@@ -75,12 +75,22 @@ export function safeResolvePath(projectPath, theaRoot) {
   return null;
 }
 
+// Simple TTL cache to avoid double-reading projects.json within the same scan cycle
+const _configCache = { theaRoot: null, data: null, at: 0 };
+const CONFIG_CACHE_TTL = 5000; // 5 seconds
+
 /**
- * Load the projects configuration file
+ * Load the projects configuration file (cached for 5s to avoid double-reads per scan cycle)
  */
 export function loadProjectConfig(theaRoot) {
+  const now = Date.now();
+  if (_configCache.theaRoot === theaRoot && now - _configCache.at < CONFIG_CACHE_TTL) {
+    return _configCache.data;
+  }
+
   const configPath = path.join(theaRoot, 'strategos', CONFIG_FILE);
 
+  let result;
   try {
     if (fs.existsSync(configPath)) {
       const content = fs.readFileSync(configPath, 'utf-8');
@@ -89,19 +99,26 @@ export function loadProjectConfig(theaRoot) {
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
         console.warn('[ProjectScanner] projects.json is not a JSON object, using defaults');
       } else {
-        return parsed;
+        result = parsed;
       }
     }
   } catch (error) {
     console.error('Error loading project config:', error.message);
   }
 
-  return {
-    folders: {},
-    tags: {},
-    projectMeta: {},
-    settings: { defaultView: 'folders', showUncategorized: true, uncategorizedLabel: 'Other Projects' }
-  };
+  if (!result) {
+    result = {
+      folders: {},
+      tags: {},
+      projectMeta: {},
+      settings: { defaultView: 'folders', showUncategorized: true, uncategorizedLabel: 'Other Projects' }
+    };
+  }
+
+  _configCache.theaRoot = theaRoot;
+  _configCache.data = result;
+  _configCache.at = now;
+  return result;
 }
 
 /**

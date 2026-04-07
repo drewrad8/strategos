@@ -45,6 +45,7 @@ import {
   MAX_TASK_LENGTH, MAX_LABEL_LENGTH, MAX_INPUT_LENGTH, MAX_PROMPT_LENGTH,
   isValidSessionId
 } from '../validation.js';
+import { getReviewResult, addReviewResult } from '../learningsDb.js';
 
 // =============================================
 // SPAWN TEMPLATES - Simplified worker spawning
@@ -54,42 +55,51 @@ const SPAWN_TEMPLATES = {
   research: {
     prefix: 'RESEARCH',
     autoAccept: true,
-    ralphMode: true
+    ralphMode: true,
+    model: 'sonnet'
   },
   impl: {
     prefix: 'IMPL',
     autoAccept: true,
-    ralphMode: true
+    ralphMode: true,
+    model: 'sonnet'
   },
   test: {
     prefix: 'TEST',
     autoAccept: true,
-    ralphMode: true
+    ralphMode: true,
+    model: 'haiku'
   },
   review: {
     prefix: 'REVIEW',
     autoAccept: true,
-    ralphMode: true
+    ralphMode: true,
+    model: 'haiku'
   },
   fix: {
     prefix: 'FIX',
     autoAccept: true,
-    ralphMode: true
+    ralphMode: true,
+    model: 'sonnet'
   },
   general: {
     prefix: 'GENERAL',
     autoAccept: true, // GENERALs need auto-accept to run curl commands; pause-keywords provide safety
-    ralphMode: true
+    ralphMode: true,
+    forcedAutonomy: true, // GENERALs are continuous-ops workers — always nudge them to find more work
+    model: 'sonnet'
   },
   colonel: {
     prefix: 'COLONEL',
     autoAccept: true,
-    ralphMode: true
+    ralphMode: true,
+    model: 'sonnet'
   },
   captain: {
     prefix: 'CAPTAIN',
     autoAccept: true,
-    ralphMode: true
+    ralphMode: true,
+    model: 'sonnet'
   },
   // Gemini CLI backend templates
   'gemini-research': {
@@ -178,6 +188,158 @@ const SPAWN_TEMPLATES = {
     backend: 'aider'
   }
 };
+
+// =============================================
+// TASK QUALITY VALIDATION
+// =============================================
+
+const MIN_TASK_LENGTH = 50;
+
+const END_STATE_PATTERNS = /\b(end state|success|done when|verify|commit|result|deliver|complet|output)\b/i;
+const PURPOSE_PATTERNS = /\b(purpose|because|why|so that|in order to|motivation|goal|objective)\b/i;
+const FILE_REF_PATTERNS = /\b[\w-]+\.(js|ts|jsx|tsx|py|rs|go|json|yaml|yml|md|css|html|sql|sh)\b|\/[\w/-]+\.\w+/;
+const CONSTRAINT_PATTERNS = /\b(must not|do not|never|avoid|constraint|limit|only|require|boundary)\b/i;
+
+// Marathon / continuous-ops language patterns (colonel failure predictor)
+// Catches explicit open-ended operation instructions from failed colonel post-mortems.
+// Intentionally narrow: only blocks commands like "run forever", "never stop", "keep N workers
+// running at all times" — NOT normal task language like "fix any failures" or "document others".
+// Removed: "bulldoze" (system feature name, appears in valid task descriptions about the bulldoze
+// protocol), "ongoing" (common adjective in bounded tasks like "fix ongoing failures").
+const MARATHON_PATTERNS = /\b(continuous(?:ly)?\s+(?:run|loop|spawn|monitor|operat)|keep\s+running|never\s+stop|marathon|weekend[- ]long|run\s+indefinitely|run\s+forever|always\s+be\s+running|perpetual|24\/7|nonstop|non[- ]stop)\b|keep\s+\d+\+?\s+workers?\s+running\s+at\s+all\s+times|run\s+until\s+(sunday|monday|tuesday|wednesday|thursday|friday|saturday|tonight|morning|end\s+of\s+day|midnight|tomorrow)|zero\s+active\s+children\s*[=:]\s*(fail|failure|bad|wrong)|when\s+one\s+finishes[^.]*spawn\s+another|spawn\s+another\s+immediately/i;
+
+// Introspection patterns — tasks that require a worker to observe its own spawn-time configuration
+// (model assignment, effort level, context sections) which cannot be verified from inside the session
+const INTROSPECTION_PATTERNS = /verif\w*\s+(?:that\s+)?(?:\w+\s+){0,3}(?:template\s+)?workers?\s+(?:receives?|are\s+assigned|gets?)\b|verify\s+model\s+routing|test(?:s)?\s+(?:that\s+)?context\s+tieri?ng|verif\w*\s+(?:that\s+)?context\s+tieri?ng|effort\s+level\s+(?:tuning|check|verif|assign)|verify\s+effort\s+level|check\s+(?:that\s+)?model\s+(?:is\s+)?(?:correctly\s+)?(?:assigned|routed)|assigned\s+(?:the\s+)?(?:correct\s+)?(?:\w+\s+)?(?:language\s+)?model|model\s+(?:is\s+)?(?:correctly\s+)?(?:assigned|routed|routing)|test\s+(?:that\s+)?(?:the\s+)?(?:model|effort|context)\s+(?:is\s+)?(?:correctly\s+)?(?:assigned|set|routed|tiered)/i;
+
+/**
+ * Assess task description quality and return warnings + score.
+ * @param {object} taskObj - The validated task object (always has .description)
+ * @param {object} [options] - Additional context
+ * @param {string} [options.templateKey] - Template type (e.g. 'colonel', 'impl')
+ * @returns {{ warnings: string[], taskQualityScore: number, hardReject: boolean, hardRejectReason: string|null }}
+ */
+function assessTaskQuality(taskObj, options = {}) {
+  const warnings = [];
+  const desc = taskObj.description || '';
+  const { templateKey } = options;
+
+  // Combine all text fields for richer analysis
+  const allText = [
+    desc,
+    taskObj.purpose || '',
+    taskObj.endState || '',
+    taskObj.context || '',
+    ...(taskObj.keyTasks || []),
+    ...(taskObj.constraints || []),
+  ].join(' ');
+
+  let score = 0;
+
+  // --- Length scoring (0-25 points) ---
+  // Linear ramp from 50 chars (0 pts) to 300 chars (25 pts), capped
+  const len = desc.length;
+  score += Math.min(25, Math.round(((len - MIN_TASK_LENGTH) / 250) * 25));
+
+  // --- End state / completion criteria (0-25 points) ---
+  const hasEndStateField = !!taskObj.endState;
+  const hasEndStateInText = END_STATE_PATTERNS.test(allText);
+  if (hasEndStateField) {
+    score += 25;
+  } else if (hasEndStateInText) {
+    score += 15;
+  } else {
+    warnings.push('No clear completion criteria — consider adding "end state", "done when", or "verify" language so the worker knows when to stop.');
+  }
+
+  // --- Purpose / motivation (0-20 points) ---
+  const hasPurposeField = !!taskObj.purpose;
+  const hasPurposeInText = PURPOSE_PATTERNS.test(allText);
+  if (hasPurposeField) {
+    score += 20;
+  } else if (hasPurposeInText) {
+    score += 12;
+  } else {
+    warnings.push('No stated purpose or motivation — consider adding "purpose", "because", or "so that" to explain why this task matters.');
+  }
+
+  // --- Specificity: file/function references (0-15 points) ---
+  const hasFileRefs = FILE_REF_PATTERNS.test(allText);
+  if (hasFileRefs) {
+    score += 15;
+  }
+
+  // --- Constraints (0-15 points) ---
+  const hasConstraintField = Array.isArray(taskObj.constraints) && taskObj.constraints.length > 0;
+  const hasConstraintInText = CONSTRAINT_PATTERNS.test(allText);
+  if (hasConstraintField) {
+    score += 15;
+  } else if (hasConstraintInText) {
+    score += 8;
+  }
+
+  // --- Colonel-specific checks (failure pattern detection) ---
+  let hardReject = false;
+  let hardRejectReason = null;
+  const isColonel = templateKey === 'colonel';
+  if (isColonel) {
+    // R3: Colonel tasks without completion criteria — hard reject (86% failure rate for unbounded colonels)
+    if (!hasEndStateField && !hasEndStateInText) {
+      score -= 20;
+      hardReject = true;
+      hardRejectReason = 'Colonel spawn rejected: no END STATE or completion criteria detected. Colonels without completion criteria fail at 86% vs near-100% for bounded tasks. Add an endState field or include "end state", "done when", "success criteria", or similar language in the task description.';
+      warnings.push(hardRejectReason);
+    }
+
+    // R1: Marathon / open-ended language is the #1 colonel failure pattern — hard reject
+    if (MARATHON_PATTERNS.test(allText)) {
+      score -= 20;
+      hardReject = true;
+      const marathonReason = 'Colonel spawn rejected: task contains open-ended/marathon language (e.g. "keep N workers running at all times", "run until [day]", "zero active children = failure", "when one finishes spawn another"). These patterns are a GENERAL\'s job — colonels need bounded scope with a finite deliverable list.';
+      hardRejectReason = hardRejectReason ? hardRejectReason + ' Additionally: ' + marathonReason : marathonReason;
+      warnings.push(marathonReason);
+    }
+  }
+
+  // --- Commander's Intent format check (soft warning, cross-type) ---
+  // Research R45: Tasks using PURPOSE/KEY TASKS/END STATE structure have a 97.1% success
+  // rate vs 24.6% without — a 72.5pp gap. Warn when fewer than 2 of the 3 markers are present.
+  const COMMANDER_INTENT_MARKERS = [
+    /\bpurpose\s*:/i,
+    /\bkey\s+tasks?\s*:/i,
+    /\bend\s+state\s*:/i,
+  ];
+  const intentMarkerCount = COMMANDER_INTENT_MARKERS.filter(p => p.test(allText)).length;
+  if (intentMarkerCount < 2) {
+    warnings.push(
+      'Tasks using Commander\'s Intent format (PURPOSE/KEY TASKS/END STATE) have a 97% success rate vs 25% without. Consider restructuring your task description to include these three sections.'
+    );
+  }
+
+  // --- Introspection pattern detection (soft warning, not hard reject) ---
+  // Tasks that ask a worker to verify its own model, effort level, or context sections
+  // cannot be verified from inside the session — these conditions are set at spawn time.
+  if (INTROSPECTION_PATTERNS.test(allText)) {
+    warnings.push('This task may require observing conditions set at spawn time (model assignment, effort level, context sections), which cannot be reliably verified from within the worker. Consider using server logs or an external observer instead.');
+  }
+
+  // --- KEY TASKS bullet count penalty (-10 points for >5 bullets) ---
+  // Overly broad impl tasks with many bullet points correlate with scope creep and failure.
+  const keyTasksMatch = allText.match(/\bkey\s+tasks?\s*:([\s\S]*?)(?:\bend\s+state\s*:|$)/i);
+  if (keyTasksMatch) {
+    const keyTasksBody = keyTasksMatch[1];
+    const bulletCount = (keyTasksBody.match(/^\s*[-*•]|\n\s*[-*•]|\n\s*\d+\./g) || []).length;
+    if (bulletCount > 5) {
+      score -= 10;
+      warnings.push(`KEY TASKS section has ${bulletCount} bullet points (max recommended: 5). Overly broad tasks increase scope creep and failure rate — consider splitting into multiple focused workers.`);
+    }
+  }
+
+  // Clamp to 0-100
+  score = Math.max(0, Math.min(100, score));
+
+  return { warnings, taskQualityScore: score, hardReject, hardRejectReason };
+}
 
 export function createWorkerRoutes(theaRoot, io) {
   const router = express.Router();
@@ -303,7 +465,8 @@ export function createWorkerRoutes(theaRoot, io) {
         prefix: config.prefix,
         autoAccept: config.autoAccept,
         ralphMode: config.ralphMode,
-        backend: config.backend || 'claude'
+        backend: config.backend || 'claude',
+        model: config.model || null
       }));
       res.json({ templates });
     } catch (error) {
@@ -315,6 +478,20 @@ export function createWorkerRoutes(theaRoot, io) {
   router.get('/efficiency', (req, res) => {
     try {
       res.json(getWorkerEfficiency());
+    } catch (error) {
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
+    }
+  });
+
+  // NOTE: This route MUST be before /api/workers/:id to avoid Express matching "auto-respawn" as the :id param.
+  /**
+   * GET /api/workers/auto-respawn/status
+   * Returns current auto-respawn registrations and chain states.
+   */
+  router.get('/auto-respawn/status', async (_req, res) => {
+    try {
+      const { getAutoRespawnStatus } = await import('../services/autoRespawnService.js');
+      res.json(getAutoRespawnStatus());
     } catch (error) {
       res.status(500).json({ error: sanitizeErrorMessage(error) });
     }
@@ -376,6 +553,7 @@ export function createWorkerRoutes(theaRoot, io) {
         allowDuplicate, // Allow spawning duplicate label+project workers (default false)
         backend,        // 'claude' (default), 'gemini', or 'aider'
         model,          // Model name for aider backend (e.g. 'ollama_chat/qwen2.5-coder:7b')
+        effortLevel,    // 'low', 'medium', or 'high' — overrides type-based default
       } = req.body;
 
       if (!projectPath) {
@@ -500,16 +678,30 @@ export function createWorkerRoutes(theaRoot, io) {
       // Backend selection: explicit > parent inheritance > 'claude' default
       if (backend === 'gemini' || backend === 'aider') {
         options.backend = backend;
-        if (backend === 'aider' && model) options.model = model;
       } else if (!backend && validParentWorkerId) {
         const parentWorker = getWorker(validParentWorkerId);
         if (parentWorker?.backend && parentWorker.backend !== 'claude') {
           options.backend = parentWorker.backend;
-          if (parentWorker.backend === 'aider' && parentWorker.model) options.model = parentWorker.model;
         }
+      }
+      // Model: explicit > parent inheritance
+      if (model) {
+        options.model = model;
+      } else if (validParentWorkerId) {
+        const parentWorker = getWorker(validParentWorkerId);
+        if (parentWorker?.model) options.model = parentWorker.model;
       }
       // Duplicate detection is ON by default — callers must opt-in to duplicates
       options.allowDuplicate = allowDuplicate === true;
+      // Effort level override (validated; type-based default applied in lifecycle.js)
+      const validEfforts = ['low', 'medium', 'high'];
+      if (effortLevel !== undefined) {
+        if (validEfforts.includes(effortLevel)) {
+          options.effortLevel = effortLevel;
+        } else {
+          return res.status(400).json({ error: `effortLevel must be one of: ${validEfforts.join(', ')}` });
+        }
+      }
 
       const worker = await spawnWorker(resolvedPath, label, io, options);
 
@@ -547,7 +739,7 @@ export function createWorkerRoutes(theaRoot, io) {
    */
   router.post('/spawn-from-template', async (req, res) => {
     try {
-      const { template: templateField, role, label, projectPath, task, parentWorkerId, allowDuplicate, model } = req.body;
+      const { template: templateField, role, label, projectPath, task, parentWorkerId, allowDuplicate, model, effortLevel } = req.body;
 
       // Accept 'role' as alias for 'template'
       const template = templateField || role;
@@ -651,6 +843,21 @@ export function createWorkerRoutes(theaRoot, io) {
         return res.status(400).json({ error: 'task must be a string or plain object' });
       }
 
+      // Build a temporary task object for quality assessment (merge structured fields if present)
+      const qualityInput = typeof task === 'string'
+        ? { description: task }
+        : task;
+      const { warnings: qualityWarnings, taskQualityScore, hardReject, hardRejectReason } = assessTaskQuality(qualityInput, { templateKey });
+
+      // R1/R3: Hard reject colonel spawns with marathon patterns or missing END STATE
+      if (hardReject) {
+        return res.status(400).json({
+          error: hardRejectReason,
+          taskQualityScore,
+          warnings: qualityWarnings,
+        });
+      }
+
       // Get parent worker for context inheritance
       const parent = parentWorkerId ? getWorker(parentWorkerId) : null;
 
@@ -697,15 +904,42 @@ export function createWorkerRoutes(theaRoot, io) {
       // Backend priority: template explicit > parent inheritance > 'claude' default
       // Backend priority: template explicit > parent inheritance > 'claude' default
       const resolvedBackend = tmpl.backend || (parent?.backend && parent.backend !== 'claude' ? parent.backend : 'claude');
+      // Validate effortLevel if provided
+      const validEfforts = ['low', 'medium', 'high'];
+      if (effortLevel !== undefined && !validEfforts.includes(effortLevel)) {
+        return res.status(400).json({ error: `effortLevel must be one of: ${validEfforts.join(', ')}` });
+      }
+
+      // Parse autoRespawn option — GENERAL workers default to true for respawn resilience
+      const autoRespawnEnabled = req.body.autoRespawn === true || (req.body.autoRespawn === undefined && templateKey === 'general');
+      let autoRespawnConfig = null;
+      if (autoRespawnEnabled) {
+        const taskDesc = typeof taskObj === 'string' ? taskObj : (taskObj.description || '');
+        autoRespawnConfig = {
+          taskDescription: taskDesc,
+          projectPath: resolvedPath,
+          label: fullLabel,
+          maxRespawns: typeof req.body.autoRespawnMaxRespawns === 'number' ? req.body.autoRespawnMaxRespawns : 10,
+          cooldownMs: typeof req.body.autoRespawnCooldownMs === 'number' ? req.body.autoRespawnCooldownMs : 120000,
+          effortLevel: effortLevel || null,
+          autoAccept: tmpl.autoAccept,
+          forcedAutonomy: !!(req.body.forcedAutonomy || tmpl.forcedAutonomy),
+          bulldozeMode: !!req.body.bulldozeMode,
+        };
+      }
+
       const options = {
         autoAccept: tmpl.autoAccept,
         ralphMode: tmpl.ralphMode,
         backend: resolvedBackend,
-        model: resolvedBackend === 'aider' ? (model || null) : null,
+        model: model || tmpl.model || null,
         task: taskObj,
         parentWorkerId,
         parentLabel: parent?.label,
-        allowDuplicate: allowDuplicate === true
+        allowDuplicate: allowDuplicate === true,
+        effortLevel: effortLevel || null,
+        autoRespawn: autoRespawnEnabled,
+        autoRespawnConfig,
       };
 
       const worker = await spawnWorker(resolvedPath, fullLabel, io, options);
@@ -718,8 +952,8 @@ export function createWorkerRoutes(theaRoot, io) {
         }
       }
 
-      // Atomically enable forced autonomy if requested
-      if (req.body.forcedAutonomy) {
+      // Atomically enable forced autonomy if requested or if the template requires it
+      if (req.body.forcedAutonomy || tmpl.forcedAutonomy) {
         updateWorkerSettings(worker.id, { forcedAutonomy: true }, io);
       }
 
@@ -732,11 +966,20 @@ export function createWorkerRoutes(theaRoot, io) {
         updateWorkerSettings(worker.id, bulldozeSettings, io);
       }
 
+      // Store task quality score on worker for metrics tracking
+      worker.taskQualityScore = taskQualityScore;
+
       // Build response — use normalizeWorker allowlist to strip internal fields (ralphToken etc.)
       const response = normalizeWorker(worker);
       if (!parentWorkerId) {
         response._warning = 'No parentWorkerId provided. Include parentWorkerId from your project instructions to enable parent-child tracking.';
         console.warn(`[SPAWN] Worker ${worker.id} spawned without parentWorkerId - parent-child tracking disabled`);
+      }
+
+      // Include task quality data in spawn response
+      response.taskQualityScore = taskQualityScore;
+      if (qualityWarnings.length > 0) {
+        response.warnings = qualityWarnings;
       }
 
       res.status(201).json(response);
@@ -1129,17 +1372,9 @@ curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Co
       if (callerWorkerId) {
         const cacheKey = `${callerWorkerId}:${req.params.id}`;
 
-        // Evict oldest entries if cache is full
+        // Evict oldest entry if cache is full (Map preserves insertion order → O(1))
         if (_outputCache.size >= OUTPUT_CACHE_MAX_ENTRIES) {
-          let oldestKey = null;
-          let oldestTime = Infinity;
-          for (const [key, entry] of _outputCache) {
-            if (entry.timestamp < oldestTime) {
-              oldestTime = entry.timestamp;
-              oldestKey = key;
-            }
-          }
-          if (oldestKey) _outputCache.delete(oldestKey);
+          _outputCache.delete(_outputCache.keys().next().value);
         }
 
         _outputCache.set(cacheKey, { output, timestamp: Date.now() });
@@ -1365,6 +1600,237 @@ curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Co
 
       const context = getWorkerContext(req.params.id);
       res.json({ ...context, workerId: req.params.id });
+    } catch (error) {
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
+    }
+  });
+
+  // =============================================
+  // BLACKBOARD ROUTES — per-hierarchy shared context
+  // =============================================
+
+  // GET /api/workers/:id/blackboard — read blackboard for worker's hierarchy
+  router.get('/:id/blackboard', async (req, res) => {
+    try {
+      const workerId = req.params.id;
+      if (!VALID_WORKER_ID.test(workerId)) {
+        return res.status(400).json({ error: 'Invalid worker ID format' });
+      }
+
+      const worker = getWorkerInternal(workerId);
+      if (!worker) {
+        return res.status(404).json({ error: 'Resource not found' });
+      }
+
+      const { getHierarchyRootId, readBlackboard } = await import('../blackboardDb.js');
+      const { workers } = await import('../workers/state.js');
+      const rootId = getHierarchyRootId(workerId, workers);
+      const bb = await readBlackboard(worker.workingDir, rootId);
+
+      res.json({
+        hierarchyRootId: rootId,
+        entryCount: bb.entries.length,
+        entries: bb.entries,
+      });
+    } catch (error) {
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
+    }
+  });
+
+  // POST /api/workers/:id/blackboard — append entry to worker's hierarchy blackboard
+  router.post('/:id/blackboard', async (req, res) => {
+    try {
+      const workerId = req.params.id;
+      if (!VALID_WORKER_ID.test(workerId)) {
+        return res.status(400).json({ error: 'Invalid worker ID format' });
+      }
+
+      const worker = getWorkerInternal(workerId);
+      if (!worker) {
+        return res.status(404).json({ error: 'Resource not found' });
+      }
+
+      const { type, key, value } = req.body;
+      if (!type || typeof type !== 'string') {
+        return res.status(400).json({ error: 'type is required' });
+      }
+      if (type.length > 50) {
+        return res.status(400).json({ error: 'type must be 50 characters or fewer' });
+      }
+      if (!key || typeof key !== 'string') {
+        return res.status(400).json({ error: 'key is required' });
+      }
+      if (key.length > 200) {
+        return res.status(400).json({ error: 'key must be 200 characters or fewer' });
+      }
+      if (!value || typeof value !== 'string') {
+        return res.status(400).json({ error: 'value is required' });
+      }
+      if (value.length > 10240) {
+        return res.status(400).json({ error: 'value must be 10240 characters (10KB) or fewer' });
+      }
+
+      const { getHierarchyRootId, appendBlackboardEntry } = await import('../blackboardDb.js');
+      const { workers } = await import('../workers/state.js');
+      const rootId = getHierarchyRootId(workerId, workers);
+
+      const result = await appendBlackboardEntry(
+        worker.workingDir,
+        rootId,
+        workerId,
+        worker.label || workerId,
+        type,
+        key,
+        value
+      );
+
+      res.json(result);
+    } catch (error) {
+      if (error.message?.startsWith('Invalid blackboard entry type')) {
+        return res.status(400).json({ error: error.message });
+      }
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
+    }
+  });
+
+  // GET /api/workers/:id/review — get review gate result for a worker
+  router.get('/:id/review', (req, res) => {
+    try {
+      const workerId = req.params.id;
+      if (!VALID_WORKER_ID.test(workerId)) {
+        return res.status(400).json({ error: 'Invalid worker ID format' });
+      }
+      const result = getReviewResult(workerId);
+      if (!result) return res.json({ reviewRun: false });
+      return res.json({ reviewRun: true, ...result });
+    } catch (error) {
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
+    }
+  });
+
+  // POST /api/workers/:id/review/override — human operator overrides a gate decision
+  router.post('/:id/review/override', (req, res) => {
+    try {
+      const workerId = req.params.id;
+      if (!VALID_WORKER_ID.test(workerId)) {
+        return res.status(400).json({ error: 'Invalid worker ID format' });
+      }
+      const { decision, reason } = req.body;
+      if (!['pass', 'conditional', 'fail'].includes(decision)) {
+        return res.status(400).json({ error: 'decision must be pass, conditional, or fail' });
+      }
+      if (reason !== undefined && (typeof reason !== 'string' || reason.length > 500)) {
+        return res.status(400).json({ error: 'reason must be a string of 500 characters or fewer' });
+      }
+      // Upsert override — creates row if none exists, updates if one does
+      addReviewResult({
+        workerId,
+        finalDecision: decision,
+        stage2Verdict: `Human override: ${reason || 'no reason given'}`,
+        deliveredWithAnnotation: 0,
+      });
+      return res.json({ success: true, workerId, decision });
+    } catch (error) {
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
+    }
+  });
+
+  // DELETE /api/workers/:id/blackboard — clear blackboard (internal, called on hierarchy root completion)
+  router.delete('/:id/blackboard', async (req, res) => {
+    try {
+      const workerId = req.params.id;
+      if (!VALID_WORKER_ID.test(workerId)) {
+        return res.status(400).json({ error: 'Invalid worker ID format' });
+      }
+
+      const worker = getWorkerInternal(workerId);
+      if (!worker) {
+        return res.status(404).json({ error: 'Resource not found' });
+      }
+
+      const { getHierarchyRootId, clearBlackboard } = await import('../blackboardDb.js');
+      const { workers } = await import('../workers/state.js');
+      const rootId = getHierarchyRootId(workerId, workers);
+
+      // Only allow clearing on hierarchy root
+      if (rootId !== workerId) {
+        return res.status(403).json({ error: 'Blackboard can only be cleared by the hierarchy root worker' });
+      }
+
+      await clearBlackboard(worker.workingDir, rootId);
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
+    }
+  });
+
+  // =============================================
+  // AUTO-RESPAWN ROUTES
+  // =============================================
+
+  /**
+   * POST /api/workers/:id/auto-respawn
+   * Register or update auto-respawn for an existing worker.
+   *
+   * Body: taskDescription (string, required), maxRespawns, cooldownMs, effortLevel,
+   *       autoAccept, forcedAutonomy, bulldozeMode
+   */
+  router.post('/:id/auto-respawn', async (req, res) => {
+    try {
+      if (!VALID_WORKER_ID.test(req.params.id)) {
+        return res.status(400).json({ error: 'Invalid worker ID' });
+      }
+      const worker = getWorker(req.params.id);
+      if (!worker) return res.status(404).json({ error: 'Worker not found' });
+
+      const { taskDescription, maxRespawns, cooldownMs, effortLevel, autoAccept, forcedAutonomy, bulldozeMode } = req.body;
+
+      if (!taskDescription || typeof taskDescription !== 'string') {
+        return res.status(400).json({ error: 'taskDescription is required and must be a string' });
+      }
+      if (taskDescription.length > MAX_TASK_LENGTH) {
+        return res.status(400).json({ error: `taskDescription must be under ${MAX_TASK_LENGTH} characters` });
+      }
+
+      const { registerAutoRespawn } = await import('../services/autoRespawnService.js');
+
+      registerAutoRespawn(req.params.id, {
+        taskDescription,
+        projectPath: worker.workingDir,
+        label: worker.label,
+        maxRespawns: typeof maxRespawns === 'number' ? maxRespawns : 10,
+        cooldownMs: typeof cooldownMs === 'number' ? cooldownMs : 120000,
+        effortLevel: effortLevel || null,
+        autoAccept: autoAccept !== false,
+        forcedAutonomy: forcedAutonomy !== false,
+        bulldozeMode: bulldozeMode === true,
+      });
+
+      // Mark the worker as autoRespawn=true so the death hooks fire
+      worker.autoRespawn = true;
+
+      res.json({ success: true, workerId: req.params.id, label: worker.label });
+    } catch (error) {
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
+    }
+  });
+
+  /**
+   * DELETE /api/workers/:id/auto-respawn
+   * Remove auto-respawn registration for a worker.
+   */
+  router.delete('/:id/auto-respawn', async (req, res) => {
+    try {
+      if (!VALID_WORKER_ID.test(req.params.id)) {
+        return res.status(400).json({ error: 'Invalid worker ID' });
+      }
+      const { deregisterAutoRespawn } = await import('../services/autoRespawnService.js');
+      deregisterAutoRespawn(req.params.id);
+
+      const worker = getWorker(req.params.id);
+      if (worker) worker.autoRespawn = false;
+
+      res.json({ success: true });
     } catch (error) {
       res.status(500).json({ error: sanitizeErrorMessage(error) });
     }

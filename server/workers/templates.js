@@ -10,7 +10,22 @@ import {
   _contextWriteLocks,
   STRATEGOS_API,
   THEA_ROOT,
+  readFileSync, existsSync,
 } from './state.js';
+
+// ============================================
+// TEMPLATE OVERRIDES
+// ============================================
+
+function _loadTemplateOverrides() {
+  try {
+    const overridePath = path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'template-overrides.json');
+    if (!existsSync(overridePath)) return null;
+    return JSON.parse(readFileSync(overridePath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
 
 // ============================================
 // NAMING SCHEMA
@@ -202,6 +217,20 @@ export const AUTO_CONTINUE_MAX_ATTEMPTS = 10;
 export const AUTO_CONTINUE_MESSAGE = 'Please continue the conversation from where we left off without asking the user any further questions. Continue with the last task that you were asked to work on.';
 
 // ============================================
+// TEMPLATE HASH TRACKING
+// ============================================
+
+let _lastGeneratedTemplateHash = null;
+
+export function computeTemplateHash(missionSection) {
+  return crypto.createHash('sha256').update(missionSection).digest('hex').slice(0, 12);
+}
+
+export function getLastGeneratedTemplateHash() {
+  return _lastGeneratedTemplateHash;
+}
+
+// ============================================
 // STRATEGOS CONTEXT GENERATION
 // ============================================
 
@@ -283,11 +312,25 @@ EXAMPLES OF WRONG GENERAL BEHAVIOR (these are FAILURES):
   - Spawning workers AND ALSO doing implementation work yourself
 
 SCOPE: Do NOT self-assign new missions. Do NOT expand scope. Observations outside your task go in your completion report, not into new spawns.
-
+${bulldozeMode ? `
+CONTINUOUS OPERATIONS (BULLDOZE MODE — MANDATORY):
+You are in BULLDOZE mode. You must NEVER consider yourself "done." When all current children complete:
+1. Review what was accomplished (git log --oneline -20, check results)
+2. Identify the NEXT improvement opportunities (research, optimize, test, refactor, document)
+3. Spawn new workers for the highest-impact items
+4. You should ALWAYS have 3-5 workers running. If you have zero active children, that is a FAILURE STATE.
+5. Use WebSearch to research new improvements if you run out of ideas
+6. Check /api/insights/learnings for past failure patterns to fix
+7. Check /api/insights/success-rate for worker types that need template improvements
+NEVER write EXHAUSTED to the state file. NEVER signal done. Your mission is CONTINUOUS.
+A GENERAL with no active children is a GENERAL that is FAILING.
+` : ''}
 COMMUNICATION: Address the human operator as "Commander" in all reports, signals, and messages. You serve the Commander's intent.
 
 RALPH: Signal in_progress every 15-30 min with progress %. Monitor workers via /children.
 FIRST SIGNAL: You MUST signal in_progress via Ralph within your first 3 minutes of receiving a task.
+
+CHILD WORKER DISMISSAL: Before dismissing a child worker, verify it has signaled done or blocked via Ralph. Do NOT dismiss a worker that is still in \`in_progress\` status without first sending it an interrupt and getting confirmation it has stopped. Silent dismissal of in-progress workers is the leading cause of NULL learnings in the database.
 
 MONITORING PROTOCOL (MANDATORY — violating this wastes API calls and context):
 1. Check /children endpoint every 2-5 MINUTES, NOT every few seconds. Workers need time to work.
@@ -325,6 +368,8 @@ OPERATIONAL RULES:
 AUTHORITY: Full authority over your child workers. Report up to your parent, not to the Commander.
 
 FIRST SIGNAL: You MUST signal in_progress via Ralph within your first 3 minutes of receiving a task. Failure to signal means the system assumes you are stuck and will send you a reminder.
+
+CHILD WORKER DISMISSAL: Before dismissing a child worker, verify it has signaled done or blocked via Ralph. Do NOT dismiss a worker that is still in \`in_progress\` status without first sending it an interrupt and getting confirmation it has stopped. Silent dismissal of in-progress workers is the leading cause of NULL learnings in the database.
 </mission>
 `;
   } else if (isCaptain) {
@@ -376,6 +421,8 @@ Your role is IMPLEMENTATION. You write code, test it, and commit it.
 
 FIRST SIGNAL: You MUST signal in_progress via Ralph within your first 3 minutes of receiving a task. Failure to signal means the system assumes you are stuck and will send you a reminder.
 
+ENVIRONMENT FAILURES: If you cannot complete due to environmental issues (missing deps, service unreachable, compile errors, permission denied), signal \`blocked\` IMMEDIATELY with the reason — do NOT silently exhaust your context trying to work around it. A blocked signal preserves your work and lets your parent respawn you with a fix; dying without signaling loses everything.
+
 BEFORE WRITING CODE: Read the file you are about to modify. Read at least one sibling file to understand the project's patterns. Do not invent your own conventions.
 
 WORKFLOW: Read existing code → Write changes → Validate syntax (node --check) → Run tests → Verify behavior → Git commit
@@ -406,6 +453,8 @@ Your role is TESTING. You write tests and report results. You do NOT fix product
 
 FIRST SIGNAL: You MUST signal in_progress via Ralph within your first 3 minutes of receiving a task. Failure to signal means the system assumes you are stuck and will send you a reminder.
 
+ENVIRONMENT FAILURES: If the test environment is broken (jest not configured, npm test script missing, server not running), signal blocked within your first 5 minutes with a clear explanation of what is missing. Do NOT spend hours trying to configure the environment. Also: if the test run itself fails, you MUST still signal done (status: done) with your learnings — a result of "tests failed for reason X" is a complete task. Dying silently is NOT acceptable.
+
 WORKFLOW: Understand the feature → Write tests (happy path, edge cases, error paths) → Run tests → Report results with evidence
 SCOPE: Test what your task specifies. If you discover untested areas outside scope, note them in Ralph "learnings."
 OUTPUT: Pass/fail counts, error output, coverage gaps. Tests must be committed.
@@ -428,6 +477,8 @@ ON ERROR — structured recovery:
 Your role is BUG FIXING. You diagnose and fix specific bugs.
 
 FIRST SIGNAL: You MUST signal in_progress via Ralph within your first 3 minutes of receiving a task. Failure to signal means the system assumes you are stuck and will send you a reminder.
+
+ENVIRONMENT FAILURES: If you cannot complete due to environmental issues (missing deps, service unreachable, compile errors, permission denied), signal \`blocked\` IMMEDIATELY with the reason — do NOT silently exhaust your context trying to work around it. A blocked signal preserves your work and lets your parent respawn you with a fix; dying without signaling loses everything.
 
 WORKFLOW: Reproduce the bug → Diagnose root cause → Write surgical fix → Add regression test → Verify fix → Git commit
 SCOPE: Fix only the bug you were assigned. Do not refactor surrounding code. Do not add features.
@@ -514,7 +565,7 @@ After completing each task:
 2. Git commit your changes with descriptive messages
 3. If stuck 3 times on the same item, skip it — mark as "SKIPPED: [reason]" and move on
 4. Periodically audit: git log, test results, codebase health — discover new work
-5. If no more work exists, write "## Status: EXHAUSTED" in the state file
+${isGeneral ? `5. NEVER write "## Status: EXHAUSTED" in the state file. You are a GENERAL — your mission is continuous. If your backlog is empty, FIND MORE WORK: check git log for untested changes, search for TODOs, research optimizations, review code quality.` : `5. If no more work exists, write "## Status: EXHAUSTED" in the state file`}
 
 State file format: "## Current" (active), "## Backlog" (prioritized TODO), "## Completed" (with commit hashes), "## Learnings" (patterns to remember across compactions), "Compaction Count: N".
 </bulldoze>
@@ -544,6 +595,22 @@ NEVER pause. NEVER use plan mode to solicit feedback. NEVER ask "should I...?" �
   } else {
     authorityLine = `**Operational Authority:** You are authorized to run scripts, install packages, and modify code within ${escapePromptXml(THEA_ROOT)}/. Act within your task scope. Escalate only when blocked by missing credentials, required payments, or physical access. Do NOT ask the user to do things you can do yourself. **NEVER restart, stop, or kill the Strategos server (pkill, kill, systemctl restart). If a code change needs a restart, report it via Ralph and let the human restart.**`;
   }
+
+  // Apply template overrides if they exist
+  // Use prefix (e.g. "IMPL") lowercased to match DB templateType keys ("impl"),
+  // not workerType.role (e.g. "implementer") which never matches override keys.
+  const overrides = _loadTemplateOverrides();
+  const overrideKey = workerType.prefix?.toLowerCase() ?? workerType.role;
+  if (overrides?.overrides?.[overrideKey]?.append_to_mission) {
+    missionSection = missionSection.replace(
+      '</mission>',
+      overrides.overrides[overrideKey].append_to_mission + '\n</mission>'
+    );
+  }
+
+  // Compute and store template hash from mission section (include override version)
+  const overrideVersion = overrides?.version ?? 0;
+  _lastGeneratedTemplateHash = computeTemplateHash(missionSection + ':v' + overrideVersion);
 
   return `# Worker ${workerId} — ${escapePromptXml(workerLabel)}
 
@@ -608,7 +675,86 @@ async function _doWriteStrategosContext(workerId, workerLabel, projectPath, ralp
   const stashDir = path.join(rulesDir, '.stashed');
   const contextPath = path.join(rulesDir, `strategos-worker-${workerId}.md`);
   const tmpPath = contextPath + '.tmp';
-  const content = generateStrategosContext(workerId, workerLabel, projectPath, ralphToken, options);
+  let content = generateStrategosContext(workerId, workerLabel, projectPath, ralphToken, options);
+
+  // Async enrichments: success examples, failure reflections, blackboard context
+  // These were removed when generateStrategosContext() was made synchronous (6e8676e).
+  // We re-add them here so workers still receive rich context.
+  const workerType = detectWorkerType(workerLabel);
+  const templateTypeKey = workerType.prefix?.toLowerCase() ?? null;
+
+  // 1. Success examples
+  let successExamplesSection = '';
+  if (templateTypeKey) {
+    try {
+      const { getRecentSuccessesByType } = await import('../learningsDb.js');
+      const isMinimalRole = workerType.role === 'tester' || workerType.role === 'reviewer';
+      const exampleCount = isMinimalRole ? 1 : 3;
+      const successes = getRecentSuccessesByType(templateTypeKey, exampleCount);
+      if (successes.length >= (isMinimalRole ? 1 : 2)) {
+        const examples = successes.map(s => {
+          const task = s.taskDescription
+            ? s.taskDescription.slice(0, 80) + (s.taskDescription.length > 80 ? '...' : '')
+            : s.label || 'unknown task';
+          const learnings = s.learnings
+            ? s.learnings.slice(0, 120) + (s.learnings.length > 120 ? '...' : '')
+            : 'completed successfully';
+          return `- **${escapePromptXml(task)}** — ${escapePromptXml(learnings)}`;
+        }).join('\n');
+        successExamplesSection = `\n## Recent Successes (${templateTypeKey} workers)\n\n${examples}\n`;
+      }
+    } catch {
+      // Non-fatal — skip success examples if learningsDb unavailable
+    }
+  }
+
+  // 2. Failure reflections
+  let failureReflectionsSection = '';
+  if (templateTypeKey) {
+    try {
+      const { getRecentReflectionsByType } = await import('../learningsDb.js');
+      const reflections = getRecentReflectionsByType(templateTypeKey, 2);
+      if (reflections.length > 0) {
+        const items = reflections.map(r => {
+          let parsed;
+          try { parsed = JSON.parse(r.reflection); } catch { return null; }
+          const task = r.taskDescription
+            ? r.taskDescription.slice(0, 60) + (r.taskDescription.length > 60 ? '...' : '')
+            : 'similar task';
+          const avoidText = Array.isArray(parsed.avoidNextTime)
+            ? parsed.avoidNextTime.join('; ')
+            : (parsed.avoidNextTime || '');
+          return `- **"${escapePromptXml(task)}"** failed because: ${escapePromptXml(parsed.whatWentWrong || '')}. Avoid: ${escapePromptXml(avoidText)}`;
+        }).filter(Boolean);
+        if (items.length > 0) {
+          failureReflectionsSection = `\n## Past Failures — Learn From These (${templateTypeKey} workers)\n\n${items.join('\n')}\n`;
+        }
+      }
+    } catch {
+      // Non-fatal — skip failure reflections if unavailable
+    }
+  }
+
+  // 3. Blackboard context
+  let blackboardSection = '';
+  try {
+    const { getHierarchyRootId, readBlackboard, formatBlackboardForContext } = await import('../blackboardDb.js');
+    const { workers } = await import('./state.js');
+    let rootId = getHierarchyRootId(workerId, workers);
+    // If the child isn't in the workers Map yet (spawned before initializeWorker),
+    // getHierarchyRootId returns the child's own ID. Fall back to walking up from parent.
+    if (rootId === workerId && options.parentWorkerId) {
+      rootId = getHierarchyRootId(options.parentWorkerId, workers);
+    }
+    const bb = await readBlackboard(projectPath, rootId);
+    if (bb.entries.length > 0) {
+      blackboardSection = '\n' + formatBlackboardForContext(bb, 500) + '\n';
+    }
+  } catch {
+    // Non-fatal — skip blackboard injection if unavailable
+  }
+
+  content = content + successExamplesSection + failureReflectionsSection + blackboardSection;
 
   // Track stashed files so we can restore them even if write fails
   const stashedFiles = [];
@@ -796,6 +942,16 @@ WRONG: Reading files, then editing them yourself. Spawn an IMPL: worker instead.
 SPAN OF CONTROL: Max 5 complex workers or 8-10 simple ones.
 
 COMMUNICATION: Address the human operator as "Commander" in all reports, signals, and messages.
+${bulldozeMode ? `
+CONTINUOUS OPERATIONS (BULLDOZE MODE — MANDATORY):
+You are in BULLDOZE mode. You must NEVER consider yourself "done." When all current children complete:
+1. Review what was accomplished (git log --oneline -20, check results)
+2. Identify the NEXT improvement opportunities (research, optimize, test, refactor, document)
+3. Spawn new workers for the highest-impact items
+4. You should ALWAYS have 3-5 workers running. Zero active children = FAILURE STATE.
+5. Check /api/insights/learnings for past failure patterns to fix
+NEVER write EXHAUSTED to the state file. NEVER signal done. Your mission is CONTINUOUS.
+` : ''}
 `;
   } else if (isColonel) {
     missionSection = `
@@ -889,7 +1045,7 @@ After completing each task:
 2. Git commit your changes with descriptive messages
 3. If stuck 3 times on the same item, skip it — mark as "SKIPPED: [reason]" and move on
 4. Periodically audit: git log, test results, codebase health — discover new work
-5. If no more work exists, write "## Status: EXHAUSTED" in the state file
+${isGeneral ? `5. NEVER write "## Status: EXHAUSTED" in the state file. You are a GENERAL — your mission is continuous. If your backlog is empty, FIND MORE WORK.` : `5. If no more work exists, write "## Status: EXHAUSTED" in the state file`}
 
 State file format: "## Current" (active), "## Backlog" (prioritized TODO), "## Completed" (with commit hashes), "## Learnings" (patterns to remember across compactions), "Compaction Count: N".
 ` : '';
