@@ -30,7 +30,7 @@ test.describe('Strategos x Architect Integration', () => {
         data: {
           projectPath: 'strategos',
           prompt: 'echo "Integration test executed successfully"',
-          label: 'TEST: Integration Worker',
+          label: 'E2E_FIXTURE: Integration Worker',
           mode: 'interactive'
         }
       });
@@ -42,7 +42,7 @@ test.describe('Strategos x Architect Integration', () => {
       expect(data.mode).toBe('interactive');
       expect(data.worker).toBeDefined();
       expect(data.worker.id).toBeDefined();
-      expect(data.worker.label).toBe('TEST: Integration Worker');
+      expect(data.worker.label).toBe('E2E_FIXTURE: Integration Worker');
       expect(data.promptSent).toBe(true);
 
       // Cleanup: kill the test worker
@@ -53,7 +53,7 @@ test.describe('Strategos x Architect Integration', () => {
     test('worker status endpoint returns analysis', async ({ request }) => {
       // First spawn a worker
       const spawnResponse = await request.post(`${STRATEGOS_API}/api/workers`, {
-        data: { projectPath: 'strategos', label: 'TEST: Status Worker' }
+        data: { projectPath: 'strategos', label: 'E2E_FIXTURE: Status Worker' }
       });
       const worker = await spawnResponse.json();
 
@@ -106,7 +106,7 @@ test.describe('Strategos x Architect Integration', () => {
         data: {
           projectPath: 'strategos',
           prompt: 'ls',
-          label: 'TEST: Architect Spawned',
+          label: 'E2E_FIXTURE: Architect Spawned',
           mode: 'interactive'
         }
       });
@@ -125,7 +125,7 @@ test.describe('Strategos x Architect Integration', () => {
       await expect(workerCard).toBeVisible({ timeout: 5000 });
 
       // Verify it has the correct label
-      await expect(workerCard.locator('h3')).toContainText('TEST: Architect Spawned');
+      await expect(workerCard.locator('h3')).toContainText('E2E_FIXTURE: Architect Spawned');
 
       // Cleanup
       await request.delete(`${STRATEGOS_API}/api/workers/${workerId}`);
@@ -141,7 +141,7 @@ test.describe('Strategos x Architect Integration', () => {
         data: {
           projectPath: 'strategos',
           prompt: 'echo "Hello from Architect workflow"',
-          label: 'TEST: Full Journey',
+          label: 'E2E_FIXTURE: Full Journey',
           mode: 'interactive'
         }
       });

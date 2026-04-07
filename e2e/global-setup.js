@@ -15,10 +15,10 @@ function authHeaders() {
 }
 
 // Labels that indicate a worker was created by tests
-// IMPORTANT: Only match labels with explicit test prefixes to avoid killing user workers
-// All test workers MUST use the "TEST:" prefix in their labels
+// IMPORTANT: Only match labels with explicit fixture prefixes to avoid killing user workers
+// All e2e fixture workers MUST use the "E2E_FIXTURE:" prefix in their labels
 const TEST_WORKER_PATTERNS = [
-  /^TEST:/i,           // Universal test prefix - all test workers should use this
+  /^E2E_FIXTURE:/i,   // Universal fixture prefix - all e2e test workers must use this
 ];
 
 function isTestWorker(worker) {
@@ -62,7 +62,7 @@ async function globalSetup() {
     // Kill only test workers
     for (const worker of testWorkers) {
       try {
-        await fetch(`${API_BASE}/api/workers/${worker.id}`, {
+        await fetch(`${API_BASE}/api/workers/${worker.id}?force=true`, {
           method: 'DELETE',
           headers: authHeaders()
         });

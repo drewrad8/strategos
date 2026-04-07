@@ -19,6 +19,7 @@ import { triggerAnalysis } from '../services/insightAnalyzer.js';
 import { generateReflection } from '../services/reflexionService.js';
 import { runReviewGate } from '../services/reviewGateService.js';
 import { getHierarchyRootId, appendBlackboardEntry } from '../blackboardDb.js';
+import { getWorkerHistory } from '../workerOutputDb.js';
 
 // Shared completion keyword regex — used for keyword-based auto-promotion.
 // Centralized here so ralph.js, health.js, and persistence.js all use the same pattern.
@@ -172,12 +173,27 @@ export function persistFailureLearning(worker, workerId, reason) {
     // so they don't inflate failure counts in success-rate metrics.
     const isEphemeral = !taskDesc || (uptime !== null && uptime < 120000);
 
+    // Fallback: if worker died without signaling learnings, capture last 20 output lines
+    // so forensics have something to work with. Skip for dismissed workers (they completed normally).
+    let learnings = worker.ralphLearnings || null;
+    if (!learnings && reason !== 'dismissed') {
+      try {
+        const history = getWorkerHistory(workerId, { limit: 20 });
+        if (history.outputs && history.outputs.length > 0) {
+          const lastLines = history.outputs.map(r => r.output_chunk).join('').trim();
+          if (lastLines) {
+            learnings = `[auto-captured on ${reason}]\n${lastLines}`;
+          }
+        }
+      } catch { /* best effort — never block the failure record */ }
+    }
+
     addLearning({
       workerId,
       label: worker.label,
       templateType: typeInfo.prefix ? typeInfo.prefix.toLowerCase() : null,
       templateHash: null,
-      learnings: worker.ralphLearnings || null,
+      learnings,
       outputs: worker.ralphOutputs || null,
       artifacts: worker.ralphArtifacts || null,
       taskDescription: typeof taskDesc === 'string' ? taskDesc : (taskDesc ? JSON.stringify(taskDesc) : null),

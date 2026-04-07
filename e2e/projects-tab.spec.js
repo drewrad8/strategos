@@ -9,7 +9,7 @@
  * - Grid vs tree view switching
  * - Spawn worker from project card
  *
- * All test workers use the "TEST:" prefix so global-setup/teardown can clean them up.
+ * All e2e fixture workers use the "E2E_FIXTURE:" prefix so global-setup/teardown can clean them up.
  */
 import { test, expect } from '@playwright/test';
 

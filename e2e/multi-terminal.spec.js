@@ -8,7 +8,7 @@
  * - Terminal output display in panes
  * - Add/remove panes
  *
- * All test workers use the "TEST:" prefix so global-setup/teardown can clean them up.
+ * All e2e fixture workers use the "E2E_FIXTURE:" prefix so global-setup/teardown can clean them up.
  */
 import { test, expect } from '@playwright/test';
 
@@ -19,7 +19,7 @@ async function spawnTestWorker(request, label) {
   const res = await request.post(`${API}/workers`, {
     data: {
       projectPath: 'strategos',
-      label: label || `TEST: MultiTerm ${Date.now()}`,
+      label: label || `E2E_FIXTURE: MultiTerm ${Date.now()}`,
       autoAccept: true,
       ralphMode: false,
       allowDuplicate: true,
@@ -51,8 +51,8 @@ test.describe('Multi-Terminal View', () => {
 
   test.beforeAll(async ({ request }) => {
     // Spawn 2 workers so multi-terminal tests have something to work with
-    const w1 = await spawnTestWorker(request, 'TEST: MultiTerm Worker A');
-    const w2 = await spawnTestWorker(request, 'TEST: MultiTerm Worker B');
+    const w1 = await spawnTestWorker(request, 'E2E_FIXTURE: MultiTerm Worker A');
+    const w2 = await spawnTestWorker(request, 'E2E_FIXTURE: MultiTerm Worker B');
     workerIds.push(w1.id, w2.id);
   });
 
