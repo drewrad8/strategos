@@ -3,6 +3,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import { DB_JOURNAL_SIZE_LIMIT, DB_BUSY_TIMEOUT } from './validation.js';
+import { getLogger } from './logger.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -166,6 +167,14 @@ const stmtDeleteOldestOutputs = db.prepare(`
     SELECT id FROM worker_outputs ORDER BY timestamp ASC LIMIT 10000
   )
 `);
+const stmtDeleteOldestOutputsFromEnded = db.prepare(`
+  DELETE FROM worker_outputs WHERE id IN (
+    SELECT wo.id FROM worker_outputs wo
+    JOIN worker_sessions ws ON wo.session_id = ws.id
+    WHERE ws.ended_at IS NOT NULL
+    ORDER BY wo.timestamp ASC LIMIT 10000
+  )
+`);
 const stmtOutputRowCount = db.prepare('SELECT COUNT(*) as c FROM worker_outputs');
 
 // Track active session IDs for each worker
@@ -204,10 +213,10 @@ export function startSession(worker, taskDescription = null) {
     const sessionId = result.lastInsertRowid;
     activeSessionIds.set(worker.id, sessionId);
 
-    console.log(`[WorkerOutputDb] Started session ${sessionId} for worker ${worker.id} (${worker.label})`);
+    getLogger().info('[workerOutput.db] Started session', { workerId: worker.id, sessionId, label: worker.label });
     return sessionId;
   } catch (err) {
-    console.error('[WorkerOutputDb] Failed to start session:', err.message);
+    getLogger().error('[workerOutput.db] Failed to start session', { err: err.message });
     return null;
   }
 }
@@ -224,7 +233,7 @@ export function endSession(workerId, finalStatus = 'stopped') {
     if (sessionId) {
       updateSessionEnd.run(finalStatus, sessionId);
       activeSessionIds.delete(workerId);
-      console.log(`[WorkerOutputDb] Ended session ${sessionId} for worker ${workerId} with status: ${finalStatus}`);
+      getLogger().info('[workerOutput.db] Ended session', { workerId, sessionId, finalStatus });
       return true;
     }
 
@@ -232,13 +241,13 @@ export function endSession(workerId, finalStatus = 'stopped') {
     const activeSession = getActiveSession.get(workerId);
     if (activeSession) {
       updateSessionEnd.run(finalStatus, activeSession.id);
-      console.log(`[WorkerOutputDb] Ended orphan session ${activeSession.id} for worker ${workerId}`);
+      getLogger().info('[workerOutput.db] Ended orphan session', { workerId, sessionId: activeSession.id });
       return true;
     }
 
     return false;
   } catch (err) {
-    console.error('[WorkerOutputDb] Failed to end session:', err.message);
+    getLogger().error('[workerOutput.db] Failed to end session', { workerId, err: err.message });
     return false;
   }
 }
@@ -286,7 +295,7 @@ export function storeOutput(workerId, output, chunkType = 'stdout') {
       activeSessionIds.delete(workerId);
       return false;
     }
-    console.error('[WorkerOutputDb] Failed to store output:', err.message);
+    getLogger().error('[workerOutput.db] Failed to store output', { workerId, err: err.message });
     return false;
   }
 }
@@ -315,7 +324,7 @@ export function getWorkerSessions(workerId, options = {}) {
       }
     };
   } catch (err) {
-    console.error('[WorkerOutputDb] Failed to get sessions:', err.message);
+    getLogger().error('[workerOutput.db] Failed to get sessions', { workerId, err: err.message });
     return { sessions: [], pagination: { total: 0, limit, offset, hasMore: false } };
   }
 }
@@ -344,7 +353,7 @@ export function getSessionOutput(sessionId, options = {}) {
       }
     };
   } catch (err) {
-    console.error('[WorkerOutputDb] Failed to get session output:', err.message);
+    getLogger().error('[workerOutput.db] Failed to get session output', { sessionId, err: err.message });
     return { outputs: [], pagination: { total: 0, limit, offset, hasMore: false } };
   }
 }
@@ -381,7 +390,7 @@ export function getWorkerHistory(workerId, options = {}) {
       }
     };
   } catch (err) {
-    console.error('[WorkerOutputDb] Failed to get worker history:', err.message);
+    getLogger().error('[workerOutput.db] Failed to get worker history', { workerId, err: err.message });
     return { outputs: [], pagination: { total: 0, limit, offset: 0, hasMore: false } };
   }
 }
@@ -405,7 +414,7 @@ export function getSessionFullOutput(sessionId) {
     }
     return chunks.join('');
   } catch (err) {
-    console.error('[WorkerOutputDb] Failed to get full output:', err.message);
+    getLogger().error('[workerOutput.db] Failed to get full output', { sessionId, err: err.message });
     return '';
   }
 }
@@ -418,7 +427,7 @@ export function getSessionFullOutput(sessionId) {
 export function cleanupOldData(daysToKeep = 7) {
   // Validate parameter to prevent accidental full deletion
   if (typeof daysToKeep !== 'number' || daysToKeep < 1 || daysToKeep > 365) {
-    console.warn(`[WorkerOutputDb] Invalid daysToKeep=${daysToKeep}, using default 7`);
+    getLogger().warn('[workerOutput.db] Invalid daysToKeep, using default 7', { daysToKeep });
     daysToKeep = 7;
   }
   const cutoffDate = new Date();
@@ -465,7 +474,7 @@ export function cleanupOldData(daysToKeep = 7) {
 
     const { totalOutputsDeleted, totalSessionsDeleted } = cleanupTx();
 
-    console.log(`[WorkerOutputDb] Cleanup: deleted ${totalSessionsDeleted} sessions, ${totalOutputsDeleted} output chunks`);
+    getLogger().info('[workerOutput.db] Cleanup complete', { sessionsDeleted: totalSessionsDeleted, outputsDeleted: totalOutputsDeleted });
 
     // Size management (VACUUM) is handled by enforceDbSizeLimit() which runs
     // in the same periodic cleanup cycle. Don't VACUUM here to avoid double-VACUUM.
@@ -475,7 +484,7 @@ export function cleanupOldData(daysToKeep = 7) {
       outputsDeleted: totalOutputsDeleted
     };
   } catch (err) {
-    console.error('[WorkerOutputDb] Cleanup failed:', err.message);
+    getLogger().error('[workerOutput.db] Cleanup failed', { err: err.message });
     return { sessionsDeleted: 0, outputsDeleted: 0, error: err.message };
   }
 }
@@ -506,7 +515,7 @@ export function getStats() {
       newestSession: newest
     };
   } catch (err) {
-    console.error('[WorkerOutputDb] Failed to get stats:', err.message);
+    getLogger().error('[workerOutput.db] Failed to get stats', { err: err.message });
     return { error: err.message };
   }
 }
@@ -520,7 +529,7 @@ export function getSession(sessionId) {
   try {
     return getSessionById.get(sessionId);
   } catch (err) {
-    console.error('[WorkerOutputDb] Failed to get session:', err.message);
+    getLogger().error('[workerOutput.db] Failed to get session', { sessionId, err: err.message });
     return null;
   }
 }
@@ -534,7 +543,7 @@ export function getSession(sessionId) {
  */
 export function cleanupOrphanedSessions(maxAgeHours = 24) {
   if (typeof maxAgeHours !== 'number' || maxAgeHours < 1 || maxAgeHours > 720) {
-    console.warn(`[WorkerOutputDb] Invalid maxAgeHours=${maxAgeHours}, using default 24`);
+    getLogger().warn('[workerOutput.db] Invalid maxAgeHours, using default 24', { maxAgeHours });
     maxAgeHours = 24;
   }
   try {
@@ -545,12 +554,12 @@ export function cleanupOrphanedSessions(maxAgeHours = 24) {
     const result = stmtOrphanedSessions.run(cutoffStr);
 
     if (result.changes > 0) {
-      console.log(`[WorkerOutputDb] Marked ${result.changes} orphaned sessions as ended`);
+      getLogger().info('[workerOutput.db] Marked orphaned sessions as ended', { rows: result.changes });
     }
 
     return { orphansCleaned: result.changes };
   } catch (err) {
-    console.error('[WorkerOutputDb] Failed to cleanup orphaned sessions:', err.message);
+    getLogger().error('[workerOutput.db] Failed to cleanup orphaned sessions', { err: err.message });
     return { orphansCleaned: 0, error: err.message };
   }
 }
@@ -582,24 +591,27 @@ export function enforceDbSizeLimit() {
     const dbSize = mainSize + walSize;
     if (dbSize <= MAX_DB_SIZE_BYTES) return { trimmed: false, dbSizeMB: (dbSize / 1024 / 1024).toFixed(0) };
 
-    console.log(`[WorkerOutputDb] DB is ${(dbSize / 1024 / 1024).toFixed(0)}MB (limit: ${(MAX_DB_SIZE_BYTES / 1024 / 1024)}MB) - trimming...`);
+    getLogger().info('[workerOutput.db] DB size limit exceeded, trimming', { dbSizeMB: (dbSize / 1024 / 1024).toFixed(0) });
 
-    // Delete oldest output chunks in batches until under limit
-    const deleteOldest = stmtDeleteOldestOutputs;
-
+    // Delete oldest output chunks from ended sessions only — active sessions are shielded.
+    // If no ended-session rows remain, log a warning and let the DB grow rather than
+    // evicting output from running workers (controlled tradeoff per Strategy 1 research).
     let rounds = 0;
     const maxRounds = 50; // Safety limit
     while (rounds < maxRounds) {
       try {
-        const result = deleteOldest.run();
-        if (result.changes === 0) break;
+        const result = stmtDeleteOldestOutputsFromEnded.run();
+        if (result.changes === 0) {
+          getLogger().warn('[workerOutput.db] Size-cap exceeded but no ended-session output to evict; active sessions are shielded, DB will grow until sessions end');
+          break;
+        }
         rounds++;
 
         // Check size after each batch (WAL mode means size may not shrink immediately)
         const currentRows = stmtOutputRowCount.get().c;
         if (currentRows < 5000) break; // Keep at least some data
       } catch (deleteErr) {
-        console.error(`[WorkerOutputDb] Delete batch failed (round ${rounds}): ${deleteErr.message}`);
+        getLogger().error('[workerOutput.db] Delete batch failed', { round: rounds, err: deleteErr.message });
         break; // Don't loop forever if DELETE itself fails (e.g. SQLITE_FULL)
       }
     }
@@ -607,10 +619,10 @@ export function enforceDbSizeLimit() {
     // VACUUM to reclaim space
     db.exec('VACUUM');
     const newSize = fs.statSync(DB_PATH).size;
-    console.log(`[WorkerOutputDb] Trimmed: ${(dbSize / 1024 / 1024).toFixed(0)}MB → ${(newSize / 1024 / 1024).toFixed(0)}MB (${rounds} rounds)`);
+    getLogger().info('[workerOutput.db] Trimmed DB', { oldSizeMB: (dbSize / 1024 / 1024).toFixed(0), newSizeMB: (newSize / 1024 / 1024).toFixed(0), rounds });
     return { trimmed: true, oldSizeMB: (dbSize / 1024 / 1024).toFixed(0), newSizeMB: (newSize / 1024 / 1024).toFixed(0) };
   } catch (err) {
-    console.error('[WorkerOutputDb] Size enforcement failed:', err.message);
+    getLogger().error('[workerOutput.db] Size enforcement failed', { err: err.message });
     return { trimmed: false, error: err.message };
   }
 }
@@ -621,13 +633,13 @@ let _startupCleanupTimer = setTimeout(() => {
   // First, mark orphaned sessions as ended (sessions >12h old that are still "active")
   const orphanResult = cleanupOrphanedSessions(12);
   if (orphanResult.orphansCleaned > 0) {
-    console.log(`[WorkerOutputDb] Startup: Marked ${orphanResult.orphansCleaned} orphaned sessions as ended`);
+    getLogger().info('[workerOutput.db] Startup: marked orphaned sessions', { rows: orphanResult.orphansCleaned });
   }
 
   // Delete old ended sessions (>1 day instead of 3)
   const result = cleanupOldData(1);
   if (result.sessionsDeleted > 0 || result.outputsDeleted > 0) {
-    console.log(`[WorkerOutputDb] Startup cleanup: ${result.sessionsDeleted} old sessions, ${result.outputsDeleted} output chunks removed`);
+    getLogger().info('[workerOutput.db] Startup cleanup complete', { sessionsDeleted: result.sessionsDeleted, outputsDeleted: result.outputsDeleted });
   }
 
   // Enforce size limit
@@ -642,7 +654,7 @@ let _periodicCleanupInterval = setInterval(() => {
     cleanupOrphanedSessions(12); // Catch sessions orphaned mid-run (not just at startup)
     enforceDbSizeLimit();
   } catch (err) {
-    console.error('[WorkerOutputDb] Periodic cleanup failed:', err.message);
+    getLogger().error('[workerOutput.db] Periodic cleanup failed', { err: err.message });
   }
   // Checkpoint WAL to prevent unbounded WAL growth
   // Escalate to RESTART if PASSIVE leaves too many pages uncheckpointed (active readers block PASSIVE)
@@ -658,7 +670,7 @@ let _periodicCleanupInterval = setInterval(() => {
     const freelistCount = db.pragma('freelist_count')[0]?.freelist_count ?? 0;
     if (freelistCount > 1000) { // ~4MB of dead pages
       db.exec('VACUUM');
-      console.log(`[WorkerOutputDb] VACUUM reclaimed ${freelistCount} freelist pages`);
+      getLogger().info('[workerOutput.db] VACUUM reclaimed freelist pages', { rows: freelistCount });
     }
   } catch (e) { /* best effort */ }
 }, 30 * 60 * 1000);
@@ -679,9 +691,9 @@ export function closeDatabase() {
   try {
     db.pragma('wal_checkpoint(TRUNCATE)');
     db.close();
-    console.log('[WorkerOutputDb] Database closed cleanly');
+    getLogger().info('[workerOutput.db] Database closed cleanly');
   } catch (err) {
-    console.error('[WorkerOutputDb] Error closing database:', err.message);
+    getLogger().error('[workerOutput.db] Error closing database', { err: err.message });
   }
 }
 

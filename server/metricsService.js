@@ -11,6 +11,7 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { DB_JOURNAL_SIZE_LIMIT, DB_BUSY_TIMEOUT } from './validation.js';
+import { getLogger } from './logger.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -220,7 +221,7 @@ class MetricsService {
   endTimer(timerId, labels = {}, sessionId = null) {
     const timer = this.timers.get(timerId);
     if (!timer) {
-      console.warn(`Timer ${timerId} not found`);
+      getLogger().warn('[metrics.service] Timer not found', { timerId });
       return 0;
     }
 
@@ -466,7 +467,7 @@ class MetricsService {
       try {
         this._aggregate();
       } catch (err) {
-        console.error(`[MetricsService] Aggregation failed: ${err.message}`);
+        getLogger().error('[metrics.service] Aggregation failed', err?.message);
       }
       // Checkpoint WAL after aggregation to prevent unbounded WAL growth.
       // Use PASSIVE first (non-blocking), escalate to RESTART if too many pages remain.
@@ -484,10 +485,10 @@ class MetricsService {
         try {
           const removed = this.cleanup(7);
           if (removed > 0) {
-            console.log(`[MetricsService] Cleaned up ${removed} metrics older than 7 days`);
+            getLogger().info('[metrics.service] Cleaned up old metrics', { removed });
           }
         } catch (err) {
-          console.error(`[MetricsService] Cleanup failed: ${err.message}`);
+          getLogger().error('[metrics.service] Cleanup failed', err?.message);
         }
         // Prune stale timers (started > 10 min ago, never ended)
         const timerCutoff = Date.now() - 10 * 60 * 1000;
@@ -500,14 +501,14 @@ class MetricsService {
           }
         }
         if (staleTimers > 0) {
-          console.log(`[MetricsService] Pruned ${staleTimers} stale timers`);
+          getLogger().info('[metrics.service] Pruned stale timers', { staleTimers });
         }
         // VACUUM when freelist pages exceed threshold
         try {
           const freelistCount = this.db.pragma('freelist_count')[0]?.freelist_count ?? 0;
           if (freelistCount > 500) { // ~2MB of dead pages
             this.db.exec('VACUUM');
-            console.log(`[MetricsService] VACUUM reclaimed ${freelistCount} freelist pages`);
+            getLogger().info('[metrics.service] VACUUM reclaimed freelist pages', { freelistCount });
           }
         } catch { /* best effort */ }
       }
@@ -547,7 +548,7 @@ class MetricsService {
         }
       } catch (err) {
         // Per-type catch: one failed type shouldn't block remaining types
-        console.error(`[MetricsService] Aggregation failed for ${type}: ${err.message}`);
+        getLogger().error('[metrics.service] Aggregation failed for type', { type, err: err?.message });
       }
     }
   }

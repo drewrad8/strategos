@@ -15,6 +15,7 @@ import { spawn } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { resolveTests, getChangedFiles } from './retestMapper.js';
+import { getLogger } from './logger.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..');
@@ -131,7 +132,7 @@ class RetestService {
 
     // Execute asynchronously — don't await, return immediately
     this.executeRun(run).catch(err => {
-      console.error(`[retestService] executeRun error for ${runId}:`, err.message);
+      getLogger('[retest.service]').error('executeRun error', { runId, error: err.message });
     });
 
     return { runId, status: run.status, triggeredSpecs, changedFiles };

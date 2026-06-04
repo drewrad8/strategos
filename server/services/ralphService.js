@@ -11,6 +11,7 @@
 
 import crypto from 'crypto';
 import { updateWorkerRalphStatus } from '../workerManager.js';
+import { getLogger } from '../logger.js';
 
 const generateCompletionToken = () => crypto.randomBytes(16).toString('hex');
 const TOKEN_TTL_MS = 4 * 60 * 60 * 1000; // 4 hours
@@ -35,10 +36,10 @@ export class RalphService {
           }
         }
         if (cleaned > 0) {
-          console.log(`[RalphService] Cleaned up ${cleaned} expired completion tokens`);
+          getLogger().info(`[ralph.service] Cleaned up ${cleaned} expired completion tokens`);
         }
       } catch (err) {
-        console.error('[RalphService] Token cleanup failed:', err.message);
+        getLogger().error('[ralph.service] Token cleanup failed:', { err: err.message });
       }
     }, 30 * 60 * 1000);
     if (this._tokenCleanupInterval.unref) {
@@ -57,7 +58,7 @@ export class RalphService {
       standalone: true,
       createdAt: Date.now()
     });
-    console.log(`[RalphService] Registered standalone worker ${workerId} with token ${token.slice(0, 8)}...`);
+    getLogger().info(`[ralph.service] Registered standalone worker ${workerId} with token ${token.slice(0, 8)}...`, { workerId });
   }
 
   /**
@@ -68,7 +69,7 @@ export class RalphService {
     const ctx = pendingCompletions.get(token);
     if (ctx?.standalone) {
       pendingCompletions.delete(token);
-      console.log(`[RalphService] Unregistered standalone token ${token.slice(0, 8)}...`);
+      getLogger().info(`[ralph.service] Unregistered standalone token ${token.slice(0, 8)}...`);
     }
   }
 
@@ -81,20 +82,20 @@ export class RalphService {
   async handleCompletionSignal(token, signalData) {
     const context = pendingCompletions.get(token);
     if (!context) {
-      console.log(`[RalphService] Unknown completion token: ${token.slice(0, 8)}...`);
+      getLogger().warn(`[ralph.service] Unknown completion token: ${token.slice(0, 8)}...`);
       return false;
     }
 
     // Check token TTL
     if (context.createdAt && Date.now() - context.createdAt > TOKEN_TTL_MS) {
       pendingCompletions.delete(token);
-      console.warn(`[RalphService] Expired completion token: ${token.slice(0, 8)}...`);
+      getLogger().warn(`[ralph.service] Expired completion token: ${token.slice(0, 8)}...`);
       return false;
     }
 
     const { workerId } = context;
     const { status } = signalData;
-    console.log(`[RalphService] Signal received for worker ${workerId}: ${status}`);
+    getLogger().info(`[ralph.service] Signal received for worker ${workerId}: ${status}`, { workerId, status });
 
     // Delete token for terminal states only
     if (status === 'done' || status === 'blocked') {
@@ -102,7 +103,14 @@ export class RalphService {
     }
 
     // Update worker's Ralph status for parent workers to query
-    updateWorkerRalphStatus(workerId, signalData, this.io);
+    const result = updateWorkerRalphStatus(workerId, signalData, this.io);
+
+    // Persistent worker tried to signal done — restore token so they can re-signal in_progress
+    if (result && result.rejected) {
+      pendingCompletions.set(token, context);
+      return { rejected: true, message: result.message };
+    }
+
     return true;
   }
 
@@ -110,7 +118,7 @@ export class RalphService {
    * Cleanup - called on shutdown
    */
   async cleanup() {
-    console.log('[RalphService] Cleaning up...');
+    getLogger().info('[ralph.service] Cleaning up...');
     if (this._tokenCleanupInterval) {
       clearInterval(this._tokenCleanupInterval);
       this._tokenCleanupInterval = null;

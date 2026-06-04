@@ -20,6 +20,9 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SHARED_ADR_DIR = path.join(__dirname, '..', '..', '..', 'shared', 'adrs', 'records');
 import { sanitizeErrorMessage } from '../errorUtils.js';
 import { CONTROL_CHAR_RE } from '../validation.js';
+import { getLogger } from '../logger.js';
+
+const logger = getLogger('[adr.route]');
 
 export function createADRRoutes() {
   const router = express.Router();
@@ -50,7 +53,7 @@ export function createADRRoutes() {
       const adrs = listADRs(options);
       res.json(adrs);
     } catch (error) {
-      console.error('Error listing ADRs:', error);
+      logger.error('Error listing ADRs', { error });
       res.status(500).json({ error: sanitizeErrorMessage(error) });
     }
   });
@@ -61,7 +64,7 @@ export function createADRRoutes() {
       const stats = getADRStats(SHARED_ADR_DIR);
       res.json(stats);
     } catch (error) {
-      console.error('Error getting ADR stats:', error);
+      logger.error('Error getting ADR stats', { error });
       res.status(500).json({ error: sanitizeErrorMessage(error) });
     }
   });
@@ -83,7 +86,7 @@ export function createADRRoutes() {
       const results = searchADRs(safeQuery, SHARED_ADR_DIR);
       res.json(results);
     } catch (error) {
-      console.error('Error searching ADRs:', error);
+      logger.error('Error searching ADRs', { error });
       res.status(500).json({ error: sanitizeErrorMessage(error) });
     }
   });
@@ -94,7 +97,7 @@ export function createADRRoutes() {
       const template = getTemplate();
       res.json({ template });
     } catch (error) {
-      console.error('Error getting template:', error);
+      logger.error('Error getting template', { error });
       res.status(500).json({ error: sanitizeErrorMessage(error) });
     }
   });
@@ -114,7 +117,7 @@ export function createADRRoutes() {
 
       res.json(adr);
     } catch (error) {
-      console.error('Error getting ADR:', error);
+      logger.error('Error getting ADR', { error });
       res.status(500).json({ error: sanitizeErrorMessage(error) });
     }
   });
@@ -182,7 +185,7 @@ export function createADRRoutes() {
       const { path: _path, ...safeCreated } = created;
       res.status(201).json(safeCreated);
     } catch (error) {
-      console.error('Error creating ADR:', error);
+      logger.error('Error creating ADR', { error });
       res.status(500).json({ error: sanitizeErrorMessage(error) });
     }
   });
@@ -239,7 +242,7 @@ export function createADRRoutes() {
       const { path: _path, ...safeUpdated } = updated;
       res.json(safeUpdated);
     } catch (error) {
-      console.error('Error updating ADR:', error);
+      logger.error('Error updating ADR', { error });
       res.status(500).json({ error: sanitizeErrorMessage(error) });
     }
   });
@@ -258,7 +261,7 @@ export function createADRRoutes() {
 
       res.json({ success: true });
     } catch (error) {
-      console.error('Error deleting ADR:', error);
+      logger.error('Error deleting ADR', { error });
       res.status(500).json({ error: sanitizeErrorMessage(error) });
     }
   });

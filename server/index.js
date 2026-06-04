@@ -11,6 +11,10 @@ import { createRoutes } from './routes.js';
 import { createIntegrationRoutes } from './routes/integration.js';
 import { createADRRoutes } from './routes/adrs.js';
 import { createRalphRoutes } from './routes/ralph.js';
+import { createLearningsRoutes } from './routes/learnings.js';
+import { createMemoryRoutes } from './routes/memory.js';
+import { createAiRoutes } from './routes/ai.js';
+import { createVersionRouter } from './routes/version.js';
 import { createRalphService } from './services/ralphService.js';
 import { createRetestService } from './retestService.js';
 import { setupSocketHandlers, stopMetricsBroadcast } from './socketHandler.js';
@@ -25,7 +29,7 @@ import { resetMetricsService } from './metricsService.js';
 import { close as closeLearningsDb, seedFromCheckpoints as seedLearnings } from './learningsDb.js';
 import { startInsightAnalyzer, stopInsightAnalyzer } from './services/insightAnalyzer.js';
 import { startSentinel, stopSentinel, runDiagnostics, getLastDiagnostics, getDiagnosticsHistory, getSentinelStatus } from './sentinel.js';
-
+// telegramBot loaded conditionally at runtime — excluded from release builds
 
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -36,31 +40,32 @@ let globalLogger = null;
 let globalStatusWriter = null;
 let globalHttpServer = null;
 let globalIo = null;
+let globalTelegramBot = null;
 
 // Configuration - Thea Kingdom port convention: 380XX
 // Server: 38007, Client: 38008 (see /docs/PORT_REGISTRY.md)
 const PORT = parseInt(process.env.PORT || '38007', 10);
 if (isNaN(PORT) || PORT < 1 || PORT > 65535) {
-  console.error(`[FATAL] Invalid PORT: ${process.env.PORT} — must be 1-65535`);
+  console.error(`[FATAL] Invalid PORT: ${process.env.PORT} — must be 1-65535`); // pre-initLogger boot guard
   process.exit(1);
 }
 const HOST = process.env.STRATEGOS_HOST || '127.0.0.1';
 if (!/^[\w.:]+$/.test(HOST)) {
-  console.error(`[FATAL] Invalid STRATEGOS_HOST: "${HOST}" — must be a valid hostname or IP`);
+  console.error(`[FATAL] Invalid STRATEGOS_HOST: "${HOST}" — must be a valid hostname or IP`); // pre-initLogger boot guard
   process.exit(1);
 }
 // THEA_ROOT imported from ./workers/state.js (auto-derived from project location, or THEA_ROOT env var)
 if (!path.isAbsolute(THEA_ROOT)) {
-  console.error(`[FATAL] THEA_ROOT must be an absolute path, got: "${THEA_ROOT}"`);
+  console.error(`[FATAL] THEA_ROOT must be an absolute path, got: "${THEA_ROOT}"`); // pre-initLogger boot guard
   process.exit(1);
 }
 if (THEA_ROOT === '/' || THEA_ROOT === '/etc' || THEA_ROOT === '/sys' || THEA_ROOT === '/proc') {
-  console.error(`[FATAL] THEA_ROOT points to a dangerous system directory: "${THEA_ROOT}"`);
+  console.error(`[FATAL] THEA_ROOT points to a dangerous system directory: "${THEA_ROOT}"`); // pre-initLogger boot guard
   process.exit(1);
 }
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || 'http://localhost:38008';
 if (CLIENT_ORIGIN && !/^https?:\/\/.+/.test(CLIENT_ORIGIN)) {
-  console.error(`[FATAL] CLIENT_ORIGIN must be a valid HTTP(S) URL, got: "${CLIENT_ORIGIN}"`);
+  console.error(`[FATAL] CLIENT_ORIGIN must be a valid HTTP(S) URL, got: "${CLIENT_ORIGIN}"`); // pre-initLogger boot guard
   process.exit(1);
 }
 
@@ -74,7 +79,7 @@ function buildCorsOrigins() {
       if (/^https?:\/\/.+/.test(o)) {
         origins.push(o);
       } else {
-        console.warn(`[WARN] Ignoring invalid STRATEGOS_CORS_ORIGINS entry: "${o}"`);
+        console.warn(`[WARN] Ignoring invalid STRATEGOS_CORS_ORIGINS entry: "${o}"`); // pre-initLogger boot guard
       }
     }
   }
@@ -82,11 +87,11 @@ function buildCorsOrigins() {
 }
 const CORS_ORIGINS = buildCorsOrigins();
 if (process.env.STRATEGOS_API_KEY && process.env.STRATEGOS_API_KEY.trim().length === 0) {
-  console.error('[FATAL] STRATEGOS_API_KEY is set but empty/whitespace — remove it or set a real key');
+  console.error('[FATAL] STRATEGOS_API_KEY is set but empty/whitespace — remove it or set a real key'); // pre-initLogger boot guard
   process.exit(1);
 }
 if (process.env.STRATEGOS_API_KEY && process.env.STRATEGOS_API_KEY.length < 16) {
-  console.warn('[WARN] STRATEGOS_API_KEY is shorter than 16 characters — consider using a stronger key');
+  console.warn('[WARN] STRATEGOS_API_KEY is shorter than 16 characters — consider using a stronger key'); // pre-initLogger boot guard
 }
 
 async function main() {
@@ -159,6 +164,10 @@ async function main() {
     standardHeaders: true,
     legacyHeaders: false,
     message: { error: 'Too many requests, please try again later' },
+    skip: (req) => {
+      const ip = req.ip || req.socket?.remoteAddress || '';
+      return ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+    },
   });
   const spawnLimiter = rateLimit({
     windowMs: 60 * 1000,
@@ -204,6 +213,10 @@ async function main() {
   app.use('/api/integration', createIntegrationRoutes(THEA_ROOT, io));
   app.use('/api/adrs', createADRRoutes());
   app.use('/api/ralph', createRalphRoutes(ralphService));
+  app.use('/api/learnings', createLearningsRoutes());
+  app.use('/api/memory', createMemoryRoutes());
+  app.use('/api/ai', createAiRoutes());
+  app.use('/api/version', createVersionRouter());
 
   // Sentinel — toggleable deep diagnostics mode
   app.get('/api/sentinel/status', (req, res) => {
@@ -264,6 +277,7 @@ async function main() {
     if (/\.[a-zA-Z0-9]{1,10}$/.test(req.path)) {
       return res.status(404).json({ error: 'Not found' });
     }
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
     res.sendFile(path.join(clientDist, 'index.html'));
   });
 
@@ -338,6 +352,25 @@ async function main() {
     log.warn('Failed to start insight analyzer', { error: err.message });
   }
 
+  // Telegram Bot (optional — gated by TELEGRAM_BOT_ENABLED=true; excluded from release builds)
+  try {
+    const { StrategosTelegramBot } = await import('./services/telegramBot.js');
+    const telegramBot = new StrategosTelegramBot();
+    if (telegramBot.enabled) {
+      globalTelegramBot = telegramBot;
+      telegramBot.start().catch(err => log.error('[TelegramBot] start failed', { error: err.message }));
+      log.info('Telegram bot started');
+    } else {
+      log.info('Telegram bot disabled (set TELEGRAM_BOT_ENABLED=true to enable)');
+    }
+  } catch (err) {
+    if (err.code === 'ERR_MODULE_NOT_FOUND') {
+      log.info('Telegram bot not available in this build');
+    } else {
+      log.error('[TelegramBot] configuration error', { error: err.message });
+    }
+  }
+
   // Socket.io authentication middleware
   io.use(authenticateSocket);
 
@@ -347,10 +380,9 @@ async function main() {
   // Start periodic cleanup sweep to prevent resource leaks
   startPeriodicCleanup(io);
 
-  // Sentinel is available but NOT auto-started. Enable via:
-  //   POST /api/sentinel/start
-  //   UI toggle in dashboard
-  //   Or tell Claude: "enable sentinel"
+  // Sentinel auto-starts on boot. startSentinel() is idempotent (_interval guard).
+  // Can still be toggled off via POST /api/sentinel/stop or UI toggle in dashboard.
+  startSentinel();
   const stats = getResourceStats();
   log.info('Resource limits', {
     running: stats.running,
@@ -420,17 +452,17 @@ async function main() {
 let _shuttingDown = false;
 async function gracefulShutdown(signal) {
   if (_shuttingDown) {
-    console.log(`[Shutdown] Already shutting down, ignoring duplicate ${signal}`);
+    getLogger().info('[shutdown] Already shutting down, ignoring duplicate signal', { signal });
     return;
   }
   _shuttingDown = true;
 
-  // Force-exit if graceful shutdown hangs (e.g., stuck HTTP connections, deadlocked async)
-  // If the process manager (systemd, etc.) force-kills before this fires,
-  // state saves and DB closes are interrupted. Ensure KillMode timeout exceeds this value.
-  const SHUTDOWN_TIMEOUT_MS = 15000;
+  // Force-exit timer: must cover grace+drain+cleanup+buffer. KillMode timeout must exceed this.
+  // TODO: bump systemd TimeoutStopSec to 75 — see docs/systemd/strategos.service.proposed
+  const SHUTDOWN_GRACE_MS = 30000, GRACE_POLL_INTERVAL_MS = 2000; // grace window constants
+  const SHUTDOWN_TIMEOUT_MS = 60000; // grace(30s)+HTTP drain(2s)+cleanup(~12s)+buffer(16s)
   const shutdownTimer = setTimeout(() => {
-    console.error(`[Shutdown] Graceful shutdown timed out after ${SHUTDOWN_TIMEOUT_MS}ms, forcing exit`);
+    getLogger().error('[shutdown] Graceful shutdown timed out', { timeoutMs: SHUTDOWN_TIMEOUT_MS });
     process.exit(1);
   }, SHUTDOWN_TIMEOUT_MS);
   shutdownTimer.unref(); // Don't keep the process alive for this timer alone
@@ -445,6 +477,62 @@ async function gracefulShutdown(signal) {
   if (globalStatusWriter) {
     globalStatusWriter.shutdown(signal);
   }
+
+  // === Shutdown grace window ===
+  // Broadcast shutdown warning so in-flight workers can signal done/held before socket teardown.
+  // Must happen BEFORE globalIo.disconnectSockets (workers need the Ralph API to signal back).
+  const graceCandidates = getWorkers().filter(
+    w => w.ralphStatus === 'in_progress' || w.ralphStatus === 'pending'
+  );
+  const graceSeconds = Math.round(SHUTDOWN_GRACE_MS / 1000);
+  if (globalIo) {
+    globalIo.emit('server:shutting-down', { graceSeconds });
+  }
+  if (graceCandidates.length > 0) {
+    const graceMsg = `[SERVER RESTART IN ${graceSeconds}s] The Strategos server is restarting. ` +
+      `Your tmux session continues uninterrupted — only the API and socket connection are briefly unavailable. ` +
+      `Worker state and learnings are being saved automatically (best-effort). ` +
+      `If you are near completion, signal done or held now to keep your status accurate in the UI. ` +
+      `Mid-call API requests will fail; the server will be back shortly.`;
+    try {
+      const { sendInputDirect } = await import('./workers/output.js');
+      for (const w of graceCandidates) {
+        sendInputDirect(w.id, graceMsg, 'shutdown_grace').catch(() => {});
+      }
+      log.info('[shutdown] Grace window started', { count: graceCandidates.length, graceSeconds });
+    } catch (err) {
+      log.warn('[shutdown] Grace broadcast failed (continuing)', { error: err.message });
+    }
+
+    // Poll until all grace candidates transition OR grace window expires.
+    const graceStart = Date.now();
+    while (Date.now() - graceStart < SHUTDOWN_GRACE_MS) {
+      await new Promise(r => setTimeout(r, GRACE_POLL_INTERVAL_MS));
+      const stillActive = getWorkers().filter(
+        w => w.ralphStatus === 'in_progress' || w.ralphStatus === 'pending'
+      );
+      if (stillActive.length === 0) {
+        log.info('[shutdown] All grace candidates transitioned — early exit',
+          { elapsedMs: Date.now() - graceStart });
+        break;
+      }
+    }
+    const finalActive = getWorkers().filter(
+      w => w.ralphStatus === 'in_progress' || w.ralphStatus === 'pending'
+    ).length;
+    log.info('[shutdown] Grace window complete',
+      { started: graceCandidates.length, transitioned: graceCandidates.length - finalActive, stillActive: finalActive });
+  }
+
+  // Bulk checkpoint all running workers at the end of the grace window (best-effort).
+  try {
+    const { bulkCheckpointRunningWorkers } = await import('./workers/persistence.js');
+    bulkCheckpointRunningWorkers('server_shutdown');
+    log.info('[shutdown] Bulk checkpoint written');
+  } catch (err) {
+    log.warn('[shutdown] Bulk checkpoint failed (non-fatal)', { error: err.message });
+  }
+  // === End grace window ===
 
   // Stop accepting new connections and force-close existing ones.
   // httpServer.close() stops new connections but waits for active ones to drain.
@@ -473,6 +561,7 @@ async function gracefulShutdown(signal) {
   stopSentinel();
   stopPeriodicCleanup();
   stopInsightAnalyzer();
+  if (globalTelegramBot) { globalTelegramBot.stop(); }
   stopAllHealthMonitors();
   stopAllPtyCaptures();
   stopMetricsBroadcast();
@@ -486,6 +575,25 @@ async function gracefulShutdown(signal) {
     } catch (err) {
       log.error('Error cleaning up Ralph service', { error: err.message });
     }
+  }
+
+  // Cat C fix: persist learnings for in_progress workers before exit so server crashes/restarts
+  // don't leave workers with null learnings in the DB.
+  try {
+    const { persistFailureLearning } = await import('./workers/ralph.js');
+    const allWorkers = getWorkers();
+    let flushed = 0;
+    for (const w of allWorkers) {
+      if (w.ralphStatus === 'in_progress' || w.ralphStatus === 'pending') {
+        const internal = getWorkerInternal(w.id);
+        if (internal) {
+          try { persistFailureLearning(internal, w.id, 'server_shutdown'); flushed++; } catch { /* non-fatal */ }
+        }
+      }
+    }
+    if (flushed > 0) log.info('Pre-shutdown learnings flushed', { count: flushed });
+  } catch (err) {
+    log.warn('Failed to flush pre-shutdown learnings', { error: err.message });
   }
 
   try {
@@ -551,7 +659,7 @@ process.on('uncaughtException', (err) => {
   const FATAL_MESSAGES = ['EPIPE', 'EADDRINUSE', 'database disk image is malformed', 'SQLITE_CORRUPT'];
   if (FATAL_CODES.includes(err.code) ||
       FATAL_MESSAGES.some(m => err.message?.includes(m) || err.code === m)) {
-    console.error(`[CRASH PROTECTION] Fatal: ${err.code || err.message} — exiting`);
+    console.error(`[CRASH PROTECTION] Fatal: ${err.code || err.message} — exiting`); // uncaughtException FATAL — logger may be unavailable
     process.exit(1);
     return;
   }

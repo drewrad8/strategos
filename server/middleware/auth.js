@@ -14,6 +14,7 @@
  */
 
 import crypto from 'crypto';
+import { getLogger } from '../logger.js';
 
 /**
  * Timing-safe string comparison to prevent timing attacks on API key.
@@ -40,8 +41,10 @@ const PUBLIC_PATHS = [
 ];
 
 // Prefix-based public paths (for routes with dynamic segments).
-// The signal endpoint is already authenticated by its 128-bit completion token —
-// requiring an additional API key adds no security and breaks worker curl calls.
+// /api/ralph/signal/:token — authenticated by 128-bit completion token in the URL.
+// /api/ralph/signal/by-worker/:id — authenticated by X-Ralph-Token header (worker's ralphToken).
+// Both routes have their own caller-identity checks; ambient API key auth is not needed and
+// would break worker curl calls that don't carry an Authorization header.
 const PUBLIC_PATH_PREFIXES = [
   '/api/ralph/signal/'
 ];
@@ -93,7 +96,7 @@ export function authenticateRequest(req, res, next) {
   const authHeader = req.headers.authorization;
 
   if (!authHeader) {
-    console.warn(`[AUTH] Unauthorized request to ${req.path} - no Authorization header`);
+    getLogger().warn('[workers.auth] Unauthorized request: no Authorization header', { event: 'security.unauthorized', path: req.path });
     return res.status(401).json({
       error: 'Authorization required',
       message: 'Please provide a valid API key in the Authorization header',
@@ -102,7 +105,7 @@ export function authenticateRequest(req, res, next) {
   }
 
   if (!authHeader.startsWith('Bearer ')) {
-    console.warn(`[AUTH] Invalid auth format for ${req.path}`);
+    getLogger().warn('[workers.auth] Invalid auth format', { event: 'security.invalid_format', path: req.path });
     return res.status(401).json({
       error: 'Invalid authorization format',
       message: 'Authorization header must use Bearer token format',
@@ -121,7 +124,7 @@ export function authenticateRequest(req, res, next) {
   const validKey = getApiKey();
 
   if (!timingSafeEqual(token, validKey)) {
-    console.warn(`[AUTH] Invalid API key for ${req.path}`);
+    getLogger().warn('[workers.auth] Invalid API key', { event: 'security.invalid_key', path: req.path });
     return res.status(401).json({
       error: 'Invalid API key',
       message: 'The provided API key is not valid'
@@ -146,12 +149,12 @@ export function authenticateSocket(socket, next) {
   const token = socket.handshake.auth?.token;
 
   if (!token) {
-    console.warn(`[AUTH] Socket connection rejected - no token`);
+    getLogger().warn('[workers.auth] Socket connection rejected: no token', { event: 'security.socket_no_token' });
     return next(new Error('Authentication required'));
   }
 
   if (!timingSafeEqual(token, getApiKey())) {
-    console.warn(`[AUTH] Socket connection rejected - invalid token`);
+    getLogger().warn('[workers.auth] Socket connection rejected: invalid token', { event: 'security.socket_invalid_token' });
     return next(new Error('Invalid API key'));
   }
 
@@ -163,10 +166,10 @@ export function authenticateSocket(socket, next) {
  */
 export function logAuthStatus() {
   if (isAuthEnabled()) {
-    console.log('Authentication: ENABLED (STRATEGOS_API_KEY is set)');
-    console.log('All API requests require Bearer token authorization');
+    getLogger().info('[workers.auth] Authentication enabled');
+    getLogger().info('[workers.auth] All API requests require Bearer token authorization');
   } else {
-    console.log('Authentication: DISABLED (development mode)');
-    console.log('Set STRATEGOS_API_KEY environment variable to enable authentication');
+    getLogger().info('[workers.auth] Authentication disabled (development mode)');
+    getLogger().info('[workers.auth] Set STRATEGOS_API_KEY to enable authentication');
   }
 }

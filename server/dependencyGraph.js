@@ -8,6 +8,10 @@
  * - Track worker completion status for dependency resolution
  */
 
+import { getLogger } from './logger.js';
+
+const logger = getLogger('dependency.graph');
+
 // ============================================
 // STATE
 // ============================================
@@ -118,7 +122,7 @@ export function registerWorkerDependencies(workerId, dependsOn = [], onComplete 
   // Reject self-dependencies and deduplicate
   const filteredDeps = [...new Set(dependsOn.filter(depId => depId !== workerId))];
   if (filteredDeps.length !== dependsOn.length) {
-    console.warn(`[DependencyGraph] Self-dependency or duplicate removed for worker ${workerId}`);
+    logger.warn('[dependency.graph] Self-dependency or duplicate removed', { workerId });
   }
 
   // If already registered, clean up old registration first to prevent duplicate dependents
@@ -143,7 +147,7 @@ export function registerWorkerDependencies(workerId, dependsOn = [], onComplete 
   const validDeps = [];
   for (const depId of filteredDeps) {
     if (!dependencyNodes.has(depId)) {
-      console.warn(`[DependencyGraph] Worker ${workerId} depends on unknown worker ${depId} — treating as completed (may have been cleaned up)`);
+      logger.warn('[dependency.graph] Worker depends on unknown worker — treating as completed', { workerId, depId });
     } else {
       validDeps.push(depId);
     }

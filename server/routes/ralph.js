@@ -1,6 +1,8 @@
+import crypto from 'node:crypto';
 import express from 'express';
 import { sanitizeErrorMessage } from '../errorUtils.js';
 import { getWorkerInternal, updateWorkerRalphStatus } from '../workerManager.js';
+import { getLogger } from '../logger.js';
 
 /**
  * Ralph routes for worker completion signaling
@@ -15,12 +17,12 @@ import { getWorkerInternal, updateWorkerRalphStatus } from '../workerManager.js'
  * Returns { error: string } on failure, or { signalData } on success.
  */
 function validateSignalBody(body) {
-  const { status = 'done', progress, currentStep, reason, learnings, outputs, artifacts } = body;
+  const { status = 'done', progress, currentStep, reason, learnings, outputs, artifacts, inputTokens, outputTokens, totalCost, modelId } = body;
 
   // Accept "completed" as alias for "done" (workers frequently use the wrong term)
   const normalizedStatus = status === 'completed' ? 'done' : status;
-  if (!['in_progress', 'done', 'blocked'].includes(normalizedStatus)) {
-    return { error: 'status must be "in_progress", "done", "completed", or "blocked"' };
+  if (!['in_progress', 'done', 'blocked', 'held'].includes(normalizedStatus)) {
+    return { error: 'status must be "in_progress", "done", "completed", "blocked", or "held"' };
   }
 
   // Validate progress range if provided
@@ -70,8 +72,22 @@ function validateSignalBody(body) {
     }
   }
 
+  // Validate token fields — all optional, but must be correct type if present
+  if (inputTokens !== undefined && (typeof inputTokens !== 'number' || inputTokens < 0)) {
+    return { error: 'inputTokens must be a non-negative number' };
+  }
+  if (outputTokens !== undefined && (typeof outputTokens !== 'number' || outputTokens < 0)) {
+    return { error: 'outputTokens must be a non-negative number' };
+  }
+  if (totalCost !== undefined && (typeof totalCost !== 'number' || totalCost < 0)) {
+    return { error: 'totalCost must be a non-negative number' };
+  }
+  if (modelId !== undefined && (typeof modelId !== 'string' || modelId.length > 100)) {
+    return { error: 'modelId must be a string (max 100 chars)' };
+  }
+
   return {
-    signalData: { status: normalizedStatus, progress, currentStep, reason, learnings, outputs, artifacts }
+    signalData: { status: normalizedStatus, progress, currentStep, reason, learnings, outputs, artifacts, inputTokens, outputTokens, totalCost, modelId }
   };
 }
 
@@ -97,10 +113,20 @@ export function createRalphRoutes(ralphService) {
         return res.status(400).json({ error: validation.error });
       }
 
+      // Cat E: soft-warn when done signal omits learnings — degrades feedback loop quality
+      if (validation.signalData.status === 'done' && !validation.signalData.learnings) {
+        getLogger().warn('[Ralph] done signal received without learnings field — feedback loop degraded', { token: token.slice(0, 8) });
+      }
+
       const result = await ralphService.handleCompletionSignal(token, validation.signalData);
 
       if (!result) {
         return res.status(404).json({ error: 'Unknown completion token' });
+      }
+
+      // Persistent worker tried to signal done — return the rejection message so it knows to continue
+      if (result.rejected) {
+        return res.status(200).json({ success: false, rejected: true, message: result.message });
       }
 
       res.json({ success: true, message: `Status updated to ${validation.signalData.status}`, progress: validation.signalData.progress });
@@ -132,9 +158,38 @@ export function createRalphRoutes(ralphService) {
         return res.status(400).json({ error: 'Worker does not have Ralph mode enabled' });
       }
 
+      // Identity verification: prefer X-Ralph-Token header, fall back to body field (legacy)
+      const headerToken = req.headers['x-ralph-token'];
+      const bodyToken = typeof req.body?.ralphToken === 'string' ? req.body.ralphToken : undefined;
+
+      let providedToken;
+      if (headerToken !== undefined) {
+        providedToken = headerToken;
+      } else if (bodyToken !== undefined) {
+        getLogger().warn(`[Ralph] Worker ${workerId} sent ralphToken in body — use X-Ralph-Token header instead`, { workerId });
+        providedToken = bodyToken;
+      } else {
+        return res.status(403).json({ error: 'ralph token mismatch' });
+      }
+
+      const expected = worker.ralphToken;
+      const maxLen = Math.max(providedToken.length, expected.length, 1);
+      const bufA = Buffer.alloc(maxLen);
+      const bufB = Buffer.alloc(maxLen);
+      bufA.write(providedToken);
+      bufB.write(expected);
+      if (!crypto.timingSafeEqual(bufA, bufB) || providedToken.length !== expected.length) {
+        return res.status(403).json({ error: 'ralph token mismatch' });
+      }
+
       const validation = validateSignalBody(req.body);
       if (validation.error) {
         return res.status(400).json({ error: validation.error });
+      }
+
+      // Cat E: soft-warn when done signal omits learnings — degrades feedback loop quality
+      if (validation.signalData.status === 'done' && !validation.signalData.learnings) {
+        getLogger().warn(`[Ralph] Worker ${workerId} (${worker.label}) signaled done without learnings — feedback loop degraded`, { workerId, label: worker.label });
       }
 
       // Call updateWorkerRalphStatus directly — skip token roundtrip
@@ -142,6 +197,11 @@ export function createRalphRoutes(ralphService) {
 
       if (!result) {
         return res.status(500).json({ error: 'Signal handling failed' });
+      }
+
+      // Persistent worker tried to signal done — return the rejection message so it knows to continue
+      if (result.rejected) {
+        return res.status(200).json({ success: false, rejected: true, message: result.message });
       }
 
       res.json({ success: true, message: `Status updated to ${validation.signalData.status}`, progress: validation.signalData.progress });

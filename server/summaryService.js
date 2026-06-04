@@ -5,22 +5,26 @@
  * using a local Ollama model as an intermediary.
  */
 
+import { getLogger } from './logger.js';
+
+const logger = getLogger('[summary]');
+
 // Validate OLLAMA_URL — must be localhost/127.0.0.1 with http(s) protocol to prevent SSRF
 const _rawOllamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434';
 const OLLAMA_URL = (() => {
   try {
     const u = new URL(_rawOllamaUrl);
     if (u.protocol !== 'http:' && u.protocol !== 'https:') {
-      console.warn(`[Summary] OLLAMA_URL protocol "${u.protocol}" rejected — only http/https allowed`);
+      logger.warn('[summary] OLLAMA_URL protocol rejected — only http/https allowed', { event: 'security.ssrf.invalid_protocol', url: _rawOllamaUrl, reason: `protocol "${u.protocol}" not allowed` });
       return 'http://localhost:11434';
     }
     if (!['localhost', '127.0.0.1', '::1'].includes(u.hostname)) {
-      console.warn(`[Summary] OLLAMA_URL hostname "${u.hostname}" is not localhost — rejecting (SSRF prevention)`);
+      logger.warn('[summary] OLLAMA_URL hostname rejected — not localhost', { event: 'security.ssrf.invalid_hostname', url: _rawOllamaUrl, reason: `hostname "${u.hostname}" is not localhost` });
       return 'http://localhost:11434';
     }
     const port = parseInt(u.port || '11434', 10);
     if (port < 1024 || port > 65535) {
-      console.warn(`[Summary] OLLAMA_URL port ${port} rejected — must be 1024-65535 (prevents targeting system services)`);
+      logger.warn('[summary] OLLAMA_URL port rejected — outside safe range', { event: 'security.ssrf.invalid_port', url: _rawOllamaUrl, port, reason: 'must be 1024-65535 to prevent targeting system services' });
       return 'http://localhost:11434';
     }
     return _rawOllamaUrl;
@@ -29,7 +33,7 @@ const OLLAMA_URL = (() => {
 // Validate model name: alphanumeric, hyphens, colons, dots (e.g. "qwen3:8b", "llama3.1:70b-instruct")
 const _rawSummaryModel = process.env.SUMMARY_MODEL || 'qwen3:8b';
 const SUMMARY_MODEL = /^[a-zA-Z0-9._:-]+$/.test(_rawSummaryModel) ? _rawSummaryModel : (() => {
-  console.warn(`[Summary] Invalid SUMMARY_MODEL format: "${_rawSummaryModel}", using default`);
+  logger.warn('[summary] Invalid SUMMARY_MODEL format — using default', { model: _rawSummaryModel });
   return 'qwen3:8b';
 })();
 
@@ -49,7 +53,7 @@ export function getSummariesEnabled() {
  */
 export function setSummariesEnabled(enabled) {
   summariesEnabled = enabled;
-  console.log(`[Summary] Summaries ${enabled ? 'enabled' : 'disabled'}`);
+  logger.info('[summary] Summaries state changed', { enabled });
   return summariesEnabled;
 }
 
@@ -199,12 +203,12 @@ async function callOllama(prompt, options = {}) {
     // SM-2: Guard against oversized responses before parsing
     const responseText = await response.text();
     if (responseText.length > MAX_OLLAMA_RESPONSE_BYTES) {
-      console.warn(`[Summary] Ollama response too large (${responseText.length} bytes), truncating to ${MAX_OLLAMA_RESPONSE_BYTES}`);
+      logger.warn('[summary] Ollama response too large — truncating', { bytes: responseText.length, limit: MAX_OLLAMA_RESPONSE_BYTES });
     }
     const data = JSON.parse(responseText.slice(0, MAX_OLLAMA_RESPONSE_BYTES));
     return data.response;
   } catch (error) {
-    console.error('Ollama call failed:', error.message);
+    logger.error('[summary] Ollama call failed', { error: error.message });
     throw error;
   } finally {
     clearTimeout(fetchTimeout);
@@ -255,7 +259,7 @@ export async function executePrompt(prompt, options = {}) {
     // SM-2: Guard against oversized responses before parsing
     const responseText = await response.text();
     if (responseText.length > MAX_OLLAMA_RESPONSE_BYTES) {
-      console.warn(`[Summary] Ollama executePrompt response too large (${responseText.length} bytes), truncating`);
+      logger.warn('[summary] Ollama executePrompt response too large — truncating', { bytes: responseText.length, limit: MAX_OLLAMA_RESPONSE_BYTES });
     }
     const data = JSON.parse(responseText.slice(0, MAX_OLLAMA_RESPONSE_BYTES));
     return {
@@ -266,7 +270,7 @@ export async function executePrompt(prompt, options = {}) {
       completionTokens: data.eval_count
     };
   } catch (error) {
-    console.error('Ollama execute failed:', error.message);
+    logger.error('[summary] Ollama execute failed', { error: error.message });
     throw error;
   } finally {
     clearTimeout(fetchTimeout);
@@ -347,7 +351,7 @@ async function _generateSummaryImpl(workerId, rawOutput, options = {}) {
   // 2. Not enough time has passed since last Ollama call (unless forcing refresh)
   if (!forceRefresh && context.lastSummary) {
     if (context.lastOutputHash === outputHash) {
-      console.log(`[Summary] Returning cached summary for worker ${workerId} (output unchanged)`);
+      logger.info('[summary] Returning cached summary — output unchanged', { workerId });
       return {
         ...context.lastSummary,
         cached: true,
@@ -357,7 +361,7 @@ async function _generateSummaryImpl(workerId, rawOutput, options = {}) {
     }
 
     if (timeSinceLastCall < MIN_SUMMARY_INTERVAL_MS) {
-      console.log(`[Summary] Returning cached summary for worker ${workerId} (rate limited, ${Math.round(timeSinceLastCall/1000)}s since last call)`);
+      logger.info('[summary] Returning cached summary — rate limited', { workerId, secondsSinceLastCall: Math.round(timeSinceLastCall / 1000) });
       return {
         ...context.lastSummary,
         cached: true,
@@ -367,7 +371,7 @@ async function _generateSummaryImpl(workerId, rawOutput, options = {}) {
     }
   }
 
-  console.log(`[Summary] Generating new summary for worker ${workerId} (hash: ${outputHash}, time since last: ${Math.round(timeSinceLastCall/1000)}s)`);
+  logger.info('[summary] Generating new summary', { workerId, outputHash, secondsSinceLastCall: Math.round(timeSinceLastCall / 1000) });
 
   // Use more lines for better context (cleaned output is much smaller than raw)
   const contextLines = extractRecentLines(rawOutput, 80);
@@ -427,17 +431,17 @@ JSON format:
         break; // Success!
       } else {
         lastError = new Error('No JSON found in response');
-        console.warn(`[Summary] Attempt ${attempt}: No JSON start found. Raw: ${response.slice(0, 200)}...`);
+        logger.warn('[summary] Ollama parse attempt: no JSON start found', { attempt, rawPreview: response.slice(0, 200) });
       }
     } catch (parseErr) {
       lastError = parseErr;
-      console.warn(`[Summary] Attempt ${attempt}: Parse failed: ${parseErr.message}`);
+      logger.warn('[summary] Ollama parse attempt: JSON parse failed', { attempt, error: parseErr.message });
     }
   }
 
   // If all attempts failed, use fallback
   if (!parsed) {
-    console.warn('[Summary] All attempts failed, using fallback');
+    logger.warn('[summary] All Ollama parse attempts failed — using fallback', { lastError: lastError?.message });
     parsed = {
       task: context.task || 'Unknown task',
       status: 'unknown',
@@ -488,7 +492,7 @@ JSON format:
   const isWaitingInput = WAITING_INPUT_RE.test(cleanedText);
 
   if (isWaitingInput && parsed.status !== 'waiting_input') {
-    console.log(`[Summary] Overriding status from "${parsed.status}" to "waiting_input" (heuristic match)`);
+    logger.info('[summary] Overriding status to waiting_input via heuristic', { workerId, previousStatus: parsed.status });
     parsed.status = 'waiting_input';
   }
 

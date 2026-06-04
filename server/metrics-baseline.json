@@ -1,60 +1,60 @@
 {
-  "capturedAt": "2026-04-07T01:21:48.705Z",
+  "capturedAt": "2026-04-21T08:26:17.053Z",
   "metrics": {
-    "totalWorkers": 1350,
+    "totalWorkers": 2412,
     "byType": {
       "test": {
-        "total": 108,
-        "successes": 85,
-        "failures": 23,
-        "successRate": 0.7870370370370371,
-        "avgUptime": 186917
-      },
-      "impl": {
-        "total": 362,
-        "successes": 339,
-        "failures": 23,
-        "successRate": 0.93646408839779,
-        "avgUptime": 437191
-      },
-      "general": {
-        "total": 24,
-        "successes": 15,
-        "failures": 9,
-        "successRate": 0.625,
-        "avgUptime": 28674964
-      },
-      "fix": {
-        "total": 334,
-        "successes": 304,
-        "failures": 30,
-        "successRate": 0.9101796407185628,
-        "avgUptime": 435782
+        "total": 254,
+        "successes": 238,
+        "failures": 3,
+        "successRate": 0.9875518672199171,
+        "avgUptime": 299616
       },
       "research": {
-        "total": 423,
-        "successes": 417,
-        "failures": 6,
-        "successRate": 0.9858156028368794,
-        "avgUptime": 360654
-      },
-      "colonel": {
-        "total": 41,
-        "successes": 35,
-        "failures": 6,
-        "successRate": 0.8536585365853658,
-        "avgUptime": 1157795
+        "total": 687,
+        "successes": 615,
+        "failures": 48,
+        "successRate": 0.9276018099547512,
+        "avgUptime": 457006
       },
       "review": {
-        "total": 58,
-        "successes": 58,
-        "failures": 0,
-        "successRate": 1,
-        "avgUptime": 274454
+        "total": 189,
+        "successes": 184,
+        "failures": 2,
+        "successRate": 0.989247311827957,
+        "avgUptime": 218398
+      },
+      "fix": {
+        "total": 556,
+        "successes": 477,
+        "failures": 65,
+        "successRate": 0.8800738007380073,
+        "avgUptime": 603502
+      },
+      "impl": {
+        "total": 520,
+        "successes": 445,
+        "failures": 57,
+        "successRate": 0.8864541832669323,
+        "avgUptime": 522057
+      },
+      "general": {
+        "total": 93,
+        "successes": 38,
+        "failures": 49,
+        "successRate": 0.4367816091954023,
+        "avgUptime": 17653828
+      },
+      "colonel": {
+        "total": 113,
+        "successes": 73,
+        "failures": 33,
+        "successRate": 0.6886792452830188,
+        "avgUptime": 1588000
       }
     },
-    "overallSuccessRate": 0.9281481481481482,
-    "overallAvgUptime": 909737,
+    "overallSuccessRate": 0.8895573700042974,
+    "overallAvgUptime": 1185576,
     "effortDistribution": {}
   }
 }

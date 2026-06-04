@@ -1,5 +1,8 @@
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
+import micromatch from 'micromatch';
+import { getLogger } from './logger.js';
 
 const CONFIG_FILE = 'projects.json';
 
@@ -71,7 +74,7 @@ export function safeResolvePath(projectPath, theaRoot) {
     }
   }
 
-  console.warn(`[SECURITY] Path traversal attempt blocked: ${projectPath} -> ${resolvedPath}`);
+  getLogger().warn('[scanner.project] Path traversal attempt blocked', { event: 'security.path_traversal', path: resolvedPath, requested: projectPath });
   return null;
 }
 
@@ -97,13 +100,13 @@ export function loadProjectConfig(theaRoot) {
       const parsed = JSON.parse(content);
       // Validate parsed value is a plain object (not array, string, number, null)
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-        console.warn('[ProjectScanner] projects.json is not a JSON object, using defaults');
+        getLogger().warn('[scanner.project] projects.json is not a JSON object, using defaults');
       } else {
         result = parsed;
       }
     }
   } catch (error) {
-    console.error('Error loading project config:', error.message);
+    getLogger().error('[scanner.project] Error loading project config:', error.message);
   }
 
   if (!result) {
@@ -113,6 +116,20 @@ export function loadProjectConfig(theaRoot) {
       projectMeta: {},
       settings: { defaultView: 'folders', showUncategorized: true, uncategorizedLabel: 'Other Projects' }
     };
+  }
+
+  if (!result.deniedPaths) {
+    const home = os.homedir();
+    result.deniedPaths = [
+      path.join(home, '.ssh'),
+      path.join(home, '.gnupg'),
+      path.join(home, '.claude'),
+      path.join(home, '.config', 'Claude'),
+      path.join(home, '.config', 'gh'),
+      path.join(home, '.netrc'),
+      path.join(home, '.aws'),
+      '**/.env'
+    ];
   }
 
   _configCache.theaRoot = theaRoot;
@@ -133,7 +150,7 @@ export function saveProjectConfig(theaRoot, config) {
     fs.renameSync(tmpPath, configPath);
     return true;
   } catch (error) {
-    console.error('Error saving project config:', error.message);
+    getLogger().error('[scanner.project] Error saving project config:', error.message);
     try { fs.unlinkSync(tmpPath); } catch { /* best effort cleanup */ }
     return false;
   }
@@ -153,7 +170,7 @@ function getAdditionalRoots(theaRoot) {
   if (envRoots) {
     const entries = envRoots.split(',').map(p => p.trim()).filter(p => p);
     if (entries.length > MAX_ADDITIONAL_ROOTS) {
-      console.warn(`[ProjectScanner] THEA_ADDITIONAL_ROOTS has ${entries.length} entries, truncating to ${MAX_ADDITIONAL_ROOTS}`);
+      getLogger().warn(`[scanner.project] THEA_ADDITIONAL_ROOTS has ${entries.length} entries, truncating to ${MAX_ADDITIONAL_ROOTS}`);
       entries.length = MAX_ADDITIONAL_ROOTS;
     }
     entries.forEach(p => {
@@ -163,7 +180,7 @@ function getAdditionalRoots(theaRoot) {
       if (path.isAbsolute(p) && normalized !== '/' && !p.includes('..') && !isUnderDangerousPath(normalized)) {
         roots.add(normalized);
       } else {
-        console.warn(`[ProjectScanner] Rejecting unsafe additional root: ${p}`);
+        getLogger().warn(`[scanner.project] Rejecting unsafe additional root: ${p}`);
       }
     });
   }
@@ -173,7 +190,7 @@ function getAdditionalRoots(theaRoot) {
   if (config.externalProjects && Array.isArray(config.externalProjects)) {
     const configProjects = config.externalProjects.slice(0, MAX_ADDITIONAL_ROOTS);
     if (config.externalProjects.length > MAX_ADDITIONAL_ROOTS) {
-      console.warn(`[ProjectScanner] Config has ${config.externalProjects.length} external projects, using first ${MAX_ADDITIONAL_ROOTS}`);
+      getLogger().warn(`[scanner.project] Config has ${config.externalProjects.length} external projects, using first ${MAX_ADDITIONAL_ROOTS}`);
     }
     configProjects.forEach(p => {
       if (typeof p !== 'string' || !p) return;
@@ -181,7 +198,7 @@ function getAdditionalRoots(theaRoot) {
       if (path.isAbsolute(p) && normalized !== '/' && !p.includes('..') && !isUnderDangerousPath(normalized)) {
         roots.add(normalized);
       } else {
-        console.warn(`[ProjectScanner] Rejecting unsafe config external root: ${p}`);
+        getLogger().warn(`[scanner.project] Rejecting unsafe config external root: ${p}`);
       }
     });
   }
@@ -322,7 +339,7 @@ export function scanProjects(theaRoot) {
         }
       }
     } catch (error) {
-      console.error(`Error accessing additional root ${additionalPath}:`, error.message);
+      getLogger().error(`[scanner.project] Error accessing additional root ${additionalPath}:`, error.message);
     }
   }
 
@@ -356,7 +373,7 @@ function scanDirectory(dirPath, projects, seenNames) {
       }
     }
   } catch (error) {
-    console.error(`Error scanning projects in ${dirPath}:`, error.message);
+    getLogger().error(`[scanner.project] Error scanning projects in ${dirPath}:`, error.message);
   }
 }
 
@@ -511,4 +528,130 @@ export function projectExists(projectPath) {
   } catch {
     return false;
   }
+}
+
+// ============================================
+// Deny-List Access Control
+// ============================================
+
+const DENY_DANGEROUS_PATHS = ['/', '/etc', '/sys', '/proc', '/dev', '/boot'];
+
+/**
+ * Return the current deny list from config (with defaults applied by loadProjectConfig).
+ */
+export function getDeniedPaths(theaRoot) {
+  const config = loadProjectConfig(theaRoot);
+  return config.deniedPaths || [];
+}
+
+/**
+ * Check if an absolute path is denied by the deny list.
+ * Resolves symlinks, normalizes, checks null bytes, then matches against each entry.
+ * Glob patterns (containing * or ?) use micromatch; plain paths use prefix check.
+ * Returns true if the path is denied, false if allowed.
+ */
+export function isPathDenied(absolutePath, theaRoot) {
+  if (!absolutePath || typeof absolutePath !== 'string' || absolutePath.includes('\0')) {
+    return false;
+  }
+
+  let resolvedPath;
+  try {
+    resolvedPath = fs.realpathSync(path.resolve(absolutePath));
+  } catch {
+    resolvedPath = path.resolve(absolutePath);
+  }
+
+  const denied = getDeniedPaths(theaRoot);
+  for (const pattern of denied) {
+    if (pattern.includes('*') || pattern.includes('?')) {
+      if (micromatch.isMatch(resolvedPath, pattern, { dot: true })) {
+        return true;
+      }
+    } else {
+      let normalizedPattern;
+      try {
+        normalizedPattern = fs.realpathSync(path.resolve(pattern));
+      } catch {
+        normalizedPattern = path.resolve(pattern);
+      }
+      if (resolvedPath === normalizedPattern || resolvedPath.startsWith(normalizedPattern + path.sep)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Add a path to the deny list. Validates before saving.
+ * pathEntry must be an absolute path or a glob like **\/.env.
+ * Returns {success, error}.
+ */
+export function addDeniedPath(theaRoot, pathEntry) {
+  if (!pathEntry || typeof pathEntry !== 'string') {
+    return { success: false, error: 'path is required and must be a string' };
+  }
+  if (pathEntry.includes('\0')) {
+    return { success: false, error: 'Invalid path: null bytes not allowed' };
+  }
+
+  const isGlob = pathEntry.includes('*') || pathEntry.includes('?');
+  if (!isGlob && !path.isAbsolute(pathEntry)) {
+    return { success: false, error: 'Path must be absolute or a glob pattern (e.g. **/.env)' };
+  }
+
+  if (!isGlob) {
+    const normalized = path.resolve(pathEntry);
+    if (DENY_DANGEROUS_PATHS.some(dp => normalized === dp)) {
+      return { success: false, error: `Refusing to deny dangerous system path: ${pathEntry}` };
+    }
+  }
+
+  const config = loadProjectConfig(theaRoot);
+  if (!config.deniedPaths) {
+    config.deniedPaths = getDeniedPaths(theaRoot);
+  }
+
+  if (config.deniedPaths.includes(pathEntry)) {
+    return { success: false, error: 'Path already in deny list' };
+  }
+
+  config.deniedPaths.push(pathEntry);
+  // Invalidate cache so next loadProjectConfig reads updated data
+  _configCache.at = 0;
+  if (!saveProjectConfig(theaRoot, config)) {
+    return { success: false, error: 'Failed to save project configuration' };
+  }
+
+  return { success: true };
+}
+
+/**
+ * Remove a path from the deny list.
+ * Returns {success, error}.
+ */
+export function removeDeniedPath(theaRoot, pathEntry) {
+  if (!pathEntry || typeof pathEntry !== 'string') {
+    return { success: false, error: 'path is required and must be a string' };
+  }
+
+  const config = loadProjectConfig(theaRoot);
+  if (!config.deniedPaths) {
+    return { success: false, error: 'Deny list is empty' };
+  }
+
+  const index = config.deniedPaths.indexOf(pathEntry);
+  if (index === -1) {
+    return { success: false, error: 'Path not found in deny list' };
+  }
+
+  config.deniedPaths.splice(index, 1);
+  // Invalidate cache
+  _configCache.at = 0;
+  if (!saveProjectConfig(theaRoot, config)) {
+    return { success: false, error: 'Failed to save project configuration' };
+  }
+
+  return { success: true };
 }

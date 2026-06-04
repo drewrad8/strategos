@@ -16,9 +16,11 @@ function authHeaders() {
 
 // Labels that indicate a worker was created by tests
 // IMPORTANT: Only match labels with explicit fixture prefixes to avoid killing user workers
-// All e2e fixture workers MUST use the "E2E_FIXTURE:" prefix in their labels
+// All e2e fixture workers MUST use the "E2E_FIXTURE:" prefix in their labels.
+// Note: spawn-from-template prepends the role prefix (e.g. "GENERAL: E2E_FIXTURE: ..."),
+// so we match E2E_FIXTURE: anywhere in the label, not just at the start.
 const TEST_WORKER_PATTERNS = [
-  /^E2E_FIXTURE:/i,   // Universal fixture prefix - all e2e test workers must use this
+  /E2E_FIXTURE:/i,   // Universal fixture prefix - matches "IMPL: E2E_FIXTURE: ...", "GENERAL: E2E_FIXTURE: ...", etc.
 ];
 
 function isTestWorker(worker) {

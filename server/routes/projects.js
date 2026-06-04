@@ -14,7 +14,10 @@ import {
   saveProjectConfig,
   addExternalProject,
   removeExternalProject,
-  listExternalProjects
+  listExternalProjects,
+  getDeniedPaths,
+  addDeniedPath,
+  removeDeniedPath
 } from '../projectScanner.js';
 import { getWorkers, getWorkersByProject } from '../workerManager.js';
 import { sanitizeErrorMessage } from '../errorUtils.js';
@@ -41,21 +44,34 @@ export function createProjectRoutes(theaRoot) {
       }
 
       if (view === 'full') {
-        // Return full config with enriched projects
+        // Return full config with enriched projects (disabled projects excluded)
         const data = getProjectsWithConfig(theaRoot);
-        data.projects = data.projects.map(p => ({
-          ...p,
-          workers: workers.filter(w => w.project === p.name)
-        }));
+        data.projects = data.projects
+          .filter(p => p.meta?.enabled !== false)
+          .map(p => ({
+            ...p,
+            enabled: p.meta?.enabled !== false,
+            workers: workers.filter(w => w.project === p.name)
+          }));
         return res.json(data);
       }
 
       // Default: flat list (backwards compatible)
-      const projects = scanProjects(theaRoot);
-      const projectsWithWorkers = projects.map(p => ({
-        ...p,
-        workers: workers.filter(w => w.project === p.name)
-      }));
+      const config = loadProjectConfig(theaRoot);
+      const includeDisabled = req.query.includeDisabled === 'true';
+      const projects = scanProjects(theaRoot).filter(p => {
+        if (includeDisabled) return true;
+        const meta = config.projectMeta?.[p.name];
+        return meta?.enabled !== false;
+      });
+      const projectsWithWorkers = projects.map(p => {
+        const meta = config.projectMeta?.[p.name] || {};
+        return {
+          ...p,
+          enabled: meta.enabled !== false,
+          workers: workers.filter(w => w.project === p.name)
+        };
+      });
 
       res.json(projectsWithWorkers);
     } catch (error) {
@@ -158,6 +174,88 @@ export function createProjectRoutes(theaRoot) {
       } else {
         res.status(400).json({ error: result.error });
       }
+    } catch (error) {
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
+    }
+  });
+
+  // PATCH /api/projects/:name/enabled - Enable or disable a project
+  // Note: orchestratorService uses scanProjects() directly and bypasses the enabled filter.
+  // Voice commands can still target disabled projects. This is by design.
+  router.patch('/:name/enabled', (req, res) => {
+    try {
+      const { name } = req.params;
+      const { enabled } = req.body;
+
+      if (typeof enabled !== 'boolean') {
+        return res.status(400).json({ error: 'enabled must be a boolean' });
+      }
+
+      // Verify project exists via filesystem scan
+      const allProjects = scanProjects(theaRoot);
+      const exists = allProjects.some(p => p.name === name);
+      if (!exists) {
+        return res.status(404).json({ error: 'Project not found' });
+      }
+
+      const config = loadProjectConfig(theaRoot);
+      if (!config.projectMeta) {
+        config.projectMeta = {};
+      }
+      if (!config.projectMeta[name]) {
+        config.projectMeta[name] = {};
+      }
+      config.projectMeta[name].enabled = enabled;
+
+      const ok = saveProjectConfig(theaRoot, config);
+      if (!ok) {
+        return res.status(500).json({ error: 'Failed to save config' });
+      }
+
+      res.json({ success: true, project: name, enabled });
+    } catch (error) {
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
+    }
+  });
+
+  // GET /api/projects/denied - List all denied paths
+  router.get('/denied', (req, res) => {
+    try {
+      res.json({ deniedPaths: getDeniedPaths(theaRoot) });
+    } catch (error) {
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
+    }
+  });
+
+  // POST /api/projects/denied - Add a path to the deny list
+  router.post('/denied', (req, res) => {
+    try {
+      const { path: pathEntry } = req.body;
+      if (!pathEntry) {
+        return res.status(400).json({ error: 'path is required' });
+      }
+      const result = addDeniedPath(theaRoot, pathEntry);
+      if (!result.success) {
+        return res.status(400).json({ error: result.error });
+      }
+      res.json({ success: true, deniedPaths: getDeniedPaths(theaRoot) });
+    } catch (error) {
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
+    }
+  });
+
+  // DELETE /api/projects/denied - Remove a path from the deny list
+  router.delete('/denied', (req, res) => {
+    try {
+      const { path: pathEntry } = req.body;
+      if (!pathEntry || typeof pathEntry !== 'string') {
+        return res.status(400).json({ error: 'path is required and must be a string' });
+      }
+      const result = removeDeniedPath(theaRoot, pathEntry);
+      if (!result.success) {
+        return res.status(400).json({ error: result.error });
+      }
+      res.json({ success: true, deniedPaths: getDeniedPaths(theaRoot) });
     } catch (error) {
       res.status(500).json({ error: sanitizeErrorMessage(error) });
     }

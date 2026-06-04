@@ -14,6 +14,7 @@ import {
   updateWorkerLabel,
   updateWorkerSettings,
   sendInput,
+  sendInputDirect,
   interruptWorker,
   getWorkerOutput,
   completeWorker,
@@ -23,11 +24,14 @@ import {
   getSiblingWorkers,
   getWorkerEfficiency,
   normalizeWorker,
-  processQueue
+  processQueue,
+  saveWorkerStateImmediate
 } from '../workerManager.js';
+import { writeStrategosContext } from '../workers/templates.js';
 import {
   safeResolvePath,
-  projectExists
+  projectExists,
+  isPathDenied
 } from '../projectScanner.js';
 import {
   generateSummary,
@@ -41,152 +45,35 @@ import {
 } from '../workerOutputDb.js';
 import { sanitizeErrorMessage } from '../errorUtils.js';
 import {
-  VALID_WORKER_ID, VALID_SIMPLE_ID, CONTROL_CHAR_RE, MULTILINE_CONTROL_CHAR_RE,
+  VALID_WORKER_ID, CONTROL_CHAR_RE, MULTILINE_CONTROL_CHAR_RE,
   MAX_TASK_LENGTH, MAX_LABEL_LENGTH, MAX_INPUT_LENGTH, MAX_PROMPT_LENGTH,
-  isValidSessionId
+  isValidSessionId,
+  validateDependsOn, validateSpawnInput, buildSpawnOptions,
 } from '../validation.js';
 import { getReviewResult, addReviewResult } from '../learningsDb.js';
+import { getDriftEventsSummary, getDriftEvents } from '../driftDb.js';
+import { logDenyEvent } from '../workers/denyAudit.js';
+import { getLogger } from '../logger.js';
+import { isContextLessInput } from '../workers/inputGuard.js';
+import crypto from 'node:crypto';
+import { workers, STRATEGOS_API } from '../workers/state.js';
+
+const logger = getLogger('[workers.route]');
 
 // =============================================
 // SPAWN TEMPLATES - Simplified worker spawning
 // =============================================
 
+// Commander mandate (2026-05-30): all workers on Opus 4.8. Restored after revert.
 const SPAWN_TEMPLATES = {
-  research: {
-    prefix: 'RESEARCH',
-    autoAccept: true,
-    ralphMode: true,
-    model: 'sonnet'
-  },
-  impl: {
-    prefix: 'IMPL',
-    autoAccept: true,
-    ralphMode: true,
-    model: 'sonnet'
-  },
-  test: {
-    prefix: 'TEST',
-    autoAccept: true,
-    ralphMode: true,
-    model: 'haiku'
-  },
-  review: {
-    prefix: 'REVIEW',
-    autoAccept: true,
-    ralphMode: true,
-    model: 'haiku'
-  },
-  fix: {
-    prefix: 'FIX',
-    autoAccept: true,
-    ralphMode: true,
-    model: 'sonnet'
-  },
-  general: {
-    prefix: 'GENERAL',
-    autoAccept: true, // GENERALs need auto-accept to run curl commands; pause-keywords provide safety
-    ralphMode: true,
-    forcedAutonomy: true, // GENERALs are continuous-ops workers — always nudge them to find more work
-    model: 'sonnet'
-  },
-  colonel: {
-    prefix: 'COLONEL',
-    autoAccept: true,
-    ralphMode: true,
-    model: 'sonnet'
-  },
-  captain: {
-    prefix: 'CAPTAIN',
-    autoAccept: true,
-    ralphMode: true,
-    model: 'sonnet'
-  },
-  // Gemini CLI backend templates
-  'gemini-research': {
-    prefix: 'RESEARCH',
-    autoAccept: true,
-    ralphMode: true,
-    backend: 'gemini'
-  },
-  'gemini-impl': {
-    prefix: 'IMPL',
-    autoAccept: true,
-    ralphMode: true,
-    backend: 'gemini'
-  },
-  'gemini-test': {
-    prefix: 'TEST',
-    autoAccept: true,
-    ralphMode: true,
-    backend: 'gemini'
-  },
-  'gemini-review': {
-    prefix: 'REVIEW',
-    autoAccept: true,
-    ralphMode: true,
-    backend: 'gemini'
-  },
-  'gemini-fix': {
-    prefix: 'FIX',
-    autoAccept: true,
-    ralphMode: true,
-    backend: 'gemini'
-  },
-  'gemini-general': {
-    prefix: 'GENERAL',
-    autoAccept: true,
-    ralphMode: true,
-    backend: 'gemini'
-  },
-  'gemini-colonel': {
-    prefix: 'COLONEL',
-    autoAccept: true,
-    ralphMode: true,
-    backend: 'gemini'
-  },
-  // Aider (Ollama) backend templates
-  'aider-research': {
-    prefix: 'RESEARCH',
-    autoAccept: true,
-    ralphMode: true,
-    backend: 'aider'
-  },
-  'aider-impl': {
-    prefix: 'IMPL',
-    autoAccept: true,
-    ralphMode: true,
-    backend: 'aider'
-  },
-  'aider-test': {
-    prefix: 'TEST',
-    autoAccept: true,
-    ralphMode: true,
-    backend: 'aider'
-  },
-  'aider-review': {
-    prefix: 'REVIEW',
-    autoAccept: true,
-    ralphMode: true,
-    backend: 'aider'
-  },
-  'aider-fix': {
-    prefix: 'FIX',
-    autoAccept: true,
-    ralphMode: true,
-    backend: 'aider'
-  },
-  'aider-general': {
-    prefix: 'GENERAL',
-    autoAccept: true,
-    ralphMode: true,
-    backend: 'aider'
-  },
-  'aider-colonel': {
-    prefix: 'COLONEL',
-    autoAccept: true,
-    ralphMode: true,
-    backend: 'aider'
-  }
+  research: { prefix: 'RESEARCH', autoAccept: true, ralphMode: true, model: 'claude-opus-4-8' },
+  impl:     { prefix: 'IMPL',     autoAccept: true, ralphMode: true, model: 'claude-opus-4-8' },
+  test:     { prefix: 'TEST',     autoAccept: true, ralphMode: true, model: 'claude-opus-4-8' },
+  review:   { prefix: 'REVIEW',   autoAccept: true, ralphMode: true, model: 'claude-opus-4-8' },
+  fix:      { prefix: 'FIX',      autoAccept: true, ralphMode: true, model: 'claude-opus-4-8' },
+  general:  { prefix: 'GENERAL',  autoAccept: true, ralphMode: true, forcedAutonomy: true, model: 'claude-opus-4-8' },
+  colonel:  { prefix: 'COLONEL',  autoAccept: true, ralphMode: true, model: 'claude-opus-4-8' },
+  captain:  { prefix: 'CAPTAIN',  autoAccept: true, ralphMode: true, model: 'claude-opus-4-8' }
 };
 
 // =============================================
@@ -345,19 +232,31 @@ export function createWorkerRoutes(theaRoot, io) {
   const router = express.Router();
 
   // GET /api/workers - List all workers
-  // Query params: ?status=running, ?project=strategos, ?fields=id,label,status,ralphProgress
+  // Query params: ?status=running, ?ralphStatus=in_progress, ?project=strategos,
+  //               ?label=IMPL (substring, case-insensitive), ?fields=id,label,status,ralphProgress
   router.get('/', (req, res) => {
     try {
       let workers = getWorkers();
 
-      // Filter by status
+      // Filter by status (exact match)
       if (req.query.status) {
         workers = workers.filter(w => w.status === req.query.status);
       }
 
-      // Filter by project
+      // Filter by ralphStatus (exact match: pending, in_progress, done, blocked, held)
+      if (req.query.ralphStatus) {
+        workers = workers.filter(w => w.ralphStatus === req.query.ralphStatus);
+      }
+
+      // Filter by project (exact match)
       if (req.query.project) {
         workers = workers.filter(w => w.project === req.query.project);
+      }
+
+      // Filter by label substring (case-insensitive)
+      if (req.query.label) {
+        const needle = req.query.label.toLowerCase();
+        workers = workers.filter(w => typeof w.label === 'string' && w.label.toLowerCase().includes(needle));
       }
 
       // Select specific fields
@@ -497,6 +396,40 @@ export function createWorkerRoutes(theaRoot, io) {
     }
   });
 
+  /**
+   * GET /api/workers/drift-events
+   * Returns drift event counts by type and worker type since a given timestamp.
+   *
+   * Query params:
+   *   since      - ISO timestamp (default: last 30 days)
+   *   workerId   - filter to a specific worker (optional)
+   */
+  router.get('/drift-events', (req, res) => {
+    try {
+      const { since, workerId } = req.query;
+
+      // Validate since param if provided
+      if (since !== undefined) {
+        if (typeof since !== 'string' || since.length > 50 || isNaN(Date.parse(since))) {
+          return res.status(400).json({ error: 'since must be a valid ISO timestamp' });
+        }
+      }
+
+      if (workerId !== undefined) {
+        if (!VALID_WORKER_ID.test(workerId)) {
+          return res.status(400).json({ error: 'Invalid workerId format' });
+        }
+        const events = getDriftEvents(workerId);
+        return res.json({ workerId, events });
+      }
+
+      const summary = getDriftEventsSummary(since || null);
+      res.json(summary);
+    } catch (error) {
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
+    }
+  });
+
   // GET /api/workers/:id - Get single worker
   router.get('/:id', (req, res) => {
     try {
@@ -530,6 +463,94 @@ export function createWorkerRoutes(theaRoot, io) {
       res.type('text/plain').send(`${status} ${health} ${progress} ${step}`);
     } catch (error) {
       res.status(500).type('text/plain').send('error');
+    }
+  });
+
+  // POST /api/workers/:id/reinject-context - Return fresh program.md and sibling learnings
+  router.post('/:id/reinject-context', async (req, res) => {
+    try {
+      const worker = getWorker(req.params.id);
+      if (!worker) {
+        return res.status(404).json({ error: 'Resource not found' });
+      }
+      const { getProgramDoc } = await import('../services/programDocService.js');
+      const nodePath = await import('node:path');
+      const programDoc = getProgramDoc(nodePath.default.join(theaRoot, worker.workingDir));
+      const { workers } = await import('../workers/state.js');
+      const allWorkers = Array.from(workers.values());
+      const sibs = allWorkers
+        .filter(w => w.parentWorkerId === worker.parentWorkerId && w.id !== worker.id && w.ralphStatus === 'done')
+        .slice(-5)
+        .map(w => ({ id: w.id, label: w.label, learnings: w.ralphLearnings }));
+      res.set('Cache-Control', 'no-store');
+      res.json({ programDoc: programDoc || null, siblingLearnings: sibs, generated: new Date().toISOString() });
+    } catch (error) {
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
+    }
+  });
+
+  // POST /api/workers/:id/refresh-ralph-token - Generate new Ralph token for token-diverged workers
+  router.post('/:id/refresh-ralph-token', async (req, res) => {
+    try {
+      const { id } = req.params;
+      if (!VALID_WORKER_ID.test(id)) {
+        return res.status(400).json({ error: 'Invalid workerId format' });
+      }
+
+      const worker = getWorkerInternal(id);
+      if (!worker) {
+        return res.status(404).json({ error: 'Resource not found' });
+      }
+      if (!worker.ralphMode) {
+        return res.status(400).json({ error: 'Worker does not have ralphMode enabled' });
+      }
+
+      const callerId = req.headers['x-caller-worker-id'];
+      if (!callerId || typeof callerId !== 'string' || !VALID_WORKER_ID.test(callerId)) {
+        return res.status(403).json({ error: 'X-Caller-Worker-Id header is required and must be a valid worker ID' });
+      }
+      const callerWorker = getWorker(callerId);
+      if (!callerWorker) {
+        return res.status(403).json({ error: 'Caller worker not found in worker store' });
+      }
+      const isSelf = callerId === id;
+      const isParent = callerId === worker.parentWorkerId;
+      const isChild = (worker.childWorkerIds || []).includes(callerId);
+      if (!isSelf && !isParent && !isChild) {
+        return res.status(403).json({ error: 'Caller is not a direct relative of the target worker' });
+      }
+
+      const oldToken = worker.ralphToken;
+      const newToken = crypto.randomBytes(16).toString('hex');
+
+      await writeStrategosContext(id, worker.label, worker.workingDir, newToken, {
+        parentWorkerId: worker.parentWorkerId,
+        parentLabel: worker.parentLabel,
+        bulldozeMode: worker.bulldozeMode || false,
+        forcedAutonomy: worker.forcedAutonomy || false,
+        injectProjectContext: worker.injectProjectContext || false
+      });
+
+      workers.get(id).ralphToken = newToken;
+      await saveWorkerStateImmediate();
+
+      const ralphService = req.app.locals.ralphService;
+      if (ralphService) {
+        if (oldToken) ralphService.unregisterStandaloneWorker(oldToken);
+        ralphService.registerStandaloneWorker(newToken, id);
+      }
+
+      const signalUrl = `${STRATEGOS_API}/api/ralph/signal/by-worker/${id}`;
+      const newSignalMsg = `[system:token-refresh] Your Ralph token has been refreshed. New token: ${newToken}\nNew signal URL: ${signalUrl}\nNew curl command:\ncurl -s -X POST ${signalUrl} -H "Content-Type: application/json" -H "X-Ralph-Token: ${newToken}" -d '{"status":"in_progress","progress":50,"currentStep":"resuming after token refresh"}'`;
+      try {
+        await sendInputDirect(id, newSignalMsg, 'system:token-refresh');
+      } catch (_err) {
+        // best-effort — non-fatal if worker session is unreachable
+      }
+
+      return res.json({ success: true, workerId: id, newToken, signalUrl });
+    } catch (error) {
+      res.status(500).json({ error: sanitizeErrorMessage(error) });
     }
   });
 
@@ -585,14 +606,10 @@ export function createWorkerRoutes(theaRoot, io) {
         return res.status(400).json({ error: 'Project path does not exist' });
       }
 
-      // Validate dependsOn array
-      if (dependsOn !== undefined) {
-        if (!Array.isArray(dependsOn) || dependsOn.length > 50) {
-          return res.status(400).json({ error: 'dependsOn must be an array with at most 50 entries' });
-        }
-        if (!dependsOn.every(id => typeof id === 'string' && VALID_WORKER_ID.test(id))) {
-          return res.status(400).json({ error: 'dependsOn entries must be valid worker IDs' });
-        }
+      // Validate dependsOn array (shared helper — unified on VALID_WORKER_ID)
+      const depCheck = validateDependsOn(dependsOn);
+      if (!depCheck.ok) {
+        return res.status(400).json({ error: depCheck.error });
       }
 
       // Validate pass-through spawn fields (defense-in-depth: strip invalid, don't reject)
@@ -639,42 +656,25 @@ export function createWorkerRoutes(theaRoot, io) {
         }
         return undefined;
       })();
-      const validWorkflowId = (workflowId !== undefined && workflowId !== null) ?
-        (typeof workflowId === 'string' && workflowId.length <= 100 && VALID_SIMPLE_ID.test(workflowId) ? workflowId : undefined) : undefined;
-      const validTaskId = (taskId !== undefined && taskId !== null) ?
-        (typeof taskId === 'string' && taskId.length <= 100 && VALID_SIMPLE_ID.test(taskId) ? taskId : undefined) : undefined;
-      const validParentWorkerId = (parentWorkerId !== undefined && parentWorkerId !== null) ?
-        (typeof parentWorkerId === 'string' && VALID_WORKER_ID.test(parentWorkerId) ? parentWorkerId : undefined) : undefined;
-      const validParentLabel = (parentLabel !== undefined && parentLabel !== null) ?
-        (typeof parentLabel === 'string' && parentLabel.length <= MAX_LABEL_LENGTH && !CONTROL_CHAR_RE.test(parentLabel) ? parentLabel : undefined) : undefined;
-      // Validate onComplete: type must be one of the known action types,
-      // and total JSON size capped to prevent memory abuse via deeply nested config
-      const VALID_ONCOMPLETE_TYPES = ['spawn', 'webhook', 'emit'];
-      const MAX_ONCOMPLETE_SIZE = 10000; // 10KB
-      const validOnComplete = (() => {
-        if (onComplete === undefined || onComplete === null) return undefined;
-        if (typeof onComplete !== 'object' || Array.isArray(onComplete)) return undefined;
-        if (typeof onComplete.type !== 'string' || !VALID_ONCOMPLETE_TYPES.includes(onComplete.type)) return undefined;
-        try {
-          if (JSON.stringify(onComplete).length > MAX_ONCOMPLETE_SIZE) return undefined;
-        } catch { return undefined; }
-        return { type: onComplete.type, config: onComplete.config || {} };
-      })();
+      // Shared spawn sub-field validation (onComplete + id pass-through fields)
+      const shared = validateSpawnInput(req.body);
+      const validParentWorkerId = shared.parentWorkerId;
 
-      // Spawn with optional dependency and context options
-      const options = {};
-      if (dependsOn) options.dependsOn = dependsOn;
-      if (validOnComplete) options.onComplete = validOnComplete;
-      if (validWorkflowId) options.workflowId = validWorkflowId;
-      if (validTaskId) options.taskId = validTaskId;
-      // Context passing options
-      if (validTask) options.task = validTask;
-      if (validParentWorkerId) options.parentWorkerId = validParentWorkerId;
-      if (validParentLabel) options.parentLabel = validParentLabel;
-      if (initialInput) options.initialInput = initialInput;
-      // Default autoAccept and ralphMode to TRUE for all spawns
-      options.autoAccept = autoAccept !== false; // true unless explicitly false
-      options.ralphMode = ralphMode !== false;   // true unless explicitly false
+      // Spawn with optional dependency and context options. The common
+      // option-assembly block is shared via buildSpawnOptions; the
+      // backend/model/allowDuplicate/effortLevel bits are REST-specific.
+      const options = buildSpawnOptions({
+        dependsOn,
+        onComplete: shared.onComplete,
+        workflowId: shared.workflowId,
+        taskId: shared.taskId,
+        task: validTask,
+        parentWorkerId: validParentWorkerId,
+        parentLabel: shared.parentLabel,
+        initialInput,
+        autoAccept,
+        ralphMode,
+      });
       // Backend selection: explicit > parent inheritance > 'claude' default
       if (backend === 'gemini' || backend === 'aider') {
         options.backend = backend;
@@ -694,7 +694,7 @@ export function createWorkerRoutes(theaRoot, io) {
       // Duplicate detection is ON by default — callers must opt-in to duplicates
       options.allowDuplicate = allowDuplicate === true;
       // Effort level override (validated; type-based default applied in lifecycle.js)
-      const validEfforts = ['low', 'medium', 'high'];
+      const validEfforts = ['low', 'medium', 'high', 'max'];
       if (effortLevel !== undefined) {
         if (validEfforts.includes(effortLevel)) {
           options.effortLevel = effortLevel;
@@ -717,7 +717,7 @@ export function createWorkerRoutes(theaRoot, io) {
       const response = normalizeWorker(worker);
       if (!parentWorkerId) {
         response._warning = 'No parentWorkerId provided. Include parentWorkerId from your project instructions to enable parent-child tracking.';
-        console.warn(`[SPAWN] Worker ${worker.id} spawned without parentWorkerId - parent-child tracking disabled`);
+        logger.warn('Worker spawned without parentWorkerId — parent-child tracking disabled', { workerId: worker.id });
       }
 
       res.status(201).json(response);
@@ -736,10 +736,11 @@ export function createWorkerRoutes(theaRoot, io) {
    *   - projectPath: string (optional) - Defaults to parent's project or theaRoot
    *   - task: string | object (required) - Task description or full task object
    *   - parentWorkerId: string (optional) - Parent worker ID
+   *   - injectProjectContext: true|false|"auto" — inject .thea/program.md into worker context. Defaults to "auto" (smart defaults by role).
    */
   router.post('/spawn-from-template', async (req, res) => {
     try {
-      const { template: templateField, role, label, projectPath, task, parentWorkerId, allowDuplicate, model, effortLevel } = req.body;
+      const { template: templateField, role, label, projectPath, task, parentWorkerId, allowDuplicate, model, effortLevel, injectProjectContext } = req.body;
 
       // Accept 'role' as alias for 'template'
       const template = templateField || role;
@@ -875,6 +876,20 @@ export function createWorkerRoutes(theaRoot, io) {
         return res.status(400).json({ error: 'Invalid project path' });
       }
 
+      // L2 deny-list check: reject spawn if projectPath matches any denied entry
+      if (isPathDenied(resolvedPath, theaRoot)) {
+        try {
+          logDenyEvent({
+            workerId: parentWorkerId || 'unknown',
+            workerLabel: label || 'unknown',
+            attemptedPath: resolvedPath,
+            denyPattern: null,
+            layer: 'L2'
+          });
+        } catch { /* audit log failure must not block error response */ }
+        return res.status(403).json({ error: `Spawn denied: projectPath '${resolvedPath}' matches deny list` });
+      }
+
       // Construct full label with prefix — strip prefix from label if already present
       const prefixUpper = tmpl.prefix.toUpperCase() + ':';
       const cleanLabel = label.toUpperCase().startsWith(prefixUpper)
@@ -905,9 +920,19 @@ export function createWorkerRoutes(theaRoot, io) {
       // Backend priority: template explicit > parent inheritance > 'claude' default
       const resolvedBackend = tmpl.backend || (parent?.backend && parent.backend !== 'claude' ? parent.backend : 'claude');
       // Validate effortLevel if provided
-      const validEfforts = ['low', 'medium', 'high'];
+      const validEfforts = ['low', 'medium', 'high', 'max'];
       if (effortLevel !== undefined && !validEfforts.includes(effortLevel)) {
         return res.status(400).json({ error: `effortLevel must be one of: ${validEfforts.join(', ')}` });
+      }
+
+      // Coerce string forms of injectProjectContext sent by API callers that don't pre-coerce
+      let injectProjectContextCoerced = typeof injectProjectContext === 'string' ? injectProjectContext.toLowerCase() : injectProjectContext;
+      if (injectProjectContextCoerced === 'true') injectProjectContextCoerced = true;
+      else if (injectProjectContextCoerced === 'false') injectProjectContextCoerced = false;
+
+      // Validate injectProjectContext if provided
+      if (injectProjectContextCoerced !== undefined && injectProjectContextCoerced !== true && injectProjectContextCoerced !== false && injectProjectContextCoerced !== 'auto') {
+        return res.status(400).json({ error: 'injectProjectContext must be true, false, or "auto"' });
       }
 
       // Parse autoRespawn option — GENERAL workers default to true for respawn resilience
@@ -925,6 +950,7 @@ export function createWorkerRoutes(theaRoot, io) {
           autoAccept: tmpl.autoAccept,
           forcedAutonomy: !!(req.body.forcedAutonomy || tmpl.forcedAutonomy),
           bulldozeMode: !!req.body.bulldozeMode,
+          model: model || tmpl.model || null,
         };
       }
 
@@ -940,6 +966,7 @@ export function createWorkerRoutes(theaRoot, io) {
         effortLevel: effortLevel || null,
         autoRespawn: autoRespawnEnabled,
         autoRespawnConfig,
+        injectProjectContext: injectProjectContextCoerced !== undefined ? injectProjectContextCoerced : 'auto',
       };
 
       const worker = await spawnWorker(resolvedPath, fullLabel, io, options);
@@ -973,7 +1000,7 @@ export function createWorkerRoutes(theaRoot, io) {
       const response = normalizeWorker(worker);
       if (!parentWorkerId) {
         response._warning = 'No parentWorkerId provided. Include parentWorkerId from your project instructions to enable parent-child tracking.';
-        console.warn(`[SPAWN] Worker ${worker.id} spawned without parentWorkerId - parent-child tracking disabled`);
+        logger.warn('Worker spawned without parentWorkerId — parent-child tracking disabled', { workerId: worker.id });
       }
 
       // Include task quality data in spawn response
@@ -984,6 +1011,13 @@ export function createWorkerRoutes(theaRoot, io) {
 
       res.status(201).json(response);
     } catch (error) {
+      if (error.code === 'MAX_WORKERS_EXCEEDED') {
+        return res.status(503).json({
+          error: 'max_workers_exceeded',
+          limit: error.limit,
+          active: error.active
+        });
+      }
       res.status(500).json({ error: sanitizeErrorMessage(error) });
     }
   });
@@ -999,16 +1033,17 @@ export function createWorkerRoutes(theaRoot, io) {
       }
       const force = req.query.force === 'true' || req.body?.force === true;
       const callerWorkerId = req.query.callerWorkerId || req.body?.callerWorkerId || null;
-      await killWorker(req.params.id, io, { force, callerWorkerId });
+      // API DELETE is always an intentional kill — suppress auto-respawn regardless of force flag
+      await killWorker(req.params.id, io, { force, callerWorkerId, suppressRespawn: true });
       res.json({ success: true });
     } catch (error) {
       if (error.message.includes('not found')) {
         return res.status(404).json({ error: 'Resource not found' });
       }
-      if (error.message.includes('Cannot kill GENERAL-tier')) {
+      if (error.message.includes('without force flag')) {
         return res.status(403).json({
-          error: 'Cannot kill GENERAL-tier worker without force flag',
-          hint: 'Add ?force=true to confirm deletion of a GENERAL-tier worker'
+          error: error.message,
+          hint: 'Add ?force=true to confirm deletion of a GENERAL/COLONEL-tier worker'
         });
       }
       if (error.message.includes('cannot kill') || error.message.includes('Workers cannot kill themselves')) {
@@ -1140,15 +1175,18 @@ export function createWorkerRoutes(theaRoot, io) {
             ralphService.registerStandaloneWorker(worker.ralphToken, worker.id);
 
             // Send Ralph instructions to the worker
+            const signalUrl = `${STRATEGOS_API}/api/ralph/signal/by-worker/${worker.id}`;
             const instructions = `
 
 === RALPH MODE ENABLED ===
-When you complete your current task, signal completion by running:
+Signal in_progress (run within first 3 minutes):
+curl -s -X POST ${signalUrl} -H "Content-Type: application/json" -H "X-Ralph-Token: ${worker.ralphToken}" -d '{"status":"in_progress","progress":10,"currentStep":"starting task"}'
 
-curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Content-Type: application/json" -d '{"status":"done"}'
+Signal done (required before stopping):
+curl -s -X POST ${signalUrl} -H "Content-Type: application/json" -H "X-Ralph-Token: ${worker.ralphToken}" -d '{"status":"done","progress":100,"currentStep":"complete","learnings":"what I found/did"}'
 
-If blocked, signal:
-curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Content-Type: application/json" -d '{"status":"blocked","reason":"brief description"}'
+Signal blocked (if you cannot proceed):
+curl -s -X POST ${signalUrl} -H "Content-Type: application/json" -H "X-Ralph-Token: ${worker.ralphToken}" -d '{"status":"blocked","progress":50,"currentStep":"what I was doing","reason":"why blocked"}'
 ===========================
 
 `;
@@ -1205,11 +1243,22 @@ curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Co
         const sender = getWorker(fromWorkerId);
         const receiver = getWorker(req.params.id);
         if (sender && receiver && sender.project && receiver.project && sender.project !== receiver.project) {
-          console.warn(`[INPUT] Cross-project input blocked: worker ${fromWorkerId} (${sender.project}) tried to send input to worker ${req.params.id} (${receiver.project})`);
+          logger.warn('Cross-project input blocked', { event: 'security.cross_project_input_blocked', fromWorkerId, fromProject: sender.project, toWorkerId: req.params.id, toProject: receiver.project });
           return res.status(403).json({
             error: `Cross-project input blocked: sender project (${sender.project}) does not match receiver project (${receiver.project})`
           });
         }
+      }
+
+      // Context-less input guard: receiving workers may have lost context (autocompact, restart)
+      // and cannot infer the goal from bare procedural commands. Force senders to include
+      // the concrete sub-task and end state on every dispatch.
+      // Exception: X-Strategos-Force-Plain: true header bypasses this check for edge cases.
+      if (isContextLessInput(input) && req.headers['x-strategos-force-plain'] !== 'true') {
+        logger.warn('Context-less input rejected', { toWorkerId: req.params.id, fromWorkerId: fromWorkerId || null });
+        return res.status(400).json({
+          error: 'context-less input forbidden — include concrete task and end state. The receiving worker may have lost context and cannot infer the goal.',
+        });
       }
 
       await sendInput(req.params.id, input, null, { fromWorkerId, source: fromWorkerId ? `rest_api:worker:${fromWorkerId}` : 'rest_api' });

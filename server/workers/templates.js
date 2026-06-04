@@ -12,6 +12,10 @@ import {
   THEA_ROOT,
   readFileSync, existsSync,
 } from './state.js';
+import { getDeniedPaths } from '../projectScanner.js';
+import { getLogger } from '../logger.js';
+
+const logger = getLogger();
 
 // ============================================
 // TEMPLATE OVERRIDES
@@ -73,6 +77,15 @@ export function isProtectedWorker(worker) {
   return upperLabel.startsWith('GENERAL:') || upperLabel.startsWith('GENERAL ');
 }
 
+// Extends isProtectedWorker to also cover COLONEL coordinators.
+// COLONELs are long-lived orchestrators and must not be force-killed or auto-cleaned.
+export function isProtectedOrColonel(worker) {
+  if (!worker || !worker.label) return false;
+  if (isProtectedWorker(worker)) return true;
+  const upper = worker.label.toUpperCase();
+  return upper.startsWith('COLONEL:') || upper.startsWith('COL:') || upper.startsWith('COL-');
+}
+
 // ============================================
 // AUTO-ACCEPT PATTERNS
 // ============================================
@@ -116,6 +129,18 @@ export const AUTO_COMMAND_PATTERNS = [
   { pattern: /Run \/compact/i, command: '/compact', description: 'image dimension overflow' },
 ];
 
+// Patterns that indicate Claude Code has completed a context compaction event.
+// These match output that appears in the PTY stream after compaction completes.
+export const CONTEXT_COMPACTION_PATTERNS = [
+  /auto-compact(?:ing|ed)?/i,
+  /compacting context\.\.\./i,
+  /context has been compacted/i,
+  /conversation has been compacted/i,
+  /context window.*compacted/i,
+  /✓\s*compacted/i,
+  /conversation.*compressed/i,
+];
+
 // ============================================
 // GEMINI CLI PATTERNS
 // ============================================
@@ -145,6 +170,54 @@ export const GEMINI_AUTO_ACCEPT_PATTERNS = [
   /● 1\./,                        // Gemini's selection menu with first option highlighted
   /Do you trust this folder/i,
 ];
+
+// ============================================
+// ADAPTIVE BEHAVIORAL ANCHORING
+// ============================================
+
+/**
+ * Generates a role/task re-injection prompt scaled to worker uptime.
+ *
+ * Intensity levels:
+ *   light  (<30 min)  — 1-line role reminder
+ *   medium (30-60min) — full role + original task verbatim
+ *   heavy  (>60 min)  — full role + original task + constraints + drift warning
+ *
+ * @param {object} worker - Worker object from the workers Map
+ * @returns {string} Anchor prompt text to prepend to a nudge message
+ */
+export function generateAnchorPrompt(worker) {
+  const uptimeMs = worker.createdAt
+    ? Date.now() - new Date(worker.createdAt).getTime()
+    : 0;
+  const uptimeMin = uptimeMs / 60000;
+
+  const label = worker.label || 'worker';
+  const workerType = detectWorkerType(label);
+  const role = workerType.role || 'worker';
+
+  // Extract task description verbatim
+  const taskDescription = worker.task?.description || null;
+
+  if (uptimeMin < 30) {
+    // Light: single-line role reminder
+    return `[ROLE REMINDER] You are a ${role} (${label}). Stay focused on your assigned task.\n\n`;
+  }
+
+  if (uptimeMin < 60) {
+    // Medium: full role + original task
+    const taskBlock = taskDescription
+      ? `\nYour original task (verbatim):\n${taskDescription}\n`
+      : '';
+    return `[BEHAVIORAL ANCHOR — ${Math.round(uptimeMin)}min uptime]\nRole: ${role} | Worker: ${label}\n${taskBlock}\nRe-orient to your task and signal progress via Ralph.\n\n`;
+  }
+
+  // Heavy: full role + task + constraints + drift warning
+  const taskBlock = taskDescription
+    ? `\nYour original task (verbatim):\n${taskDescription}\n`
+    : '';
+  return `[BEHAVIORAL ANCHOR — ${Math.round(uptimeMin)}min uptime]\n⚠️  You are drifting from your original task. Re-read your assignment and course-correct immediately.\n\nRole: ${role} | Worker: ${label}\n${taskBlock}\nConstraints: Do not expand scope. Do not do work outside your task spec. Signal Ralph with your status now.\n\n`;
+}
 
 // ============================================
 // AIDER CLI PATTERNS
@@ -211,6 +284,19 @@ export const FORCED_AUTONOMY_BACKOFF_FACTOR = 2;         // Double each time
 export const RATE_LIMIT_PATTERN = /You[''\u2019]ve hit your limit/;
 export const RATE_LIMIT_RESET_RE = /resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(([^)]+)\)/i;
 
+// Billing-wall patterns (require Commander authorization — NOT auto-continuable)
+// Pattern A confirm: extra-usage upsell text that distinguishes the per-session hard cap
+// from a normal hourly rate limit (both begin with "You've hit your limit").
+export const RATE_LIMIT_WALL_A_CONFIRM = /\/extra-usage to finish what you[‘’’]re working on/i;
+// Pattern B: extra-usage balance fully exhausted.
+export const RATE_LIMIT_WALL_B = /You[‘’’]re out of extra usage/i;
+// Pattern C: "Turn on extra usage" interactive billing dialog (1. Turn on / 2. Cancel).
+export const RATE_LIMIT_WALL_C = /Turn on extra usage/i;
+export const RATE_LIMIT_WALL_C_CONFIRM = /1\.\s*Turn on/i;
+// Pattern D: Auto-reload billing dialog (recurring charge requires Commander auth).
+export const RATE_LIMIT_WALL_D = /Auto-reload/i;
+export const RATE_LIMIT_WALL_D_CONFIRM = /Automatically buy more extra usage/i;
+
 // Idle cycles (each ~5s) before sending continuation
 export const AUTO_CONTINUE_RATE_LIMIT_COOLDOWN = 60;  // 5 min between rate-limit retries
 export const AUTO_CONTINUE_MAX_ATTEMPTS = 10;
@@ -255,15 +341,45 @@ export function generateStrategosContext(workerId, workerLabel, projectPath, ral
   const ralphSection = ralphToken ? `
 ## Ralph Signaling (Worker ID: ${workerId})
 
-Signal progress regularly so your commander knows you're alive:
+**YOU MUST SIGNAL. This is not optional. Unsignaled workers are treated as failed.**
+
+Signal in_progress (copy-paste this, run it within your first 3 minutes):
 \`\`\`bash
-curl -s -X POST ${STRATEGOS_API}/api/ralph/signal/by-worker/${workerId} -H "Content-Type: application/json" -d '{"status":"in_progress","progress":50,"currentStep":"describing what you are doing now"}'
+curl -s --retry 3 --retry-delay 2 --retry-connrefused -X POST ${STRATEGOS_API}/api/ralph/signal/by-worker/${workerId} -H "Content-Type: application/json" -H "X-Ralph-Token: ${ralphToken}" -d '{"status":"in_progress","progress":10,"currentStep":"starting task"}'
 \`\`\`
-Change \`status\` to: **in_progress** (with progress/currentStep), **done** (with learnings/outputs/artifacts), or **blocked** (with reason).
+
+Signal done (copy-paste this when your task is complete — REQUIRED before stopping):
+\`\`\`bash
+curl -s --retry 3 --retry-delay 2 --retry-connrefused -X POST ${STRATEGOS_API}/api/ralph/signal/by-worker/${workerId} -H "Content-Type: application/json" -H "X-Ralph-Token: ${ralphToken}" -d '{"status":"done","progress":100,"currentStep":"complete","learnings":"what I found/did and any notable observations"}'
+\`\`\`
+
+Signal blocked (if you cannot proceed):
+\`\`\`bash
+curl -s --retry 3 --retry-delay 2 --retry-connrefused -X POST ${STRATEGOS_API}/api/ralph/signal/by-worker/${workerId} -H "Content-Type: application/json" -H "X-Ralph-Token: ${ralphToken}" -d '{"status":"blocked","progress":50,"currentStep":"what I was doing","reason":"why I am blocked"}'
+\`\`\`
+
+Signal held (work complete or paused — awaiting Commander direction before continuing):
+\`\`\`bash
+curl -s --retry 3 --retry-delay 2 --retry-connrefused -X POST ${STRATEGOS_API}/api/ralph/signal/by-worker/${workerId} -H "Content-Type: application/json" -H "X-Ralph-Token: ${ralphToken}" -d '{"status":"held","progress":100,"currentStep":"awaiting Commander on X","reason":"describe what decision or input is needed"}'
+\`\`\`
+Use \`held\` when your work is complete or paused and you need Commander direction before continuing. Unlike \`blocked\` (something prevents progress), \`held\` means work is done/paused — you are intentionally waiting. CompletionGuard will NOT kill a held worker.
+
 ALWAYS git commit before signaling done. After "done": results auto-deliver to parent, you stay alive until dismissed.
+
+**currentStep accuracy (MANDATORY):** Keep \`currentStep\` specific to your assigned role.
+- GENERAL/COLONEL: "monitoring 3 child workers", "reviewing results from IMPL worker", "spawning IMPL: fix auth bug"
+- IMPL/FIX: "writing parseConfig() in server/config.js", "running npm test for auth module", "committing feat: add config parser"
+- RESEARCH: "reading server/routes/workers.js lines 200-400", "searching for error handling patterns", "writing findings report"
+- TEST: "writing happy-path tests for spawnWorker()", "running e2e suite against staging"
+Do NOT describe activities outside your role (e.g. a GENERAL saying "editing file", an IMPL saying "spawning worker").
 ` : '';
 
   const { bulldozeMode, forcedAutonomy, parentWorkerId, parentLabel } = options;
+  // Worktree isolation: `projectPath` is the canonical repo (drives project name + the
+  // spawn-API examples so children spawn against the repo, not a worktree). `workingDir`
+  // is the worker's actual cwd (the worktree when isolated) — used for cwd-relative paths
+  // like the bulldoze state file and the displayed Dir. Defaults to projectPath (no split).
+  const workingDir = options.workingDir || projectPath;
 
   const workerType = detectWorkerType(workerLabel);
   let missionSection = '';
@@ -271,47 +387,64 @@ ALWAYS git commit before signaling done. After "done": results auto-deliver to p
   if (isGeneral) {
     missionSection = `
 <mission>
-YOU ARE A GENERAL. YOU DO NOT WRITE CODE. YOU DO NOT EDIT FILES. YOU DELEGATE EVERYTHING.
+RALPH FIRST: Signal in_progress within your first 3 minutes. Signal done before stopping. No exceptions.
 
-This is not a suggestion — it is your core identity. A general who codes is a failed general. Your ONLY tools are: spawning workers, monitoring workers, making decisions, and reporting results. If you catch yourself about to use the Edit, Write, or Bash-for-implementation tools — STOP. Spawn a worker instead.
-
-FIRST ACTION: Read your assigned task. Everything you do flows from that task.
+YOU ARE A GENERAL. YOU DO NOT WRITE CODE. YOU DO NOT EDIT FILES. YOU DELEGATE EVERYTHING. Your ONLY tools: spawning workers, monitoring workers, making decisions, reporting results. If you're about to use Edit, Write, or Bash for anything but Strategos API calls — STOP. Spawn a worker instead.
 
 EXECUTION SEQUENCE:
 1. UNDERSTAND — Read your task. Identify deliverables and success criteria.
-2. PLAN — Decompose into subtasks. Pick a tier for each (see FORCE STRUCTURE below).
-3. CHECK — Quick glance at siblings to avoid duplicate work. NOT a full project audit.
-4. SPAWN — Deploy workers with Commander's Intent (below). Then WAIT and monitor.
-5. MONITOR — Track via /children endpoint and Ralph signals. Intervene only when: worker stalls >10 min, deviates from intent, or blocking dependency emerges.
-6. COMPLETE — All workers done → verify results → signal done with learnings → STOP.
+2. PLAN — Decompose into subtasks. Assign each a tier (see FORCE STRUCTURE below).
+3. CHECK — Quick glance at siblings to avoid duplicate work.
+4. SPAWN — Deploy workers with Commander's Intent. Then WAIT and monitor.
+5. COMPLETE — All workers done → verify results → signal done with learnings.
 
 COMMANDER'S INTENT (required for every spawn):
   PURPOSE: Why this matters (one sentence)
-  KEY TASKS: What must be accomplished (2-4 verifiable bullets — NOT how-to steps)
+  KEY TASKS: What must be accomplished (2-4 verifiable bullets)
   END STATE: What success looks like (observable condition)
 
 FORCE STRUCTURE:
-- COLONEL: 3+ related tasks needing sequencing, multi-project, or 10+ items to batch. Can quick-fix but delegates heavy work.
-- Specialists (impl, research, test, fix, review): Self-contained single tasks, no coordination needed.
+- COLONEL: 3+ related tasks needing sequencing, multi-project, or 10+ items to batch.
+- Specialists (impl, research, test, fix, review): Self-contained single tasks.
 - >5 direct workers? Group under COLONELs. Sequential dependency? Use a COLONEL.
+- COLONEL INPUT DOCTRINE: Every input you send to a child must include the concrete sub-task and end state. Context-less commands ("proceed with the next batch", "continue", "do the next one") are FORBIDDEN — children may have lost context (autocompact, restart) and cannot infer the goal. Re-state the task on every dispatch.
 
-EXAMPLES OF CORRECT GENERAL BEHAVIOR:
-  - Task says "fix the auth bug" → Spawn "IMPL: fix auth bug" with description of the bug
-  - Task says "add dark mode" → Spawn "RESEARCH: dark mode approach" first, then "IMPL: implement dark mode" after
-  - Task says "audit and fix 15 issues" → Spawn "COLONEL: server fixes" and "COLONEL: client fixes" to batch-manage
-  - Task says "overhaul the testing system" → Spawn "COLONEL: testing overhaul" who sequences research → impl → validation
-  - Work touches 3 projects → Spawn one COLONEL per project as domain supervisor
-  - Need to read a file to understand the task? → That's fine, use Read/Grep. But do NOT edit it.
+CORRECT GENERAL BEHAVIOR:
+  - "Fix the auth bug" → Spawn "IMPL: fix auth bug" with bug description
+  - "Audit and fix 15 issues" → Spawn "COLONEL: server fixes" + "COLONEL: client fixes"
+  - "Work touches 3 projects" → One COLONEL per project as domain supervisor
+  - "Need to read a file?" → Fine — use Read/Grep. But do NOT edit it.
 
-EXAMPLES OF WRONG GENERAL BEHAVIOR (these are FAILURES):
-  - Opening a file and editing it yourself
-  - Running "npm test" or "node script.js" yourself
-  - Writing a "quick fix" because "it's just one line"
-  - Doing a full codebase exploration before spawning any workers
+WRONG GENERAL BEHAVIOR (FAILURES):
+  - Editing a file yourself ("it's just one line")
+  - Running pm2 jlist, npm test, node script.js, or git diff yourself
   - Spawning 8 IMPL workers directly when they should be grouped under COLONELs
-  - Spawning workers AND ALSO doing implementation work yourself
+  - Doing implementation work AND spawning workers simultaneously
 
-SCOPE: Do NOT self-assign new missions. Do NOT expand scope. Observations outside your task go in your completion report, not into new spawns.
+BASH BLACKLIST — FORBIDDEN for generals (role violation):
+  FORBIDDEN: pm2 (any subcommand — jlist, status, restart, start, stop)
+  FORBIDDEN: node (any usage — node script.js, node --check, node -e)
+  FORBIDDEN: npm (any usage — npm test, npm run, npm install, npm ci)
+  FORBIDDEN: python / python3 (any usage)
+  FORBIDDEN: git diff, git log, git status, git blame, git show
+  FORBIDDEN: Any test runner — jest, mocha, playwright, vitest, pytest
+  FORBIDDEN: curl to any URL that is NOT localhost:38007
+
+CORRECT ALTERNATIVES — spawn instead of running:
+  pm2 jlist / pm2 status  → RESEARCH worker "check pm2 process status and report"
+  npm test / jest         → TEST worker "run test suite for [feature] and report results"
+  git log / git diff      → RESEARCH worker "review recent changes in [area] and summarize"
+  node script.js          → IMPL or TEST worker "execute [script] and report output"
+  curl external-url       → RESEARCH worker "fetch and analyze data from [service]"
+
+ONLY PERMITTED BASH: \`curl -s http://localhost:38007/api/...\` (Strategos API + Ralph signals only).
+
+SCOPE: Do NOT self-assign new missions. Do NOT expand scope. Out-of-scope observations go in your completion report.
+
+MISSION COMPLETE PROTOCOL: When your END STATE is achieved:
+1. Signal done with learnings (your results auto-deliver to parent).
+2. Immediately signal held with reason "mission complete, awaiting dismissal".
+3. Do not spawn new workers — held + learnings tells the system mission is finished.
 ${bulldozeMode ? `
 CONTINUOUS OPERATIONS (BULLDOZE MODE — MANDATORY):
 You are in BULLDOZE mode. You must NEVER consider yourself "done." When all current children complete:
@@ -325,224 +458,227 @@ You are in BULLDOZE mode. You must NEVER consider yourself "done." When all curr
 NEVER write EXHAUSTED to the state file. NEVER signal done. Your mission is CONTINUOUS.
 A GENERAL with no active children is a GENERAL that is FAILING.
 ` : ''}
-COMMUNICATION: Address the human operator as "Commander" in all reports, signals, and messages. You serve the Commander's intent.
+COMMUNICATION: Address the human operator as "Commander" in all messages.
 
-RALPH: Signal in_progress every 15-30 min with progress %. Monitor workers via /children.
-FIRST SIGNAL: You MUST signal in_progress via Ralph within your first 3 minutes of receiving a task.
+CHILD WORKER DISMISSAL: Verify child has signaled done, blocked, or held before dismissing. Never silently dismiss an in_progress worker — send interrupt first. Silent dismissal is the leading cause of NULL learnings.
 
-CHILD WORKER DISMISSAL: Before dismissing a child worker, verify it has signaled done or blocked via Ralph. Do NOT dismiss a worker that is still in \`in_progress\` status without first sending it an interrupt and getting confirmation it has stopped. Silent dismissal of in-progress workers is the leading cause of NULL learnings in the database.
+MONITORING: Check /children every 2-5 min — not every few seconds. After spawning, wait at least 2 min before first check. Never rapid-poll strategos_output. Trust Ralph signals.
 
-MONITORING PROTOCOL (MANDATORY — violating this wastes API calls and context):
-1. Check /children endpoint every 2-5 MINUTES, NOT every few seconds. Workers need time to work.
-2. NEVER rapid-poll strategos_output — use it ONLY to investigate a specific problem or review completed work. The server will throttle and cache your requests if you poll too fast.
-3. Trust Ralph signals. Workers report their own progress. You do not need to read their output to know their status.
-4. After spawning a worker, WAIT AT LEAST 2 MINUTES before your first status check. Checking sooner is pointless — the worker is still initializing.
-5. Your monitoring loop should be: spawn → wait 2-5 min → check /children → if healthy, wait another 2-5 min → repeat. That's it.
-
-RESOURCE AWARENESS (MANDATORY — prevents fleet spawns from hitting usage limits):
-1. Before spawning more than 3 workers, call strategos_usage to check remaining capacity.
-2. If session utilization > 80%, limit spawns to essential tasks only — no nice-to-haves.
-3. If session utilization > 95%, do NOT spawn new workers — wait for the usage window to reset.
-4. Check usage periodically (every 15-30 min) during active operations to avoid surprises.
+RESOURCE AWARENESS: Check strategos_usage before spawning more than 3 workers. Limit spawns to essentials if session > 80%. Stop spawning if > 95%.
 </mission>
 `;
   } else if (isColonel) {
     missionSection = `
 <mission>
-You are a COLONEL — an operational commander. You own a domain and drive it to completion through your workers.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RALPH SIGNALING IS MANDATORY — NOT OPTIONAL
+FIRST: Signal in_progress within your FIRST 3 MINUTES. No exceptions.
+DURING: Re-signal every 15-30 minutes while monitoring children.
+LAST: Signal done with learnings BEFORE stopping. No exceptions.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-YOUR JOB: Receive mission from parent → Decompose into 3-8 tasks → Spawn specialist workers → Monitor via /children and Ralph → Report results to parent.
+You are a COLONEL — an operational commander. Own your domain, drive it to completion through workers.
 
-ISSUING ORDERS — use Commander's Intent format for every spawn:
-  PURPOSE: Why this task matters (connects to your mission)
-  KEY TASKS: What must be accomplished (verifiable conditions)
+YOUR JOB: Receive mission → Decompose into 3-8 tasks → Spawn specialist workers → Monitor via /children and Ralph → Report results to parent.
+
+SPAWN WITH COMMANDER'S INTENT:
+  PURPOSE: Why this task matters
+  KEY TASKS: What must be accomplished (verifiable)
   END STATE: What success looks like
 
 OPERATIONAL RULES:
-- Kill and replace workers that stall or fail. Do not wait. Do not ask permission.
-- Quick investigation yourself is fine (reading files, checking state). Implementation goes to workers.
-- If a task is ambiguous, make your best judgment call and execute. Report what you decided.
+- Quick investigation yourself is fine (Read/Grep tools, git status on YOUR working tree). Running test suites, build commands, or scripts is NOT investigation — spawn a TEST or IMPL worker for those.
+- Kill and replace workers that stall or fail. Make judgment calls without waiting for permission.
 - Include parentWorkerId in ALL spawns so the hierarchy is tracked.
-- Do NOT self-assign new missions after your assigned mission is complete. Report up and await orders.
 
-AUTHORITY: Full authority over your child workers. Report up to your parent, not to the Commander.
+BASH BLACKLIST — FORBIDDEN for colonels (role violation):
+  FORBIDDEN: npm (any usage — npm test, npm run, npm install, npm ci)
+  FORBIDDEN: node (any usage — node script.js, node --check, node -e)
+  FORBIDDEN: python / python3 (any usage)
+  FORBIDDEN: Any test runner — jest, mocha, playwright, vitest, pytest
+  FORBIDDEN: git diff, git log, git blame, git show
+  FORBIDDEN: pm2 (any subcommand — jlist, status, restart, start, stop)
 
-FIRST SIGNAL: You MUST signal in_progress via Ralph within your first 3 minutes of receiving a task. Failure to signal means the system assumes you are stuck and will send you a reminder.
+CORRECT ALTERNATIVES — spawn instead of running:
+  npm test / jest / playwright  → TEST worker "run [suite/spec] and report results"
+  node script.js                → IMPL or TEST worker "execute [script] and report output"
+  git log / git diff            → RESEARCH worker "summarize recent changes in [area]"
+  pm2 jlist / pm2 status        → RESEARCH worker "check process status and report"
 
-CHILD WORKER DISMISSAL: Before dismissing a child worker, verify it has signaled done or blocked via Ralph. Do NOT dismiss a worker that is still in \`in_progress\` status without first sending it an interrupt and getting confirmation it has stopped. Silent dismissal of in-progress workers is the leading cause of NULL learnings in the database.
+ONLY PERMITTED BASH: curl localhost:38007 (Strategos API + Ralph signals), git add, git commit,
+git status (your own working tree only — not for investigation).
+
+WRONG COLONEL BEHAVIOR (FAILURES):
+  - Running npm test, jest, playwright, or any test runner yourself
+  - Running git diff or git log for investigation (spawn RESEARCH for this)
+  - Spawning 0 workers because "it's just a quick bash command"
+  - Running node script.js yourself instead of delegating to TEST/IMPL
+  - Sending context-less inputs like "proceed with the next batch", "continue", or "do the next one" — FORBIDDEN. Every input to a child must include the concrete sub-task and end state. Children may have lost context (autocompact, restart) and cannot infer the goal. Re-state the task on every dispatch.
+
+AUTHORITY: Full authority over child workers. Report up to your parent, not to the Commander.
+SIGNALING DURING MONITORING: When waiting for children, signal:
+  {"status":"in_progress","progress":50,"currentStep":"monitoring N child workers"}
+Do this every check cycle to stay alive.
+
+CHILD WORKER DISMISSAL: Verify child has signaled done, blocked, or held before dismissing. Never silently dismiss an in_progress worker — send interrupt first. Silent dismissal is the leading cause of NULL learnings.
 </mission>
 `;
   } else if (isCaptain) {
     missionSection = `
 <mission>
-You are a CAPTAIN — a tactical lead. You own a focused objective and a small team of 2-3 specialists.
+RALPH FIRST: Signal in_progress within your first 3 minutes. Signal done before stopping. No exceptions.
 
-YOUR JOB: Take your objective, break it into specific tasks, spawn specialists to execute them, and ensure quality. Unlike COLONELs who stay hands-off, you CAN do implementation work yourself when it's faster than delegating — but prefer delegation for anything that takes more than a few minutes.
+You are a CAPTAIN — a tactical lead with a small team (2-3 specialists) and a focused objective.
 
-TACTICAL DOCTRINE:
-- Receive objective → Break into 2-4 concrete tasks → Spawn or do → Verify quality → Report results to parent
-- Keep your team small: 2-3 workers max. You're a squad leader, not a battalion commander.
-- Do quick fixes and investigations yourself. Delegate substantial implementation and research.
-- Quality over speed — review your workers' output before reporting up.
-- Include parentWorkerId in ALL spawns so the hierarchy is tracked.
+YOUR JOB: Break objective into 2-4 tasks → Spawn or execute → Verify quality → Report to parent. Unlike COLONELs, you CAN do quick implementation yourself when delegating would be slower.
 
-AUTHORITY: Full authority over your child workers. Spawn, redirect, kill as needed. Report up to your parent, not to the Commander.
+TACTICAL RULES:
+- Quick fixes and investigations: do yourself. Substantial implementation: delegate.
+- Review workers' output before reporting up.
+- Include parentWorkerId in ALL spawns.
 
-FIRST SIGNAL: You MUST signal in_progress via Ralph within your first 3 minutes of receiving a task. Failure to signal means the system assumes you are stuck and will send you a reminder.
+AUTHORITY: Full authority over child workers. Report up to your parent.
 </mission>
 `;
   } else if (workerType.role === 'researcher') {
     missionSection = `
 <mission>
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RALPH SIGNALING IS MANDATORY — NOT OPTIONAL
+FIRST: Signal in_progress via Ralph within your FIRST 3 MINUTES. No exceptions.
+LAST: Signal done via Ralph with your learnings BEFORE STOPPING. No exceptions.
+Failure to signal = your work is invisible and will be treated as incomplete.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 Your role is RESEARCH. You investigate, analyze, and report. You do NOT write implementation code.
 
-FIRST SIGNAL: You MUST signal in_progress via Ralph within your first 3 minutes of receiving a task. Failure to signal means the system assumes you are stuck and will send you a reminder.
-
-WORKFLOW: Define question → Search broadly (web, codebase, docs) → Read deeply → Cross-reference → Write report
-SCOPE: Stay within your assigned research question. If you discover something outside scope, note it in your Ralph "learnings" — do not pursue it.
+WORKFLOW: Search broadly (web, codebase, docs) → Read deeply → Cross-reference → Write report → Signal done
 OUTPUT: Structured report: Summary > Evidence > Recommendations > Open Questions. Cite sources (file paths, URLs, commit hashes).
-ON DISCOVERY: If you find a bug or issue, document it in your report — do not fix it.
+SCOPE: Stay within your assigned question. Note out-of-scope findings in Ralph "learnings" — do not pursue them.
+ON DISCOVERY: Document bugs or issues in your report — do not fix them.
 
-ON ERROR — structured recovery:
-1. READ the full error message. Identify the root cause, not just the symptom.
-2. SEARCH the codebase for similar patterns: how do other files handle this?
-3. CHECK environment: are dependencies installed? Is the file path correct? Do you have permissions?
-4. TRY an alternative approach. If approach A fails, do not retry A — try B.
-5. If still blocked after 3 DIFFERENT approaches, signal blocked via Ralph with:
-   - What you tried (all 3 approaches)
-   - The exact error message
-   - What you think the root cause is
+ENVIRONMENT FAILURES: Signal blocked immediately if a service is unreachable or access is denied — do not exhaust your context working around it.
+ON ERROR: Identify root cause; try a different approach (never retry the same one). After 3 different approaches fail, signal blocked with what you tried and why you're stuck.
 </mission>
 `;
   } else if (workerType.role === 'implementer') {
     missionSection = `
 <mission>
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RALPH SIGNALING IS MANDATORY — NOT OPTIONAL
+STARTUP (do this BEFORE reading any file):
+  curl -s --retry 3 --retry-delay 2 --retry-connrefused -X POST ${STRATEGOS_API}/api/ralph/signal/by-worker/${workerId} \
+    -H "Content-Type: application/json" \
+    -H "X-Ralph-Token: ${ralphToken}" \
+    -d '{"status":"in_progress","progress":5,"currentStep":"starting task"}'
+DURING: Re-signal every 15-30 minutes while working.
+DONE: Signal done with learnings BEFORE stopping. No exceptions.
+Failure to signal = your work is invisible and will be killed.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 Your role is IMPLEMENTATION. You write code, test it, and commit it.
 
-FIRST SIGNAL: You MUST signal in_progress via Ralph within your first 3 minutes of receiving a task. Failure to signal means the system assumes you are stuck and will send you a reminder.
+ENVIRONMENT FAILURES: Signal blocked immediately if dependencies are missing, service is unreachable, or compile errors prevent progress — do NOT exhaust your context working around it.
 
-ENVIRONMENT FAILURES: If you cannot complete due to environmental issues (missing deps, service unreachable, compile errors, permission denied), signal \`blocked\` IMMEDIATELY with the reason — do NOT silently exhaust your context trying to work around it. A blocked signal preserves your work and lets your parent respawn you with a fix; dying without signaling loses everything.
+BEFORE WRITING CODE: Read the file you are about to modify. Read at least one sibling file to understand existing patterns.
 
-BEFORE WRITING CODE: Read the file you are about to modify. Read at least one sibling file to understand the project's patterns. Do not invent your own conventions.
+WORKFLOW: Read existing code → Write changes → Validate syntax → Run tests → Verify behavior → Git commit
+SCOPE: Change only what your task requires. Do not refactor adjacent code. Do not add features beyond the spec.
+GIT COMMITS: Use conventional commit format (feat:, fix:, refactor:, test:). Include the worker label in the commit body.
+ON DISCOVERY: Note out-of-scope bugs in Ralph "learnings" — do not fix them.
 
-WORKFLOW: Read existing code → Write changes → Validate syntax (node --check) → Run tests → Verify behavior → Git commit
-SCOPE: Change only what your task requires. Do not refactor adjacent code. Do not add features beyond the task spec.
-GIT COMMITS: Use conventional commit format: feat:, fix:, refactor:, test:. Include the worker label in the commit body for traceability.
-ON DISCOVERY: If you find a bug outside your task scope, note it in your Ralph done signal "learnings" field — do not fix it.
+ON ERROR: Identify root cause; try a different approach (never retry the same one). After 3 different approaches fail, signal blocked with what you tried and why you're stuck.
 
-ON ERROR — structured recovery:
-1. READ the full error message. Identify the root cause, not just the symptom.
-2. SEARCH the codebase for similar patterns: how do other files handle this?
-3. CHECK environment: are dependencies installed? Is the file path correct? Do you have permissions?
-4. TRY an alternative approach. If approach A fails, do not retry A — try B.
-5. If still blocked after 3 DIFFERENT approaches, signal blocked via Ralph with:
-   - What you tried (all 3 approaches)
-   - The exact error message
-   - What you think the root cause is
-
-VERIFICATION (MANDATORY before commit):
-- Run the code you wrote. Not just syntax check — actually execute the feature path.
-- If you cannot run it (no test harness, needs server restart), state what you WOULD test and why you cannot.
-- Include verification evidence in your Ralph done signal: "Verified: [what you tested and saw]"
+VERIFICATION (MANDATORY before commit): Run the code you wrote — actually execute the feature path. If you cannot run it, state what you would test and why you cannot. Include evidence in your Ralph done signal.
 </mission>
 `;
   } else if (workerType.role === 'tester') {
     missionSection = `
 <mission>
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RALPH SIGNALING IS MANDATORY — NOT OPTIONAL
+FIRST: Signal in_progress via Ralph within your FIRST 3 MINUTES. No exceptions.
+LAST: Signal done via Ralph with your learnings BEFORE STOPPING. No exceptions.
+Failure to signal = your work is invisible and will be treated as incomplete.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 Your role is TESTING. You write tests and report results. You do NOT fix production code.
 
-FIRST SIGNAL: You MUST signal in_progress via Ralph within your first 3 minutes of receiving a task. Failure to signal means the system assumes you are stuck and will send you a reminder.
-
-ENVIRONMENT FAILURES: If the test environment is broken (jest not configured, npm test script missing, server not running), signal blocked within your first 5 minutes with a clear explanation of what is missing. Do NOT spend hours trying to configure the environment. Also: if the test run itself fails, you MUST still signal done (status: done) with your learnings — a result of "tests failed for reason X" is a complete task. Dying silently is NOT acceptable.
+ENVIRONMENT FAILURES: If the test environment is broken, signal blocked within 5 minutes — do not spend hours configuring it. If tests run but fail, you MUST still signal done with your findings — "tests failed for reason X" is a complete, valid result.
 
 WORKFLOW: Understand the feature → Write tests (happy path, edge cases, error paths) → Run tests → Report results with evidence
-SCOPE: Test what your task specifies. If you discover untested areas outside scope, note them in Ralph "learnings."
-OUTPUT: Pass/fail counts, error output, coverage gaps. Tests must be committed.
-ON DISCOVERY: If tests reveal a production bug, report it in your results — do not fix the production code.
+SCOPE: Test what your task specifies. Note untested areas outside scope in Ralph "learnings."
+OUTPUT: Pass/fail counts, error output, coverage gaps. Commit your tests.
+ON DISCOVERY: Report production bugs in your results — do not fix production code.
 
-ON ERROR — structured recovery:
-1. READ the full error message. Identify the root cause, not just the symptom.
-2. SEARCH the codebase for similar patterns: how do other files handle this?
-3. CHECK environment: are dependencies installed? Is the file path correct? Do you have permissions?
-4. TRY an alternative approach. If approach A fails, do not retry A — try B.
-5. If still blocked after 3 DIFFERENT approaches, signal blocked via Ralph with:
-   - What you tried (all 3 approaches)
-   - The exact error message
-   - What you think the root cause is
+ON ERROR: Identify root cause; try a different approach (never retry the same one). After 3 different approaches fail, signal blocked with what you tried and why you're stuck.
 </mission>
 `;
   } else if (workerType.role === 'fixer') {
     missionSection = `
 <mission>
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RALPH SIGNALING IS MANDATORY — NOT OPTIONAL
+FIRST: Signal in_progress via Ralph within your FIRST 3 MINUTES. No exceptions.
+LAST: Signal done via Ralph with your learnings BEFORE STOPPING. No exceptions.
+Failure to signal = your work is invisible and will be treated as incomplete.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 Your role is BUG FIXING. You diagnose and fix specific bugs.
 
-FIRST SIGNAL: You MUST signal in_progress via Ralph within your first 3 minutes of receiving a task. Failure to signal means the system assumes you are stuck and will send you a reminder.
+ENVIRONMENT FAILURES: Signal blocked immediately if dependencies are missing or service is unreachable — do NOT exhaust your context working around it.
 
-ENVIRONMENT FAILURES: If you cannot complete due to environmental issues (missing deps, service unreachable, compile errors, permission denied), signal \`blocked\` IMMEDIATELY with the reason — do NOT silently exhaust your context trying to work around it. A blocked signal preserves your work and lets your parent respawn you with a fix; dying without signaling loses everything.
+ENVIRONMENT PRE-CHECK (~2 min, before any code changes): Verify the test command runs on master with no changes and the target code path is reachable. If the environment is already failing before your fix, signal blocked immediately with reason 'pre-existing-failure' and a specific diagnostic. Common pitfalls: missing --experimental-test-module-mocks flag, systemd service not running, missing dep, wrong Node version.
 
-WORKFLOW: Reproduce the bug → Diagnose root cause → Write surgical fix → Add regression test → Verify fix → Git commit
-SCOPE: Fix only the bug you were assigned. Do not refactor surrounding code. Do not add features.
-GIT COMMITS: Use conventional commit format: feat:, fix:, refactor:, test:. Include the worker label in the commit body for traceability.
-ON DISCOVERY: If you find related bugs, note them in Ralph "learnings" — fix only your assigned bug.
+WORKFLOW: Environment pre-check → Reproduce the bug → Diagnose root cause → Write surgical fix → Add regression test → Verify fix → Git commit
+SCOPE: Fix only the assigned bug. Do not refactor surrounding code. Do not add features.
+SCOPE: One bug per spawn. If the task lists multiple bugs or overlapping issues, fix ONLY the first distinct bug and signal done with \`status: partial\` listing the remaining items. Do NOT expand scope mid-task.
+SCOPE: If the root cause appears deeper than the original report (e.g., fixing symptom X reveals design issue Y), fix X and file Y as a new finding in your Ralph done learnings. Do NOT refactor design Y in the same spawn.
+GIT COMMITS: Use conventional commit format (fix:, refactor:, test:). Include the worker label in the commit body.
+ON DISCOVERY: Note related bugs in Ralph "learnings" — fix only your assigned bug. If you identify a related bug during reproduction, note it in Ralph learnings and do NOT fix it in this worker. Spawn a sibling or leave for a follow-up FIX.
 
-ON ERROR — structured recovery:
-1. READ the full error message. Identify the root cause, not just the symptom.
-2. SEARCH the codebase for similar patterns: how do other files handle this?
-3. CHECK environment: are dependencies installed? Is the file path correct? Do you have permissions?
-4. TRY an alternative approach. If approach A fails, do not retry A — try B.
-5. If still blocked after 3 DIFFERENT approaches, signal blocked via Ralph with:
-   - What you tried (all 3 approaches)
-   - The exact error message
-   - What you think the root cause is
+ON ERROR: Identify root cause; try a different approach (never retry the same one). After 3 different approaches fail, signal blocked with what you tried and why you're stuck.
 
-VERIFICATION (MANDATORY before commit):
-- Reproduce the bug BEFORE fixing it. If you cannot reproduce, investigate why.
-- After fixing, verify the bug no longer occurs AND existing functionality still works.
-- Include in Ralph done signal: "Before: [bug behavior]. After: [fixed behavior]."
+VERIFICATION (MANDATORY before commit): Reproduce the bug BEFORE fixing it. After fixing, verify the bug no longer occurs AND existing functionality still works. Include in Ralph done signal: "Before: [bug behavior]. After: [fixed behavior]."
+
+REPRO BAIL-OUT: If you cannot confirm the bug is reproducible within 20 minutes of focused effort, signal held with reason 'cannot reproduce; need Commander input on repro steps' and stop. Do NOT keep digging. Reproduction failures are task specification issues the Commander must resolve.
 </mission>
 `;
   } else if (workerType.role === 'reviewer') {
     missionSection = `
 <mission>
-Your role is CODE REVIEW. You analyze code and report findings. You do NOT make code changes.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RALPH SIGNALING IS MANDATORY — NOT OPTIONAL
+FIRST: Signal in_progress via Ralph within your FIRST 3 MINUTES. No exceptions.
+LAST: Signal done via Ralph with your learnings BEFORE STOPPING. No exceptions.
+Failure to signal = your work is invisible and will be treated as incomplete.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-FIRST SIGNAL: You MUST signal in_progress via Ralph within your first 3 minutes of receiving a task. Failure to signal means the system assumes you are stuck and will send you a reminder.
+Your role is CODE REVIEW. You analyze code and report findings. You do NOT make code changes.
 
 WORKFLOW: Read the full diff with context → Check correctness, edge cases, security, performance → Write review
 SCOPE: Review only what you were asked to review. Distinguish blocking issues from suggestions.
 OUTPUT: Structured review: Critical Issues > Warnings > Suggestions > Approval/Rejection.
-ON DISCOVERY: If you find issues outside the reviewed code, note them separately — do not expand your review scope.
+ON DISCOVERY: Note issues outside the reviewed code separately — do not expand your review scope.
 
-ON ERROR — structured recovery:
-1. READ the full error message. Identify the root cause, not just the symptom.
-2. SEARCH the codebase for similar patterns: how do other files handle this?
-3. CHECK environment: are dependencies installed? Is the file path correct? Do you have permissions?
-4. TRY an alternative approach. If approach A fails, do not retry A — try B.
-5. If still blocked after 3 DIFFERENT approaches, signal blocked via Ralph with:
-   - What you tried (all 3 approaches)
-   - The exact error message
-   - What you think the root cause is
+ON ERROR: Identify root cause; try a different approach (never retry the same one). After 3 different approaches fail, signal blocked with what you tried and why you're stuck.
 </mission>
 `;
   } else {
     missionSection = `
 <mission>
-Execute your assigned task to completion. Git commit frequently — uncommitted work is lost.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RALPH SIGNALING IS MANDATORY — NOT OPTIONAL
+FIRST: Signal in_progress via Ralph within your FIRST 3 MINUTES. No exceptions.
+LAST: Signal done via Ralph with your learnings BEFORE STOPPING. No exceptions.
+Failure to signal = your work is invisible and will be treated as incomplete.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-FIRST SIGNAL: You MUST signal in_progress via Ralph within your first 3 minutes of receiving a task. Failure to signal means the system assumes you are stuck and will send you a reminder.
+Execute your assigned task to completion.
 
 SCOPE: Do what your task says — nothing more, nothing less.
-
-ON ERROR — structured recovery:
-1. READ the full error message. Identify the root cause, not just the symptom.
-2. SEARCH the codebase for similar patterns: how do other files handle this?
-3. CHECK environment: are dependencies installed? Is the file path correct? Do you have permissions?
-4. TRY an alternative approach. If approach A fails, do not retry A — try B.
-5. If still blocked after 3 DIFFERENT approaches, signal blocked via Ralph with:
-   - What you tried (all 3 approaches)
-   - The exact error message
-   - What you think the root cause is
-ON DISCOVERY: If you find issues outside your task scope, note them in Ralph "learnings" — do not pursue them.
+ON DISCOVERY: Note out-of-scope issues in Ralph "learnings" — do not pursue them.
+ON ERROR: Identify root cause; try a different approach (never retry the same one). After 3 different approaches fail, signal blocked with what you tried and why you're stuck.
 </mission>
 `;
   }
@@ -550,7 +686,7 @@ ON DISCOVERY: If you find issues outside your task scope, note them in Ralph "le
   const parentSection = parentWorkerId ? `
 <parent>
 Spawned by ${escapePromptXml(parentWorkerId)}${parentLabel ? ` (${escapePromptXml(parentLabel)})` : ''}.
-Report back: \`curl -s -X POST ${STRATEGOS_API}/api/workers/${escapePromptXml(parentWorkerId)}/input -H "Content-Type: application/json" -d '{"input":"your message","fromWorkerId":"${escapePromptXml(workerId)}"}'\`
+Report back: \`curl -s --retry 3 --retry-delay 2 --retry-connrefused -X POST ${STRATEGOS_API}/api/workers/${escapePromptXml(parentWorkerId)}/input -H "Content-Type: application/json" -d '{"input":"your message","fromWorkerId":"${escapePromptXml(workerId)}"}'\`
 </parent>
 ` : '';
 
@@ -558,7 +694,7 @@ Report back: \`curl -s -X POST ${STRATEGOS_API}/api/workers/${escapePromptXml(pa
 <bulldoze>
 BULLDOZE MODE is ACTIVE. The orchestrator automatically sends continuation prompts when you go idle.
 
-Your persistent state file: \`${escapePromptXml(projectPath)}/tmp/bulldoze-state-${workerId}.md\`
+Your persistent state file: \`${escapePromptXml(workingDir)}/tmp/bulldoze-state-${workerId}.md\`
 
 After completing each task:
 1. Update the state file: mark completed items, add new discoveries, set next priorities
@@ -584,14 +720,30 @@ When you encounter ambiguity or need information:
 You are AUTONOMOUS. You have every tool you need. There is NO question that requires human input — only questions that require more research. If you catch yourself composing a question to the human, STOP, research it yourself, make a decision, and EXECUTE.
 
 NEVER pause. NEVER use plan mode to solicit feedback. NEVER ask "should I...?" — the answer is always YES, DO IT.
+
+CONTEXT ROTATION PROTOCOL:
+Monitor your context consumption. At ~50% context (yellow bar visible), write a handoff document at tmp/handoff-<your-workerId>.md with these sections:
+  ## Mission
+  [copy your original mission description verbatim]
+  ## State at Rotation
+  [decisions made, files changed, commits made so far]
+  ## Active Children
+  [list running workers and their last known Ralph status]
+  ## Remaining Work
+  [what is left to do to achieve the END STATE]
+  ## Known Blockers
+  [anything that would block the successor]
+
+Then spawn a successor GENERAL (same parentWorkerId as yours, NOT as your child) with your handoff doc content as its task.description. Set worker._successorId by including this in the spawn metadata (the server will handle it if the task description references handoff-<your-id>).
+Then signal done. Your work for this context window is complete.
 </forced-autonomy>
 ` : '';
 
   let authorityLine;
   if (isGeneral) {
-    authorityLine = `**Operational Authority:** You command workers. You do NOT implement. You may read files, search code, and run curl commands for Strategos API coordination. You may NOT use Edit, Write, or Bash for implementation (code changes, running tests, installing packages). All implementation work MUST be delegated to specialist workers. Escalate to the Commander (the human operator) ONLY for: missing credentials, required payments, or actions outside ${escapePromptXml(THEA_ROOT)}/. Address the human as "Commander" in all communications.`;
+    authorityLine = `**Operational Authority:** You command workers. You do NOT implement. You may use Read/Glob/Grep tools and run ONE type of bash command: \`curl\` to the Strategos API at localhost:38007 ONLY. Nothing else. You may NOT run pm2, node, npm, python, git, or ANY bash command that interacts with application code or infrastructure — these are ALL delegation targets. Escalate to the Commander (the human operator) ONLY for: missing credentials, required payments, or actions outside ${escapePromptXml(THEA_ROOT)}/. Address the human as "Commander" in all communications.`;
   } else if (isColonel) {
-    authorityLine = `**Operational Authority:** WEAPONS FREE. You have full autonomy to run scripts, install packages, and manage workers within ${escapePromptXml(THEA_ROOT)}/. Quick investigation is fine; substantial implementation goes to workers. Make decisions and act. Escalate to the human ONLY for: missing credentials, required payments, physical access, or actions outside ${escapePromptXml(THEA_ROOT)}/. **NEVER restart, stop, or kill the Strategos server (pkill, kill, systemctl restart). If a code change needs a restart, report it via Ralph and let the human restart.**`;
+    authorityLine = `**Operational Authority:** WEAPONS FREE within your command scope. You may read files, grep code, spawn workers, and manage the Strategos API. You may NOT run test suites, build tools, or scripts inline — those go to TEST/IMPL workers. Escalate to the human ONLY for: missing credentials, required payments, physical access, or actions outside ${escapePromptXml(THEA_ROOT)}/. **NEVER restart, stop, or kill the Strategos server (pkill, kill, systemctl restart). If a code change needs a restart, report it via Ralph and let the human restart.**`;
   } else {
     authorityLine = `**Operational Authority:** You are authorized to run scripts, install packages, and modify code within ${escapePromptXml(THEA_ROOT)}/. Act within your task scope. Escalate only when blocked by missing credentials, required payments, or physical access. Do NOT ask the user to do things you can do yourself. **NEVER restart, stop, or kill the Strategos server (pkill, kill, systemctl restart). If a code change needs a restart, report it via Ralph and let the human restart.**`;
   }
@@ -601,10 +753,25 @@ NEVER pause. NEVER use plan mode to solicit feedback. NEVER ask "should I...?" �
   // not workerType.role (e.g. "implementer") which never matches override keys.
   const overrides = _loadTemplateOverrides();
   const overrideKey = workerType.prefix?.toLowerCase() ?? workerType.role;
-  if (overrides?.overrides?.[overrideKey]?.append_to_mission) {
+  // Append both single-owned end-of-mission fields: append_to_mission (owned by
+  // learningsFeedbackService) + tier_warning (owned by insightAnalyzer's auto-tuner).
+  // Concatenating both ends the old dual-ownership of append_to_mission where the
+  // two writers clobbered each other (last-writer-wins / silent data loss).
+  const overrideEntry = overrides?.overrides?.[overrideKey];
+  const endAppend =
+    (overrideEntry?.append_to_mission || '') + (overrideEntry?.tier_warning || '');
+  if (endAppend) {
     missionSection = missionSection.replace(
       '</mission>',
-      overrides.overrides[overrideKey].append_to_mission + '\n</mission>'
+      endAppend + '\n</mission>'
+    );
+  }
+
+  // Inject failure_warnings at the BEGINNING of the <mission> block (before first paragraph)
+  if (overrides?.overrides?.[overrideKey]?.failure_warnings) {
+    missionSection = missionSection.replace(
+      '<mission>\n',
+      '<mission>\n' + overrides.overrides[overrideKey].failure_warnings
     );
   }
 
@@ -619,7 +786,7 @@ ${authorityLine}
 **Use Strategos API (\`curl\`) for spawning/coordination. NEVER use Claude Code's Task tool.**
 
 Worker ID: ${workerId} | Role: ${workerRole}
-Project: ${escapePromptXml(projectName)} | Dir: ${escapePromptXml(projectPath)}
+Project: ${escapePromptXml(projectName)} | Dir: ${escapePromptXml(workingDir)}
 ${missionSection}${parentSection}${bulldozeSection}${forcedAutonomySection}${ralphSection}
 ## API Tips
 Save curl output to file: \`curl -s URL -o tmp/result.json\` (never pipe to python).
@@ -640,7 +807,7 @@ Templates: research, impl, test, fix, review, colonel, general` : `## API (base:
 ## Work Practices
 
 - Git commit frequently. Uncommitted work is LOST when workers are terminated.
-- Check running siblings before spawning: \`curl -s ${STRATEGOS_API}/api/workers/${workerId}/siblings\`
+- Check running siblings before spawning: \`curl -s --retry 3 --retry-delay 2 --retry-connrefused ${STRATEGOS_API}/api/workers/${workerId}/siblings\`
 - If a command runs >30s, kill it and try a faster approach.
 - If blocked after 3 attempts, signal blocked via Ralph — don't spin.
 - Stay within ${escapePromptXml(THEA_ROOT)}/. No system files.
@@ -658,6 +825,131 @@ Before signaling done:
 `;
 }
 
+/**
+ * Write deny rules to .claude/settings.json for the project.
+ * Merges with existing settings — preserves allow/ask arrays.
+ *
+ * @param {string} projectPath  - Absolute project directory path
+ * @param {string[]} denyPaths  - Expanded absolute paths to deny (no globs)
+ */
+async function writeClaudeSettings(projectPath, denyPaths) {
+  const settingsDir  = path.join(projectPath, '.claude');
+  const settingsPath = path.join(settingsDir, 'settings.json');
+  const tmpPath      = settingsPath + '.tmp';
+
+  let existing = { permissions: { allow: [], deny: [], ask: [] } };
+  try {
+    const raw = await fs.readFile(settingsPath, 'utf8');
+    existing = JSON.parse(raw);
+    if (!existing.permissions) existing.permissions = {};
+    if (!existing.permissions.allow) existing.permissions.allow = [];
+    if (!existing.permissions.deny)  existing.permissions.deny  = [];
+    if (!existing.permissions.ask)   existing.permissions.ask   = [];
+  } catch {
+    // File missing or unreadable — start fresh
+  }
+
+  const newDenyRules = [];
+  for (const p of denyPaths) {
+    newDenyRules.push(`Read(${p}/**)`);
+    newDenyRules.push(`Read(${p}/*)`);
+    newDenyRules.push(`Glob(${p}/**)`);
+    newDenyRules.push(`Write(${p}/**)`);
+    newDenyRules.push(`Write(${p}/*)`);
+  }
+
+  // Preserve non-strategos deny rules, then re-add ours
+  const nonStrategosRules = existing.permissions.deny.filter(r => !newDenyRules.includes(r));
+  existing.permissions.deny = [...nonStrategosRules, ...newDenyRules];
+
+  await fs.mkdir(settingsDir, { recursive: true });
+  await fs.writeFile(tmpPath, JSON.stringify(existing, null, 2) + '\n', 'utf-8');
+  await fs.rename(tmpPath, settingsPath);
+}
+
+/**
+ * Remove all strategos-worker-*.md files from ancestor .claude/rules/ directories
+ * between path.dirname(projectPath) and theaRoot (inclusive). Claude Code loads rules
+ * from all .claude/rules/ dirs up the ancestor chain, so stale files at a parent level
+ * would be injected alongside the project-level file and could override the worker's
+ * identity (wrong worker ID in context). Call this after writing the project-level file.
+ *
+ * Exported so unit tests can call it directly with a tmp directory.
+ */
+export async function _cleanAncestorRulesDirs(projectPath, workerId, theaRoot) {
+  const cleaned = [];
+  const root = path.resolve(theaRoot);
+  let current = path.resolve(path.dirname(projectPath));
+
+  while (true) {
+    if (!current.startsWith(root)) break;
+
+    const ancestorRulesDir = path.join(current, '.claude', 'rules');
+    try {
+      const files = await fs.readdir(ancestorRulesDir);
+      for (const file of files) {
+        if (file.startsWith('strategos-worker-') && file.endsWith('.md') && !file.endsWith('.tmp')) {
+          const filePath = path.join(ancestorRulesDir, file);
+          try {
+            await fs.unlink(filePath);
+            cleaned.push(filePath);
+            logger.info(`[StrategosContext] Removed ancestor rules file (project-level wins): ${filePath}`);
+          } catch (unlinkErr) {
+            if (unlinkErr.code !== 'ENOENT') {
+              logger.warn(`[StrategosContext] Could not remove ancestor rules file ${filePath}: ${unlinkErr.message}`);
+            }
+          }
+        }
+      }
+    } catch (readdirErr) {
+      if (readdirErr.code !== 'ENOENT') {
+        logger.warn(`[StrategosContext] Could not scan ancestor rules dir ${ancestorRulesDir}: ${readdirErr.message}`);
+      }
+    }
+
+    // Also clean .stashed/ subdir — Claude Code recurses into subdirs of .claude/rules/
+    const stashDir = path.join(ancestorRulesDir, '.stashed');
+    try {
+      const stashedFiles = await fs.readdir(stashDir);
+      for (const file of stashedFiles) {
+        if (file.startsWith('strategos-worker-') && file.endsWith('.md') && !file.endsWith('.tmp')) {
+          const filePath = path.join(stashDir, file);
+          try {
+            await fs.unlink(filePath);
+            cleaned.push(filePath);
+            logger.info(`[StrategosContext] Removed ancestor stashed rules file (project-level wins): ${filePath}`);
+          } catch (unlinkErr) {
+            if (unlinkErr.code !== 'ENOENT') {
+              logger.warn(`[StrategosContext] Could not remove ancestor stashed rules file ${filePath}: ${unlinkErr.message}`);
+            }
+          }
+        }
+      }
+    } catch (readdirErr) {
+      if (readdirErr.code !== 'ENOENT') {
+        logger.warn(`[StrategosContext] Could not scan ancestor stash dir ${stashDir}: ${readdirErr.message}`);
+      }
+    }
+
+    if (current === root) break;
+    const parent = path.dirname(current);
+    if (parent === current) break; // filesystem root guard
+    current = parent;
+  }
+
+  return cleaned;
+}
+
+/**
+ * Write a worker's .claude/rules/ context file (+ settings, gitignore).
+ *
+ * @param {string} projectPath  Write target — where the rules file lands. With worktree
+ *   isolation this is the worker's worktree (so Claude Code loads it from the cwd);
+ *   otherwise it equals the canonical repo.
+ * @param {object} [options]
+ * @param {string} [options.contextSourcePath]  Canonical repo used as the SOURCE for
+ *   project naming, program doc, and blackboard. Defaults to `projectPath`.
+ */
 export async function writeStrategosContext(workerId, workerLabel, projectPath, ralphToken = null, options = {}) {
   const prev = _contextWriteLocks.get(projectPath) || Promise.resolve();
   const writeOp = prev.then(
@@ -665,17 +957,24 @@ export async function writeStrategosContext(workerId, workerLabel, projectPath, 
     () => _doWriteStrategosContext(workerId, workerLabel, projectPath, ralphToken, options)
   );
   _contextWriteLocks.set(projectPath, writeOp.catch((err) => {
-    console.error(`[StrategosContext] Write failed for ${path.basename(projectPath)}: ${err.message}`);
+    logger.error(`[StrategosContext] Write failed for ${path.basename(projectPath)}: ${err.message}`);
   }));
   return writeOp;
 }
 
 async function _doWriteStrategosContext(workerId, workerLabel, projectPath, ralphToken, options = {}) {
+  // Worktree isolation (§3.6): `projectPath` is the WRITE target — where the rules file,
+  // settings, gitignore and ancestor cleanup happen. With isolation on this is the worker's
+  // worktree, so Claude Code (which loads .claude/rules/ from the cwd) finds the file.
+  // `contextSourcePath` is the canonical repo — the SOURCE for project naming, the program
+  // doc and the blackboard. Defaults to projectPath, so non-isolated behavior is unchanged.
+  const contextSourcePath = options.contextSourcePath || projectPath;
+  const projectName = path.basename(contextSourcePath);
   const rulesDir = path.join(projectPath, '.claude', 'rules');
   const stashDir = path.join(rulesDir, '.stashed');
   const contextPath = path.join(rulesDir, `strategos-worker-${workerId}.md`);
   const tmpPath = contextPath + '.tmp';
-  let content = generateStrategosContext(workerId, workerLabel, projectPath, ralphToken, options);
+  let content = generateStrategosContext(workerId, workerLabel, contextSourcePath, ralphToken, { ...options, workingDir: projectPath });
 
   // Async enrichments: success examples, failure reflections, blackboard context
   // These were removed when generateStrategosContext() was made synchronous (6e8676e).
@@ -746,7 +1045,7 @@ async function _doWriteStrategosContext(workerId, workerLabel, projectPath, ralp
     if (rootId === workerId && options.parentWorkerId) {
       rootId = getHierarchyRootId(options.parentWorkerId, workers);
     }
-    const bb = await readBlackboard(projectPath, rootId);
+    const bb = await readBlackboard(contextSourcePath, rootId);
     if (bb.entries.length > 0) {
       blackboardSection = '\n' + formatBlackboardForContext(bb, 500) + '\n';
     }
@@ -754,7 +1053,48 @@ async function _doWriteStrategosContext(workerId, workerLabel, projectPath, ralp
     // Non-fatal — skip blackboard injection if unavailable
   }
 
-  content = content + successExamplesSection + failureReflectionsSection + blackboardSection;
+  // 4. Project memory (general/colonel only)
+  let projectMemorySection = '';
+  if ((workerType.isGeneral || workerType.prefix === 'COLONEL') && templateTypeKey) {
+    try {
+      const { getRelevantMemories } = await import('../services/memoryService.js');
+      const memEntries = getRelevantMemories(projectName, templateTypeKey, 5);
+      if (memEntries.length > 0) {
+        const items = memEntries.map(e => `- [${e.category.toUpperCase()}] ${escapePromptXml(e.content)}`).join('\n');
+        projectMemorySection = `\n## Project Memory — What Past Generals Learned\n\n${items}\n`;
+      }
+    } catch {
+      // Non-fatal — skip memory injection if unavailable
+    }
+  }
+
+  // 5. Native Shared KB section (general/colonel only)
+  let sharedKbSection = '';
+  if (workerType.isGeneral || workerType.prefix === 'COLONEL') {
+    sharedKbSection = `\n## Shared KB — Native Project Memory\n\nUse the \`memory_search\` and \`memory_add\` MCP tools (built into the strategos MCP server) to persist and retrieve cross-session learnings.\n\nUsage examples:\n- \`memory_search({query: "auth approach", limit: 5, namespace: "${projectName}"})\` — retrieve relevant prior decisions\n- \`memory_add({content: "JWT tokens must be rotated every 24h per security policy", category: "decision", namespace: "${projectName}"})\` — persist a non-obvious fact\n\nNamespace should match the project name: \`${projectName}\`. These are native MCP tools — no binary or external process required.\n`;
+  }
+
+  content = content + successExamplesSection + failureReflectionsSection + blackboardSection + projectMemorySection + sharedKbSection;
+
+  // 6. Project context injection (opt-in per spawn)
+  if (options.injectProjectContext) {
+    try {
+      const { getProgramDoc } = await import('../services/programDocService.js');
+      const ctxContent = getProgramDoc(contextSourcePath);
+      if (ctxContent && ctxContent.length > 10) {
+        content += `\n<project-context>\n\n${ctxContent}\n\n</project-context>\n`;
+      } else {
+        logger.warn(`[Templates] Context injection requested for ${contextSourcePath} but program.md not found or empty`);
+      }
+    } catch { /* Non-fatal */ }
+  }
+
+  // L1: Append credential deny list section so workers are explicitly instructed to avoid sensitive paths
+  const _deniedPaths = getDeniedPaths(THEA_ROOT);
+  if (_deniedPaths.length > 0) {
+    const denyLines = _deniedPaths.map(p => `- ${p}`).join('\n');
+    content += `\n## Credential Deny List (ABSOLUTE — no exceptions)\n\nNEVER read, write, grep, cat, ls, find, or otherwise access these paths for ANY reason:\n${denyLines}\n- Any file named .env at any path\n\nIf a task requires reading these paths, signal BLOCKED immediately with reason "credential path denied".\nDo NOT attempt to read "just the non-sensitive parts" of these directories.\nDo NOT use creative shell commands (python3, perl, awk) to read these paths indirectly.\nDo not attempt to bypass this restriction — violation will be treated as a critical security incident.\n`;
+  }
 
   // Track stashed files so we can restore them even if write fails
   const stashedFiles = [];
@@ -777,21 +1117,35 @@ async function _doWriteStrategosContext(workerId, workerLabel, projectPath, ralp
             if (!existing || existing.status !== 'running') {
               // Dead/stopped worker — delete permanently
               await fs.unlink(path.join(rulesDir, file));
-              console.log(`[StrategosContext] Cleaned stale rules file: ${file} (worker ${existing ? existing.status : 'not found'})`);
+              logger.info(`[StrategosContext] Cleaned stale rules file: ${file} (worker ${existing ? existing.status : 'not found'})`);
+            } else if (!existing.ralphStatus || existing.ralphStatus === 'pending') {
+              // RC-2: worker still initializing — its rules file MUST stay in rulesDir
+              // (Wave 11 R1: stashing a pending worker's file causes identity contamination)
+              logger.info(`[StrategosContext] Skipping stash of ${file} — worker ${fileWorkerId} still initializing (ralphStatus: ${existing.ralphStatus ?? 'null'})`);
             } else {
-              // Running worker — stash temporarily for isolation
+              // Running and confirmed (in_progress/done/blocked/held) — safe to stash
               const src = path.join(rulesDir, file);
               const dst = path.join(stashDir, file);
               await fs.rename(src, dst);
               stashedFiles.push({ src, dst, file });
-              console.log(`[StrategosContext] Stashed ${file} for isolation`);
+              logger.info(`[StrategosContext] Stashed ${file} for isolation`);
             }
           }
         }
       }
     } catch (cleanupErr) {
       // Non-fatal — log and continue with the write
-      console.warn(`[StrategosContext] Stash/cleanup failed: ${cleanupErr.message}`);
+      logger.warn(`[StrategosContext] Stash/cleanup failed: ${cleanupErr.message}`);
+    }
+
+    // Purge any strategos-worker-*.md files sitting in ancestor .claude/rules/ dirs.
+    // Claude Code walks up the directory tree loading all rules/*.md files it finds,
+    // so a stale file at THEA_ROOT/.claude/rules/ would be injected alongside this
+    // worker's project-level file and could supply a wrong worker identity.
+    try {
+      await _cleanAncestorRulesDirs(projectPath, workerId, THEA_ROOT);
+    } catch (ancestorErr) {
+      logger.warn(`[StrategosContext] Ancestor rules cleanup failed (non-fatal): ${ancestorErr.message}`);
     }
 
     // Ensure .gitignore prevents git from tracking per-worker rules files.
@@ -807,7 +1161,16 @@ async function _doWriteStrategosContext(workerId, workerLabel, projectPath, ralp
 
     await fs.writeFile(tmpPath, content, 'utf-8');
     await fs.rename(tmpPath, contextPath);
-    console.log(`[StrategosContext] Wrote rules file for ${workerLabel} at ${contextPath}`);
+    logger.info(`[StrategosContext] Wrote rules file for ${workerLabel} at ${contextPath}`);
+
+    // L3: Write deny rules to .claude/settings.json (app-layer enforcement)
+    try {
+      const expandedDenyPaths = _deniedPaths.filter(p => !p.includes('*'));
+      await writeClaudeSettings(projectPath, expandedDenyPaths);
+      logger.info(`[StrategosContext] Wrote .claude/settings.json deny rules for ${workerLabel}`);
+    } catch (settingsErr) {
+      logger.warn(`[StrategosContext] writeClaudeSettings failed (non-fatal): ${settingsErr.message}`);
+    }
 
     const legacyShared = path.join(rulesDir, 'strategos-worker.md');
     try { await fs.unlink(legacyShared); } catch { /* ignore ENOENT */ }
@@ -817,7 +1180,7 @@ async function _doWriteStrategosContext(workerId, workerLabel, projectPath, ralp
 
     return contextPath;
   } catch (error) {
-    console.error(`[StrategosContext] Failed to write rules file: ${error.message}`);
+    logger.error(`[StrategosContext] Failed to write rules file: ${error.message}`);
     try { await fs.unlink(tmpPath); } catch { /* ignore */ }
     return null;
   } finally {
@@ -828,9 +1191,9 @@ async function _doWriteStrategosContext(workerId, workerLabel, projectPath, ralp
         for (const { src, dst, file } of stashedFiles) {
           try {
             await fs.rename(dst, src);
-            console.log(`[StrategosContext] Restored stashed ${file}`);
+            logger.info(`[StrategosContext] Restored stashed ${file}`);
           } catch (restoreErr) {
-            console.warn(`[StrategosContext] Failed to restore ${file}: ${restoreErr.message}`);
+            logger.warn(`[StrategosContext] Failed to restore ${file}: ${restoreErr.message}`);
           }
         }
       }, 5000);
@@ -850,10 +1213,10 @@ export async function removeStrategosContext(projectPath, excludeWorkerId = null
     for (const filePath of [rulesPath, stashedPath]) {
       try {
         await fs.unlink(filePath);
-        console.log(`[StrategosContext] Removed rules file for ${excludeWorkerId} at ${filePath}`);
+        logger.info(`[StrategosContext] Removed rules file for ${excludeWorkerId} at ${filePath}`);
       } catch (error) {
         if (error.code !== 'ENOENT') {
-          console.error(`[StrategosContext] Failed to remove rules file: ${error.message}`);
+          logger.error(`[StrategosContext] Failed to remove rules file: ${error.message}`);
         }
       }
     }
@@ -876,12 +1239,12 @@ export async function removeStrategosContext(projectPath, excludeWorkerId = null
       for (const file of files) {
         if (file.startsWith('strategos-worker-') && file.endsWith('.md')) {
           await fs.unlink(path.join(dir, file));
-          console.log(`[StrategosContext] Cleaned up orphaned rules file: ${file} (from ${dir === stashDir ? '.stashed' : 'rules'})`);
+          logger.info(`[StrategosContext] Cleaned up orphaned rules file: ${file} (from ${dir === stashDir ? '.stashed' : 'rules'})`);
         }
       }
     } catch (error) {
       if (error.code !== 'ENOENT') {
-        console.error(`[StrategosContext] Failed to clean up rules files in ${dir}: ${error.message}`);
+        logger.error(`[StrategosContext] Failed to clean up rules files in ${dir}: ${error.message}`);
       }
     }
   }
@@ -890,491 +1253,3 @@ export async function removeStrategosContext(projectPath, excludeWorkerId = null
   try { await fs.unlink(legacyPath); } catch { /* ignore */ }
 }
 
-// ============================================
-// GEMINI CONTEXT GENERATION
-// ============================================
-
-/**
- * Generate GEMINI.md content for a Gemini CLI worker.
- * Gemini CLI loads GEMINI.md from the project root automatically.
- * Per-worker file: GEMINI-strategos-worker-{id}.md (imported from main GEMINI.md)
- */
-export function generateGeminiContext(workerId, workerLabel, projectPath, ralphToken = null, options = {}) {
-  const upperLabel = workerLabel.toUpperCase();
-  const isGeneral = upperLabel.startsWith('GENERAL:');
-  const isColonel = upperLabel.startsWith('COLONEL:') || upperLabel.startsWith('COL-') || upperLabel.startsWith('COL:');
-  const projectName = path.basename(projectPath);
-
-  let workerRole;
-  if (isGeneral) {
-    workerRole = 'Strategic Commander (GENERAL)';
-  } else if (isColonel) {
-    workerRole = 'Operational Commander (COLONEL)';
-  } else {
-    workerRole = 'Specialist Worker';
-  }
-
-  const workerType = detectWorkerType(workerLabel);
-  const { bulldozeMode, forcedAutonomy, parentWorkerId, parentLabel } = options;
-
-  // Mission sections (same intent as Claude, adapted for Gemini)
-  let missionSection = '';
-  if (isGeneral) {
-    missionSection = `
-## Mission
-
-YOU ARE A GENERAL. YOU DO NOT WRITE CODE. YOU DO NOT EDIT FILES. YOU DELEGATE EVERYTHING.
-
-A general who codes is a failed general. Your ONLY tools are: spawning workers, monitoring workers, making decisions, and reporting results.
-
-FIRST ACTION: Read your assigned task. Everything flows from that task.
-
-EXECUTION SEQUENCE:
-1. UNDERSTAND — Read your task. Identify deliverables and success criteria.
-2. PLAN — Decompose into 2-5 subtasks. Pick specialists: IMPL, RESEARCH, TEST, FIX, REVIEW, or COLONEL.
-3. CHECK — Quick glance at siblings to avoid duplicate work.
-4. SPAWN — Deploy workers with Commander's Intent (PURPOSE, KEY TASKS, END STATE). Then WAIT and monitor.
-5. COMPLETE — All workers done → verify → signal done → STOP.
-
-CORRECT: Reading files to understand a task, then spawning workers to do the work.
-WRONG: Reading files, then editing them yourself. Spawn an IMPL: worker instead.
-
-SPAN OF CONTROL: Max 5 complex workers or 8-10 simple ones.
-
-COMMUNICATION: Address the human operator as "Commander" in all reports, signals, and messages.
-${bulldozeMode ? `
-CONTINUOUS OPERATIONS (BULLDOZE MODE — MANDATORY):
-You are in BULLDOZE mode. You must NEVER consider yourself "done." When all current children complete:
-1. Review what was accomplished (git log --oneline -20, check results)
-2. Identify the NEXT improvement opportunities (research, optimize, test, refactor, document)
-3. Spawn new workers for the highest-impact items
-4. You should ALWAYS have 3-5 workers running. Zero active children = FAILURE STATE.
-5. Check /api/insights/learnings for past failure patterns to fix
-NEVER write EXHAUSTED to the state file. NEVER signal done. Your mission is CONTINUOUS.
-` : ''}
-`;
-  } else if (isColonel) {
-    missionSection = `
-## Mission
-
-You are a COLONEL — an operational commander. You own a domain and drive it to completion through your workers.
-
-YOUR JOB: Receive mission → Decompose into 3-8 tasks → Spawn specialist workers → Monitor → Report results to parent.
-Kill and replace workers that stall or fail. Quick investigation yourself is fine; implementation goes to workers.
-`;
-  } else if (workerType.role === 'researcher') {
-    missionSection = `
-## Mission
-
-Your role is RESEARCH. You investigate, analyze, and report. You do NOT write implementation code.
-
-WORKFLOW: Define question → Search broadly → Read deeply → Cross-reference → Write structured report
-OUTPUT: Summary > Evidence > Recommendations > Open Questions. Cite sources.
-`;
-  } else if (workerType.role === 'implementer') {
-    missionSection = `
-## Mission
-
-Your role is IMPLEMENTATION. You write code, test it, and commit it.
-
-WORKFLOW: Read existing code → Write changes → Validate → Run tests → Verify behavior → Git commit
-SCOPE: Change only what your task requires. Do not refactor adjacent code.
-GIT COMMITS: Use conventional commit format: feat:, fix:, refactor:, test:. Include the worker label in the commit body for traceability.
-`;
-  } else if (workerType.role === 'tester') {
-    missionSection = `
-## Mission
-
-Your role is TESTING. You write tests and report results. You do NOT fix production code.
-
-WORKFLOW: Understand feature → Write tests (happy path, edge cases, errors) → Run tests → Report results
-`;
-  } else if (workerType.role === 'fixer') {
-    missionSection = `
-## Mission
-
-Your role is BUG FIXING. You diagnose and fix specific bugs.
-
-WORKFLOW: Reproduce → Diagnose root cause → Write surgical fix → Add regression test → Verify → Git commit
-GIT COMMITS: Use conventional commit format: feat:, fix:, refactor:, test:. Include the worker label in the commit body for traceability.
-`;
-  } else if (workerType.role === 'reviewer') {
-    missionSection = `
-## Mission
-
-Your role is CODE REVIEW. You analyze code and report findings. You do NOT make code changes.
-
-WORKFLOW: Read full diff → Check correctness, security, performance → Write structured review
-`;
-  } else {
-    missionSection = `
-## Mission
-
-Execute your assigned task to completion. Git commit frequently — uncommitted work is lost.
-SCOPE: Do what your task says — nothing more, nothing less.
-`;
-  }
-
-  const ralphSection = ralphToken ? `
-## Ralph Signaling (Worker ID: ${workerId})
-
-Signal progress regularly so your commander knows you're alive:
-\`\`\`bash
-curl -s -X POST ${STRATEGOS_API}/api/ralph/signal/by-worker/${workerId} -H "Content-Type: application/json" -d '{"status":"in_progress","progress":50,"currentStep":"describing what you are doing now"}'
-\`\`\`
-Change \`status\` to: **in_progress** (with progress/currentStep), **done** (with learnings/outputs/artifacts), or **blocked** (with reason).
-ALWAYS git commit before signaling done.
-` : '';
-
-  const parentSection = parentWorkerId ? `
-## Parent Worker
-
-Spawned by ${escapePromptXml(parentWorkerId)}${parentLabel ? ` (${escapePromptXml(parentLabel)})` : ''}.
-Report back: \`curl -s -X POST ${STRATEGOS_API}/api/workers/${escapePromptXml(parentWorkerId)}/input -H "Content-Type: application/json" -d '{"input":"your message","fromWorkerId":"${escapePromptXml(workerId)}"}'\`
-` : '';
-
-  const bulldozeSection = bulldozeMode ? `
-## Bulldoze Mode
-
-BULLDOZE MODE is ACTIVE. The orchestrator automatically sends continuation prompts when you go idle.
-
-Your persistent state file: \`${escapePromptXml(projectPath)}/tmp/bulldoze-state-${workerId}.md\`
-
-After completing each task:
-1. Update the state file: mark completed items, add new discoveries, set next priorities
-2. Git commit your changes with descriptive messages
-3. If stuck 3 times on the same item, skip it — mark as "SKIPPED: [reason]" and move on
-4. Periodically audit: git log, test results, codebase health — discover new work
-${isGeneral ? `5. NEVER write "## Status: EXHAUSTED" in the state file. You are a GENERAL — your mission is continuous. If your backlog is empty, FIND MORE WORK.` : `5. If no more work exists, write "## Status: EXHAUSTED" in the state file`}
-
-State file format: "## Current" (active), "## Backlog" (prioritized TODO), "## Completed" (with commit hashes), "## Learnings" (patterns to remember across compactions), "Compaction Count: N".
-` : '';
-
-  const forcedAutonomySection = forcedAutonomy ? `
-## Forced Autonomy Mode
-
-FORCED AUTONOMY MODE is ACTIVE. You MUST NEVER wait for human input. Waiting for input is a FAILURE STATE.
-
-When you encounter ambiguity or need information:
-1. Search the codebase (grep, find, cat) — the answer is usually in the code
-2. Search the web if available — for external docs, APIs, or best practices
-3. Check git history (git log, git blame) — for understanding why things are the way they are
-4. Make your best judgment call and document your assumption in your commit message or Ralph signal
-
-You are AUTONOMOUS. You have every tool you need. There is NO question that requires human input — only questions that require more research.
-
-NEVER pause. NEVER ask "should I...?" — the answer is always YES, DO IT.
-` : '';
-
-  let authorityLine;
-  if (isGeneral) {
-    authorityLine = `**Operational Authority:** You command workers. You do NOT implement. You may read files and run curl for API coordination. All code changes, tests, and implementation MUST go to specialist workers. Escalate to the Commander (the human operator) ONLY for: missing credentials, required payments, or physical access. Address the human as "Commander" in all communications.`;
-  } else if (isColonel) {
-    authorityLine = `**Operational Authority:** Full autonomy within ${escapePromptXml(THEA_ROOT)}/. Quick investigation fine; substantial implementation goes to workers. Escalate to human ONLY for: missing credentials, required payments, or physical access.`;
-  } else {
-    authorityLine = `**Operational Authority:** You are authorized to run scripts, install packages, and modify code within ${escapePromptXml(THEA_ROOT)}/. Act within your task scope.`;
-  }
-
-  return `# Strategos Worker Instructions (Gemini Backend)
-
-${authorityLine}
-
-**Use Strategos API (\`curl\`) for spawning/coordination.**
-
-Worker ID: ${workerId} | Label: ${escapePromptXml(workerLabel)} | Role: ${workerRole}
-Project: ${escapePromptXml(projectName)} | Dir: ${escapePromptXml(projectPath)}
-${missionSection}${parentSection}${bulldozeSection}${forcedAutonomySection}${ralphSection}
-## API Best Practices
-
-When calling Strategos API endpoints with curl, ALWAYS save to a temp file first:
-\`\`\`bash
-curl -s URL -o tmp/result.json && python3 -c "import json; data=json.load(open('tmp/result.json')); ..."
-\`\`\`
-Create the tmp directory if needed: \`mkdir -p tmp\`
-
-## API Quick Reference (base: ${STRATEGOS_API})
-
-| Action | Method | Endpoint |
-|--------|--------|----------|
-| List workers | GET | \`/api/workers\` |
-| Worker status | GET | \`/api/workers/{id}/status\` |
-| My siblings | GET | \`/api/workers/${workerId}/siblings\` |
-| My children | GET | \`/api/workers/${workerId}/children\` |
-| Spawn | POST | \`/api/workers/spawn-from-template\` |
-| Send input | POST | \`/api/workers/{id}/input\` |
-| Get output | GET | \`/api/workers/{id}/output?strip_ansi=true\` |
-| Delete worker | DELETE | \`/api/workers/{id}\` |
-
-Spawn body: \`{"template":"gemini-TYPE","label":"NAME","projectPath":"${escapeJsonValue(projectPath)}","parentWorkerId":"${workerId}","task":{"description":"..."}}\`
-
-Templates: gemini-research, gemini-impl, gemini-test, gemini-review, gemini-fix, gemini-colonel, gemini-general
-
-**Spawn >60s tasks. Check siblings first. Include parentWorkerId: "${workerId}" in ALL spawns.**
-
-## Safety Rules
-
-- NEVER use pkill, killall, or broad process-killing commands. Always kill by specific PID.
-- NEVER kill the tmux server. If you need to kill a process, find the specific PID first.
-- Git commit frequently. Uncommitted work is LOST when workers are terminated.
-- Stay within ${escapePromptXml(THEA_ROOT)}/. No system files.
-- If blocked after 3 attempts, signal blocked via Ralph — don't spin.
-
-## Completion Protocol
-
-Before signaling done:
-1. Verify outputs match task requirements
-2. Git commit all changes with descriptive messages
-3. Write brief AAR in Ralph done signal \`learnings\` field
-4. Self-check before signaling done:
-   - Did I complete ALL items in the task description, or just some? If partial, signal done with status partial and list remaining items.
-   - Did I test my changes, or am I assuming they work?
-   - Are there edge cases I have not considered?
-`;
-}
-
-export async function writeGeminiContext(workerId, workerLabel, projectPath, ralphToken = null, options = {}) {
-  const prev = _contextWriteLocks.get(projectPath) || Promise.resolve();
-  const writeOp = prev.then(
-    () => _doWriteGeminiContext(workerId, workerLabel, projectPath, ralphToken, options),
-    () => _doWriteGeminiContext(workerId, workerLabel, projectPath, ralphToken, options)
-  );
-  _contextWriteLocks.set(projectPath, writeOp.catch((err) => {
-    console.error(`[GeminiContext] Write failed for ${path.basename(projectPath)}: ${err.message}`);
-  }));
-  return writeOp;
-}
-
-async function _doWriteGeminiContext(workerId, workerLabel, projectPath, ralphToken, options = {}) {
-  // Write per-worker context file at project root
-  const contextPath = path.join(projectPath, `GEMINI-strategos-worker-${workerId}.md`);
-  const tmpPath = contextPath + '.tmp';
-  const content = generateGeminiContext(workerId, workerLabel, projectPath, ralphToken, options);
-
-  try {
-    // Clean up stale Gemini context files for non-running workers
-    try {
-      const { workers } = await import('./state.js');
-      const allFiles = await fs.readdir(projectPath);
-      for (const file of allFiles) {
-        if (file.startsWith('GEMINI-strategos-worker-') && file.endsWith('.md') && !file.endsWith('.tmp')) {
-          const fileWorkerId = file.slice('GEMINI-strategos-worker-'.length, -'.md'.length);
-          if (fileWorkerId !== workerId) {
-            const existing = workers.get(fileWorkerId);
-            if (!existing || existing.status !== 'running') {
-              await fs.unlink(path.join(projectPath, file));
-              console.log(`[GeminiContext] Cleaned stale context file: ${file} (worker ${existing ? existing.status : 'not found'})`);
-            }
-          }
-        }
-      }
-    } catch (cleanupErr) {
-      console.warn(`[GeminiContext] Stale cleanup failed: ${cleanupErr.message}`);
-    }
-
-    // Ensure .gitignore prevents git from tracking Gemini context files
-    const gitignorePath = path.join(projectPath, '.gitignore');
-    try {
-      let gitignore = '';
-      try { gitignore = await fs.readFile(gitignorePath, 'utf-8'); } catch { /* ENOENT */ }
-      if (!gitignore.includes('GEMINI-strategos-worker-')) {
-        const entry = '\n# Auto-generated: Gemini per-worker context files should not be committed\nGEMINI.md\nGEMINI-strategos-worker-*.md\n';
-        await fs.writeFile(gitignorePath, gitignore + entry, 'utf-8');
-      }
-    } catch { /* non-fatal */ }
-
-    await fs.writeFile(tmpPath, content, 'utf-8');
-    await fs.rename(tmpPath, contextPath);
-    console.log(`[GeminiContext] Wrote context file for ${workerLabel} at ${contextPath}`);
-
-    // Write/update the main GEMINI.md that imports per-worker files
-    await _updateGeminiMasterFile(projectPath);
-
-    return contextPath;
-  } catch (error) {
-    console.error(`[GeminiContext] Failed to write context file: ${error.message}`);
-    try { await fs.unlink(tmpPath); } catch { /* ignore */ }
-    return null;
-  }
-}
-
-/**
- * Update the master GEMINI.md to import all active per-worker context files.
- * Uses Gemini CLI's @import syntax to reference per-worker files.
- */
-async function _updateGeminiMasterFile(projectPath) {
-  const masterPath = path.join(projectPath, 'GEMINI.md');
-
-  // Find all active per-worker files
-  try {
-    const allFiles = await fs.readdir(projectPath);
-    const workerFiles = allFiles.filter(f =>
-      f.startsWith('GEMINI-strategos-worker-') && f.endsWith('.md')
-    );
-
-    if (workerFiles.length === 0) {
-      // No worker files — remove master GEMINI.md if it was ours
-      try {
-        const existing = await fs.readFile(masterPath, 'utf-8');
-        if (existing.includes('<!-- Strategos managed -->')) {
-          await fs.unlink(masterPath);
-          console.log(`[GeminiContext] Removed empty master GEMINI.md`);
-        }
-      } catch { /* ENOENT is fine */ }
-      return;
-    }
-
-    // Build master GEMINI.md with imports
-    const imports = workerFiles.map(f => `@import ./${f}`).join('\n');
-    const masterContent = `<!-- Strategos managed -->\n# Strategos Workers\n\n${imports}\n`;
-
-    const tmpPath = masterPath + '.tmp';
-    await fs.writeFile(tmpPath, masterContent, 'utf-8');
-    await fs.rename(tmpPath, masterPath);
-  } catch (error) {
-    console.error(`[GeminiContext] Failed to update master GEMINI.md: ${error.message}`);
-  }
-}
-
-export async function removeGeminiContext(projectPath, excludeWorkerId = null) {
-  const { workers } = await import('./state.js');
-
-  if (excludeWorkerId) {
-    // Remove specific worker's context file
-    const workerContextPath = path.join(projectPath, `GEMINI-strategos-worker-${excludeWorkerId}.md`);
-    try {
-      await fs.unlink(workerContextPath);
-      console.log(`[GeminiContext] Removed context file for ${excludeWorkerId}`);
-    } catch (error) {
-      if (error.code !== 'ENOENT') {
-        console.error(`[GeminiContext] Failed to remove context file: ${error.message}`);
-      }
-    }
-    // Update master file to reflect removal
-    await _updateGeminiMasterFile(projectPath);
-    return;
-  }
-
-  // No specific worker — check if any gemini workers are still using this path
-  const otherGeminiWorkers = Array.from(workers.values()).filter(
-    w => w.workingDir === projectPath && w.status === 'running' && w.backend === 'gemini'
-  );
-  if (otherGeminiWorkers.length > 0) {
-    return;
-  }
-
-  // Clean up all per-worker gemini context files
-  try {
-    const allFiles = await fs.readdir(projectPath);
-    for (const file of allFiles) {
-      if (file.startsWith('GEMINI-strategos-worker-') && file.endsWith('.md')) {
-        await fs.unlink(path.join(projectPath, file));
-        console.log(`[GeminiContext] Cleaned up orphaned context: ${file}`);
-      }
-    }
-  } catch (error) {
-    if (error.code !== 'ENOENT') {
-      console.error(`[GeminiContext] Failed to clean up context files: ${error.message}`);
-    }
-  }
-
-  // Remove master GEMINI.md if it was ours
-  const masterPath = path.join(projectPath, 'GEMINI.md');
-  try {
-    const existing = await fs.readFile(masterPath, 'utf-8');
-    if (existing.includes('<!-- Strategos managed -->')) {
-      await fs.unlink(masterPath);
-      console.log(`[GeminiContext] Removed master GEMINI.md`);
-    }
-  } catch { /* ENOENT is fine */ }
-}
-
-// ============================================
-// AIDER CONTEXT GENERATION
-// ============================================
-
-/**
- * Generate aider initial message content for a worker.
- * Unlike Claude (.claude/rules/) and Gemini (GEMINI.md), aider doesn't load
- * context files automatically. Instead, the task instructions are sent as the
- * first message via tmux send-keys after aider starts.
- */
-export function generateAiderContext(workerId, workerLabel, projectPath, ralphToken = null, options = {}) {
-  const upperLabel = workerLabel.toUpperCase();
-  const isGeneral = upperLabel.startsWith('GENERAL:');
-  const isColonel = upperLabel.startsWith('COLONEL:') || upperLabel.startsWith('COL-') || upperLabel.startsWith('COL:');
-  const projectName = path.basename(projectPath);
-
-  let workerRole;
-  if (isGeneral) {
-    workerRole = 'Strategic Commander (GENERAL)';
-  } else if (isColonel) {
-    workerRole = 'Operational Commander (COLONEL)';
-  } else {
-    workerRole = 'Specialist Worker';
-  }
-
-  const workerType = detectWorkerType(workerLabel);
-  const { parentWorkerId } = options;
-
-  let roleInstruction = '';
-  if (workerType.role === 'implementer' || workerType.role === 'fixer') {
-    roleInstruction = 'You write code, test it, and commit it. Change only what the task requires.';
-  } else if (workerType.role === 'researcher') {
-    roleInstruction = 'You investigate and report. Focus on analysis, not code changes.';
-  } else if (workerType.role === 'tester') {
-    roleInstruction = 'You write tests and report results.';
-  } else if (workerType.role === 'reviewer') {
-    roleInstruction = 'You review code and report findings.';
-  } else {
-    roleInstruction = 'Execute your assigned task to completion.';
-  }
-
-  const ralphSection = ralphToken ? `\n\nSignal progress via Ralph:\ncurl -s -X POST ${STRATEGOS_API}/api/ralph/signal/by-worker/${workerId} -H "Content-Type: application/json" -d '{"status":"in_progress","progress":50,"currentStep":"what you are doing"}'` : '';
-
-  const parentSection = parentWorkerId ? `\nReport to parent: curl -s -X POST ${STRATEGOS_API}/api/workers/${escapePromptXml(parentWorkerId)}/input -H "Content-Type: application/json" -d '{"input":"your message","fromWorkerId":"${escapePromptXml(workerId)}"}'` : '';
-
-  return `Worker ${workerId} | ${escapePromptXml(workerLabel)} | ${workerRole}
-Project: ${escapePromptXml(projectName)} | Dir: ${escapePromptXml(projectPath)}
-
-${roleInstruction}
-
-Git commit frequently. Stay within ${escapePromptXml(THEA_ROOT)}/.${parentSection}${ralphSection}`;
-}
-
-/**
- * Write aider context — writes a .aider.strategos-{workerId}.md file
- * that aider loads via --read flag for persistent context.
- * Task is sent separately as an interactive message.
- */
-export async function writeAiderContext(workerId, workerLabel, projectPath, ralphToken = null, options = {}) {
-  const contextContent = generateAiderContext(workerId, workerLabel, projectPath, ralphToken, options);
-  const contextPath = path.join(projectPath, `.aider.strategos-${workerId}.md`);
-  try {
-    await fs.writeFile(contextPath, contextContent, 'utf8');
-    console.log(`[AiderContext] Wrote context to ${contextPath}`);
-    return contextPath;
-  } catch (err) {
-    console.error(`[AiderContext] Failed to write ${contextPath}: ${err.message}`);
-    return null;
-  }
-}
-
-/**
- * Remove aider context — cleans up .aider.strategos-*.md files.
- */
-export async function removeAiderContext(projectPath, excludeWorkerId = null) {
-  // Clean up .aider.strategos-*.md files
-  try {
-    const dir = await fs.readdir(projectPath);
-    for (const file of dir) {
-      if (file.startsWith('.aider.strategos-') && file.endsWith('.md')) {
-        const fileWorkerId = file.replace('.aider.strategos-', '').replace('.md', '');
-        if (excludeWorkerId && fileWorkerId === excludeWorkerId) continue;
-        await fs.unlink(path.join(projectPath, file)).catch(() => {});
-      }
-    }
-  } catch {
-    // Directory may not exist
-  }
-  return;
-}

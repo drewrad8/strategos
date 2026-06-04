@@ -206,7 +206,7 @@ echo ""
 # Anthropic (optional - Claude CLI doesn't need it)
 echo -e "${BOLD}Anthropic API Key${NC} (optional - for direct API calls)"
 if [ -n "$ANTHROPIC_KEY" ]; then
-    echo -e "  Found in environment: ${GREEN}sk-ant-...${ANTHROPIC_KEY: -4}${NC}"
+    echo -e "  Found in environment: ${GREEN}***${ANTHROPIC_KEY: -4}${NC}"
     read -p "  Use this key? [Y/n]: " -n 1 -r
     echo
     if [[ $REPLY =~ ^[Nn]$ ]]; then

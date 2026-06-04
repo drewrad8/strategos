@@ -10,6 +10,9 @@
  */
 
 import { execAsync, workers } from './state.js';
+import { getLogger } from '../logger.js';
+
+const logger = getLogger('workers.resources');
 
 // ============================================
 // CONSTANTS
@@ -83,7 +86,7 @@ export async function getSystemResources() {
     _lastResourceCheckAt = now;
     return result;
   } catch (err) {
-    console.error(`[Resources] Failed to read /proc/meminfo: ${err.message}`);
+    logger.error('[workers.resources] Failed to read /proc/meminfo', { error: err.message });
     // Return a permissive default so we don't block spawns on read failure
     return {
       totalMB: 0, availableMB: Infinity, usedPercent: 0,
@@ -170,7 +173,7 @@ export async function checkSpawnResources() {
   }
 
   if (warnings.length > 0) {
-    console.warn(`[Resources] Spawn allowed with warnings: ${warnings.join(', ')}`);
+    logger.warn('[workers.resources] Spawn allowed with warnings', { warnings });
   }
 
   return {

@@ -15,6 +15,7 @@ import {
   getPendingWorkers,
   getWorkerDependencies
 } from './workerManager.js';
+import { isContextLessInput } from './workers/inputGuard.js';
 
 import { sanitizeErrorMessage } from './errorUtils.js';
 import { projectExists, safeResolvePath } from './projectScanner.js';
@@ -22,13 +23,15 @@ import { getMetricsService, MetricTypes } from './metricsService.js';
 
 import path from 'path';
 import os from 'os';
+import { getLogger } from './logger.js';
 
 let metricsBroadcastInterval = null;
 
 // Shared validation constants (single source of truth)
 import {
-  VALID_WORKER_ID, VALID_SIMPLE_ID, CONTROL_CHAR_RE, MULTILINE_CONTROL_CHAR_RE,
-  MAX_TASK_LENGTH, MAX_LABEL_LENGTH, MAX_INPUT_LENGTH
+  VALID_WORKER_ID, CONTROL_CHAR_RE, MULTILINE_CONTROL_CHAR_RE,
+  MAX_TASK_LENGTH, MAX_LABEL_LENGTH, MAX_INPUT_LENGTH,
+  validateDependsOn, validateSpawnInput, buildSpawnOptions,
 } from './validation.js';
 
 // Per-socket rate limiting configuration (events per second)
@@ -83,7 +86,7 @@ function createSocketRateLimiter() {
  * See research/50-socket-realtime-audit.md §1.2 and recommendation R1 for details.
  *
  * Health events (server/workers/health.js):
- *   worker:general:stalled          — GENERAL worker has stalled
+ *   worker:general:stalled          — GENERAL or COLONEL worker has stalled (handled: OrchestratorContext toast)
  *   worker:auto-killed:stall        — Worker auto-killed for stalling
  *   worker:auto-killed:completion   — Worker auto-killed after completion timeout
  *   worker:completion-nudge         — Worker nudged toward completion
@@ -96,6 +99,8 @@ function createSocketRateLimiter() {
  *   worker:auto-dismissed           — Worker auto-dismissed after Ralph done signal
  *
  * Output events (server/workers/output.js):
+ *   worker:general:dead             — GENERAL tmux session died or crashed (handled: OrchestratorContext toast)
+ *   worker:colonel:dead             — COLONEL tmux session died or crashed (handled: OrchestratorContext toast)
  *   worker:role:violation           — GENERAL worker detected coding (role guard)
  *   worker:rate_limited             — Worker output rate-limited
  *   worker:autocontinue             — Auto-continue triggered
@@ -117,15 +122,11 @@ function createSocketRateLimiter() {
 export function setupSocketHandlers(io, theaRoot) {
   // Handle server-level socket errors
   io.engine.on('connection_error', (err) => {
-    console.error('[Socket.io] Connection error:', {
-      code: err.code,
-      message: err.message,
-      context: err.context
-    });
+    getLogger().error('[socket.handler] Connection error', { event: 'connection_error', code: err.code, err: err.message, context: err.context });
   });
 
   io.on('connection', (socket) => {
-    console.log(`Client connected: ${socket.id}`);
+    getLogger().info('[socket.handler] Client connected', { socketId: socket.id });
 
     // Per-socket rate limiter
     const rateLimiter = createSocketRateLimiter();
@@ -135,10 +136,14 @@ export function setupSocketHandlers(io, theaRoot) {
     // the socket to have joined the target worker's room first.
     const joinedWorkers = new Set();
 
+    // Per-socket rawInput line buffers: workerId -> accumulated chars awaiting newline.
+    // Used to detect complete lines before applying the context-less input guard.
+    const rawInputLineBuffers = new Map();
+
     // Per-socket middleware: rate-limit all incoming events before they reach handlers
     socket.use(([event, ...args], next) => {
       if (rateLimiter.check(event)) {
-        console.warn(`[RateLimit] Socket ${socket.id} throttled on ${event}`);
+        getLogger().warn('[socket.handler] Socket rate limited', { socketId: socket.id, event });
         return next(new Error('Rate limit exceeded'));
       }
       next();
@@ -146,7 +151,7 @@ export function setupSocketHandlers(io, theaRoot) {
 
     // Socket-level error handling
     socket.on('error', (error) => {
-      console.error(`[Socket] Error for ${socket.id}:`, error.message || error);
+      getLogger().error('[socket.handler] Socket error', { socketId: socket.id, err: error.message || String(error) });
     });
 
     // Send current state on connect (wrapped to prevent crash on rapid disconnect)
@@ -171,7 +176,7 @@ export function setupSocketHandlers(io, theaRoot) {
         }
       }
     } catch (err) {
-      console.warn(`[Socket] Failed to send initial state to ${socket.id}:`, err.message);
+      getLogger().warn('[socket.handler] Failed to send initial state', { socketId: socket.id, err: err.message });
     }
 
     // Handle worker spawn (with optional dependencies and context)
@@ -191,7 +196,8 @@ export function setupSocketHandlers(io, theaRoot) {
       autoAccept,
       ralphMode,
       backend,
-      model
+      model,
+      effortLevel
     }) => {
       try {
         // SECURITY: Safely resolve project path with traversal prevention
@@ -225,58 +231,41 @@ export function setupSocketHandlers(io, theaRoot) {
           socket.emit('error', { message: 'Initial input too large or invalid' });
           return;
         }
-        if (dependsOn !== undefined) {
-          if (!Array.isArray(dependsOn) || dependsOn.length > 50) {
-            socket.emit('error', { message: 'dependsOn must be an array with at most 50 entries' });
-            return;
-          }
-          if (!dependsOn.every(id => typeof id === 'string' && /^[a-zA-Z0-9-]{1,36}$/.test(id))) {
-            socket.emit('error', { message: 'dependsOn entries must be valid worker IDs' });
-            return;
-          }
+        // Shared dependsOn validation — unified on VALID_WORKER_ID (was a loose
+        // /^[a-zA-Z0-9-]{1,36}$/ here, which had DIVERGED from the REST path).
+        const depCheck = validateDependsOn(dependsOn);
+        if (!depCheck.ok) {
+          socket.emit('error', { message: depCheck.error });
+          return;
         }
 
-        // Validate pass-through spawn fields (defense-in-depth: strip invalid, don't reject)
+        // Shared spawn sub-field validation (onComplete + id pass-through fields)
+        const shared = validateSpawnInput({ onComplete, workflowId, taskId, parentWorkerId, parentLabel });
+        const validParentWorkerId = shared.parentWorkerId;
+        // Socket-specific: task is string-only here (REST also accepts an object
+        // task — intentionally NOT unified to preserve socket behavior).
         const validTask = (task !== undefined && task !== null) ?
           (typeof task === 'string' && task.length <= MAX_TASK_LENGTH && !MULTILINE_CONTROL_CHAR_RE.test(task) ? task : undefined) : undefined;
-        const validWorkflowId = (workflowId !== undefined && workflowId !== null) ?
-          (typeof workflowId === 'string' && workflowId.length <= 100 && VALID_SIMPLE_ID.test(workflowId) ? workflowId : undefined) : undefined;
-        const validTaskId = (taskId !== undefined && taskId !== null) ?
-          (typeof taskId === 'string' && taskId.length <= 100 && VALID_SIMPLE_ID.test(taskId) ? taskId : undefined) : undefined;
-        const validParentWorkerId = (parentWorkerId !== undefined && parentWorkerId !== null) ?
-          (typeof parentWorkerId === 'string' && VALID_WORKER_ID.test(parentWorkerId) ? parentWorkerId : undefined) : undefined;
-        const validParentLabel = (parentLabel !== undefined && parentLabel !== null) ?
-          (typeof parentLabel === 'string' && parentLabel.length <= MAX_LABEL_LENGTH && !CONTROL_CHAR_RE.test(parentLabel) ? parentLabel : undefined) : undefined;
-        // Validate onComplete: type must be one of the known action types,
-        // and total JSON size capped to prevent memory abuse via deeply nested config
-        const VALID_ONCOMPLETE_TYPES = ['spawn', 'webhook', 'emit'];
-        const MAX_ONCOMPLETE_SIZE = 10000; // 10KB
-        const validOnComplete = (() => {
-          if (onComplete === undefined || onComplete === null) return undefined;
-          if (typeof onComplete !== 'object' || Array.isArray(onComplete)) return undefined;
-          if (typeof onComplete.type !== 'string' || !VALID_ONCOMPLETE_TYPES.includes(onComplete.type)) return undefined;
-          try {
-            if (JSON.stringify(onComplete).length > MAX_ONCOMPLETE_SIZE) return undefined;
-          } catch { return undefined; }
-          return { type: onComplete.type, config: onComplete.config || {} };
-        })();
         // Validate model name (defense-in-depth: strip invalid, match routes.js pattern)
         const validModel = (model !== undefined && typeof model === 'string' && model.length <= 100 && /^[a-zA-Z0-9._:/-]+$/.test(model)) ? model : undefined;
+        const validEfforts = ['low', 'medium', 'high', 'max'];
+        const validEffortLevel = (effortLevel !== undefined && validEfforts.includes(effortLevel))
+          ? effortLevel : undefined;
 
-        // Build options object
-        const options = {};
-        if (dependsOn) options.dependsOn = dependsOn;
-        if (validOnComplete) options.onComplete = validOnComplete;
-        if (validWorkflowId) options.workflowId = validWorkflowId;
-        if (validTaskId) options.taskId = validTaskId;
-        // Context passing options
-        if (validTask) options.task = validTask;
-        if (validParentWorkerId) options.parentWorkerId = validParentWorkerId;
-        if (validParentLabel) options.parentLabel = validParentLabel;
-        if (initialInput) options.initialInput = initialInput;
-        // Default autoAccept and ralphMode to TRUE for all spawns (match routes.js)
-        options.autoAccept = autoAccept !== false; // true unless explicitly false
-        options.ralphMode = ralphMode !== false;   // true unless explicitly false
+        // Build options object — common assembly shared via buildSpawnOptions;
+        // backend/model/effortLevel layered on below (socket-specific).
+        const options = buildSpawnOptions({
+          dependsOn,
+          onComplete: shared.onComplete,
+          workflowId: shared.workflowId,
+          taskId: shared.taskId,
+          task: validTask,
+          parentWorkerId: validParentWorkerId,
+          parentLabel: shared.parentLabel,
+          initialInput,
+          autoAccept,
+          ralphMode,
+        });
         // Backend selection: explicit > parent inheritance > 'claude' default
         if (backend === 'gemini' || backend === 'aider') {
           options.backend = backend;
@@ -288,6 +277,7 @@ export function setupSocketHandlers(io, theaRoot) {
             if (parentWorker.backend === 'aider' && parentWorker.model) options.model = parentWorker.model;
           }
         }
+        if (validEffortLevel !== undefined) options.effortLevel = validEffortLevel;
 
         const worker = await spawnWorker(resolvedPath, label, io, options);
 
@@ -322,12 +312,12 @@ export function setupSocketHandlers(io, theaRoot) {
       if (!joinedWorkers.has(workerId)) {
         return socket.emit('error', { message: 'Not subscribed to this worker', workerId });
       }
-      console.log(`[Socket] Received worker:kill for ${workerId} (force: ${!!force})`);
+      getLogger().info('[socket.handler] Received worker:kill', { socketId: socket.id, workerId, force: !!force });
       try {
-        await killWorker(workerId, io, { force: !!force });
-        console.log(`[Socket] Worker ${workerId} killed successfully`);
+        await killWorker(workerId, io, { force: !!force, reason: 'killed_by_human' });
+        getLogger().info('[socket.handler] Worker killed successfully', { workerId });
       } catch (error) {
-        console.error(`[Socket] Failed to kill worker ${workerId}:`, error.message);
+        getLogger().error('[socket.handler] Failed to kill worker', { workerId, err: error.message });
         socket.emit('error', { message: sanitizeErrorMessage(error), workerId });
       }
     });
@@ -350,7 +340,7 @@ export function setupSocketHandlers(io, theaRoot) {
           const sender = getWorkerInternal(fromWorkerId);
           const receiver = getWorkerInternal(workerId);
           if (sender && receiver && sender.project && receiver.project && sender.project !== receiver.project) {
-            console.warn(`[INPUT] Cross-project input blocked: worker ${fromWorkerId} (${sender.project}) tried to send input to worker ${workerId} (${receiver.project})`);
+            getLogger().warn('[socket.handler] Cross-project input blocked', { event: 'cross_project_blocked', socketId: socket.id, fromWorkerId, workerId, senderProject: sender.project, receiverProject: receiver.project });
             return socket.emit('error', {
               message: `Cross-project input blocked: sender project (${sender.project}) does not match receiver project (${receiver.project})`,
               workerId
@@ -376,6 +366,44 @@ export function setupSocketHandlers(io, theaRoot) {
         if (!joinedWorkers.has(workerId)) {
           return socket.emit('error', { message: 'Not subscribed to this worker', workerId });
         }
+
+        // Context-less guard: accumulate into a per-worker line buffer.
+        // Individual keystrokes pass through immediately; the guard fires only
+        // when a complete line is assembled (newline received). Lines >80 chars
+        // or containing technical markers are fast-allowed and never blocked.
+        const prev = rawInputLineBuffers.get(workerId) || '';
+        const buf = prev + keys;
+
+        // Overflow guard: buffers longer than 1000 chars will fast-allow anyway (>80 char rule).
+        // Clear buffer and forward normally to avoid unbounded memory growth.
+        if (buf.length > 1000) {
+          rawInputLineBuffers.delete(workerId);
+          await sendRawInput(workerId, keys);
+          return;
+        }
+
+        const nlIdx = buf.search(/[\n\r]/);
+
+        if (nlIdx === -1) {
+          // No complete line yet — store accumulated chars and forward this keystroke.
+          rawInputLineBuffers.set(workerId, buf);
+          await sendRawInput(workerId, keys);
+          return;
+        }
+
+        // Complete line assembled — test the text before the newline.
+        const line = buf.slice(0, nlIdx);
+        rawInputLineBuffers.set(workerId, buf.slice(nlIdx + 1));
+
+        if (isContextLessInput(line)) {
+          getLogger().warn('[socket.handler] Context-less rawInput rejected', { socketId: socket.id, workerId });
+          socket.emit('worker:input:rejected', {
+            workerId,
+            reason: 'context-less input forbidden — include concrete task and end state'
+          });
+          return;
+        }
+
         await sendRawInput(workerId, keys);
       } catch (error) {
         socket.emit('error', { message: sanitizeErrorMessage(error), workerId });
@@ -438,10 +466,10 @@ export function setupSocketHandlers(io, theaRoot) {
 === RALPH MODE ENABLED ===
 When you complete your current task, signal completion by running:
 
-curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Content-Type: application/json" -d '{"status":"done"}'
+curl -s --retry 3 --retry-delay 2 --retry-connrefused -X POST http://localhost:38007/api/ralph/signal/by-worker/${worker.id} -H "Content-Type: application/json" -H "X-Ralph-Token: ${worker.ralphToken}" -d '{"status":"done"}'
 
 If blocked, signal:
-curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Content-Type: application/json" -d '{"status":"blocked","reason":"brief description"}'
+curl -s --retry 3 --retry-delay 2 --retry-connrefused -X POST http://localhost:38007/api/ralph/signal/by-worker/${worker.id} -H "Content-Type: application/json" -H "X-Ralph-Token: ${worker.ralphToken}" -d '{"status":"blocked","reason":"brief description"}'
 ===========================
 
 `;
@@ -521,7 +549,7 @@ curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Co
       try {
         await resizeWorkerTerminal(workerId, cols, rows, io);
       } catch (error) {
-        console.error('Resize error:', error.message);
+        getLogger().error('[socket.handler] Resize error', { workerId, err: error.message });
         socket.emit('error', { message: 'Resize failed', workerId });
       }
     });
@@ -566,7 +594,7 @@ curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Co
 
     // Handle metrics subscription (using Socket.io rooms)
     socket.on('metrics:subscribe', () => {
-      console.log(`[Socket] Client ${socket.id} subscribed to metrics`);
+      getLogger().info('[socket.handler] Client subscribed to metrics', { socketId: socket.id });
       socket.join('metrics');
 
       // Send immediate metrics update to the subscribing client
@@ -574,7 +602,7 @@ curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Co
         const metricsData = getSystemMetricsData();
         socket.emit('metrics:update', metricsData);
       } catch (error) {
-        console.error('[Socket] Error sending initial metrics:', error.message);
+        getLogger().error('[socket.handler] Error sending initial metrics', { socketId: socket.id, err: error.message });
       }
 
       // Start broadcast interval if not running
@@ -583,14 +611,14 @@ curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Co
           startMetricsBroadcast(io);
         }
       } catch (error) {
-        console.error('[Socket] Error starting metrics broadcast:', error.message);
+        getLogger().error('[socket.handler] Error starting metrics broadcast', { err: error.message });
       }
     });
 
     // Handle metrics unsubscription (using Socket.io rooms)
     socket.on('metrics:unsubscribe', () => {
       try {
-        console.log(`[Socket] Client ${socket.id} unsubscribed from metrics`);
+        getLogger().info('[socket.handler] Client unsubscribed from metrics', { socketId: socket.id });
         socket.leave('metrics');
 
         // Stop broadcast interval if no more subscribers
@@ -598,20 +626,21 @@ curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Co
         if ((!room || room.size === 0) && metricsBroadcastInterval) {
           clearInterval(metricsBroadcastInterval);
           metricsBroadcastInterval = null;
-          console.log('[Socket] Metrics broadcast stopped - no subscribers');
+          getLogger().info('[socket.handler] Metrics broadcast stopped - no subscribers');
         }
       } catch (error) {
-        console.error('[Socket] Error in metrics:unsubscribe:', error.message);
+        getLogger().error('[socket.handler] Error in metrics:unsubscribe', { socketId: socket.id, err: error.message });
       }
     });
 
     // Handle disconnect with reason logging
     socket.on('disconnect', (reason) => {
       try {
-        console.log(`Client disconnected: ${socket.id}, reason: ${reason}`);
-        // Clean up rate limiter and ownership set to prevent memory leak
+        getLogger().info('[socket.handler] Client disconnected', { socketId: socket.id, reason });
+        // Clean up rate limiter, ownership set, and rawInput buffers to prevent memory leak
         rateLimiter.destroy();
         joinedWorkers.clear();
+        rawInputLineBuffers.clear();
 
         // Socket.io automatically removes socket from rooms on disconnect.
         // Stop broadcast if metrics room is now empty.
@@ -619,19 +648,19 @@ curl -X POST http://localhost:38007/api/ralph/signal/${worker.ralphToken} -H "Co
         if ((!room || room.size === 0) && metricsBroadcastInterval) {
           clearInterval(metricsBroadcastInterval);
           metricsBroadcastInterval = null;
-          console.log('[Socket] Metrics broadcast stopped - no subscribers');
+          getLogger().info('[socket.handler] Metrics broadcast stopped - no subscribers');
         }
 
         // Log specific disconnect reasons for debugging
         if (reason === 'ping timeout') {
-          console.warn(`[Socket] Client ${socket.id} disconnected due to ping timeout - possible network issue`);
+          getLogger().warn('[socket.handler] Client disconnected: ping timeout', { socketId: socket.id, reason });
         } else if (reason === 'transport close') {
-          console.warn(`[Socket] Client ${socket.id} transport closed unexpectedly`);
+          getLogger().warn('[socket.handler] Client transport closed unexpectedly', { socketId: socket.id, reason });
         } else if (reason === 'transport error') {
-          console.error(`[Socket] Client ${socket.id} transport error`);
+          getLogger().error('[socket.handler] Client transport error', { socketId: socket.id, reason });
         }
       } catch (error) {
-        console.error('[Socket] Error in disconnect handler:', error.message);
+        getLogger().error('[socket.handler] Error in disconnect handler', { socketId: socket.id, err: error.message });
       }
     });
 
@@ -696,7 +725,7 @@ function getSystemMetricsData() {
 
 // Start periodic metrics broadcast using Socket.io rooms
 function startMetricsBroadcast(io) {
-  console.log('[Socket] Starting metrics broadcast (every 5 seconds)');
+  getLogger().info('[socket.handler] Starting metrics broadcast');
 
   metricsBroadcastInterval = setInterval(() => {
     const room = io.sockets.adapter.rooms.get('metrics');
@@ -706,7 +735,7 @@ function startMetricsBroadcast(io) {
       const metricsData = getSystemMetricsData();
       io.to('metrics').emit('metrics:update', metricsData);
     } catch (error) {
-      console.error('[Socket] Error broadcasting metrics:', error.message);
+      getLogger().error('[socket.handler] Error broadcasting metrics', { err: error.message });
     }
   }, 5000);
 
@@ -722,6 +751,6 @@ export function stopMetricsBroadcast() {
   if (metricsBroadcastInterval) {
     clearInterval(metricsBroadcastInterval);
     metricsBroadcastInterval = null;
-    console.log('[Socket] Metrics broadcast stopped');
+    getLogger().info('[socket.handler] Metrics broadcast stopped');
   }
 }

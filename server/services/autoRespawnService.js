@@ -1,17 +1,20 @@
 /**
- * Auto-respawn service for GENERAL workers.
+ * Auto-respawn service for workers with autoRespawn=true.
  *
- * When a GENERAL with autoRespawn=true dies (crash, session exhaustion, or kill),
- * this service spawns a fresh replacement with the same task and a handoff note
- * built from the dead worker's last Ralph signal.
+ * When any worker (general or non-general) with autoRespawn=true dies (crash,
+ * session exhaustion, or kill), this service spawns a fresh replacement with
+ * the same task and a handoff note built from the dead worker's last Ralph signal.
  *
  * Usage:
- *   registerAutoRespawn(workerId, config)   — call after spawning a general
- *   handleGeneralDeath(workerId, reason, io) — call when a general dies
- *   getAutoRespawnStatus()                  — returns all registrations + counts
+ *   registerAutoRespawn(workerId, config)      — call after spawning the worker
+ *   handleGeneralDeath(workerId, reason, io)   — call when a registered worker dies
+ *   getAutoRespawnStatus()                     — returns all registrations + counts
+ *
+ * Non-general workers: pass parentWorkerId in config to preserve hierarchy on respawn.
  */
 
 import { getLogger } from '../logger.js';
+import { buildHandoffNote } from './handoffUtils.js';
 
 const logger = getLogger();
 
@@ -40,8 +43,10 @@ const DEFAULT_COOLDOWN_MS = 120_000; // 2 minutes
  *   - autoAccept {boolean}
  *   - forcedAutonomy {boolean}
  *   - bulldozeMode {boolean}
+ *   - model {string|null}          Model override (e.g. 'opus') — preserved across respawns
  *   - chainId {string|null}        Set when re-registering a replacement worker
  *   - respawnCount {number}        Set when re-registering a replacement worker
+ *   - parentWorkerId {string|null} Parent to re-attach to on respawn (non-generals)
  */
 export function registerAutoRespawn(workerId, config) {
   const {
@@ -54,8 +59,10 @@ export function registerAutoRespawn(workerId, config) {
     autoAccept = true,
     forcedAutonomy = true,
     bulldozeMode = false,
+    model = null,
     chainId = null,
     respawnCount = 0,
+    parentWorkerId = null,
   } = config;
 
   if (!taskDescription || !projectPath || !label) {
@@ -74,9 +81,11 @@ export function registerAutoRespawn(workerId, config) {
     autoAccept,
     forcedAutonomy,
     bulldozeMode,
+    model,
     chainId: chainId || workerId,      // first worker is its own chain root
     respawnCount,
     registeredAt: Date.now(),
+    parentWorkerId,
   };
 
   registrations.set(workerId, registration);
@@ -139,22 +148,8 @@ export async function handleGeneralDeath(workerId, reason, io = null, workerSnap
     return;
   }
 
-  // Build handoff note from last Ralph signal
-  const handoffLines = [];
-  const snap = workerSnapshot || {};
-  if (snap.ralphProgress !== undefined && snap.ralphProgress !== null) {
-    handoffLines.push(`Progress at death: ${snap.ralphProgress}%`);
-  }
-  if (snap.ralphCurrentStep) {
-    handoffLines.push(`Last step: ${snap.ralphCurrentStep}`);
-  }
-  if (snap.ralphLearnings) {
-    handoffLines.push(`Learnings from previous run:\n${snap.ralphLearnings}`);
-  }
-
-  const handoffNote = handoffLines.length > 0
-    ? `--- HANDOFF NOTE (auto-respawn #${chainState.count + 1}, reason: ${reason}) ---\n${handoffLines.join('\n')}\n--- END HANDOFF NOTE ---\n\n`
-    : `--- HANDOFF NOTE (auto-respawn #${chainState.count + 1}, reason: ${reason}) ---\nNo prior progress information available.\n--- END HANDOFF NOTE ---\n\n`;
+  // Build handoff note from last Ralph signal (includes progress, step, learnings, blocker)
+  const handoffNote = buildHandoffNote(workerSnapshot, chainState.count + 1, reason);
 
   const fullTask = `${handoffNote}${reg.taskDescription}`;
 
@@ -174,22 +169,27 @@ export async function handleGeneralDeath(workerId, reason, io = null, workerSnap
 
     const newWorker = await spawnWorker(reg.projectPath, reg.label, io, {
       task: { description: fullTask },
-      parentWorkerId: null,  // No parent — spawned as independent top-level general
+      // Preserve parentWorkerId for non-general workers so hierarchy is maintained;
+      // generals are top-level and set null intentionally.
+      parentWorkerId: reg.parentWorkerId || null,
       autoAccept: reg.autoAccept,
       ralphMode: true,
       allowDuplicate: true,  // Allow duplicate label since we're replacing a dead worker
       effortLevel: reg.effortLevel,
+      model: reg.model,
       autoRespawn: true,
       autoRespawnConfig: {
         taskDescription: reg.taskDescription,  // Store original task (without handoff prefix)
         projectPath: reg.projectPath,
         label: reg.label,
+        parentWorkerId: reg.parentWorkerId || null,
         maxRespawns: reg.maxRespawns,
         cooldownMs: reg.cooldownMs,
         effortLevel: reg.effortLevel,
         autoAccept: reg.autoAccept,
         forcedAutonomy: reg.forcedAutonomy,
         bulldozeMode: reg.bulldozeMode,
+        model: reg.model,
         chainId: reg.chainId,
         respawnCount: chainState.count,
       },
@@ -234,6 +234,7 @@ export function getAutoRespawnStatus() {
       cooldownMs: reg.cooldownMs,
       lastSpawnAt: chainState.lastSpawnAt || null,
       registeredAt: reg.registeredAt,
+      model: reg.model || null,
     });
   }
 

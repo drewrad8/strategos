@@ -8,11 +8,14 @@ import { v4 as uuidv4 } from 'uuid';
 import { promisify } from 'util';
 import path from 'path';
 import fs from 'fs/promises';
+import { getLogger } from '../logger.js';
 import { writeFileSync, renameSync, mkdirSync, existsSync, readdirSync, readFileSync, statSync, unlinkSync } from 'fs';
 
 export { spawn, exec, uuidv4, path, fs, writeFileSync, renameSync, mkdirSync, existsSync, readdirSync, readFileSync, statSync, unlinkSync };
 
 export const execAsync = promisify(exec);
+
+const logger = getLogger('workers.state');
 
 // ============================================
 // IN-MEMORY STATE
@@ -63,7 +66,7 @@ export const MAX_RESPAWN_SUGGESTIONS = 20;
 
 // Auto-dismiss timers for workers that signal done
 export const autoDismissTimers = new Map();
-export const AUTO_DISMISS_DELAY_MS = 90 * 1000; // 90 seconds
+export const AUTO_DISMISS_DELAY_MS = 30 * 60 * 1000; // 30 minutes
 
 // Per-worker send lock
 export const _sendingInput = new Set();
@@ -75,6 +78,38 @@ export const _tmuxSendLock = new Map();
 export const _processingQueues = new Set();
 
 // ============================================
+// TMUX SEND LOCK
+// ============================================
+
+const TMUX_LOCK_TIMEOUT_MS = 5000;
+
+function _runWithTimeout(fn, ms) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`tmux send lock timed out after ${ms}ms`)), ms);
+    Promise.resolve(fn()).then(
+      (val) => { clearTimeout(timer); resolve(val); },
+      (err) => { clearTimeout(timer); reject(err); }
+    );
+  });
+}
+
+export async function withTmuxLock(workerId, fn) {
+  const prev = _tmuxSendLock.get(workerId) || Promise.resolve();
+  const next = prev.then(
+    () => _runWithTimeout(fn, TMUX_LOCK_TIMEOUT_MS),
+    () => _runWithTimeout(fn, TMUX_LOCK_TIMEOUT_MS)
+  );
+  const settled = next.catch(() => {});
+  _tmuxSendLock.set(workerId, settled);
+  settled.finally(() => {
+    if (_tmuxSendLock.get(workerId) === settled) {
+      _tmuxSendLock.delete(workerId);
+    }
+  });
+  return next;
+}
+
+// ============================================
 // CONSTANTS
 // ============================================
 
@@ -82,7 +117,7 @@ export const SESSION_PREFIX = 'thea-worker-';
 // Auto-derive THEA_ROOT from file location: state.js is at THEA_ROOT/<project>/server/workers/state.js
 const _stateFileDir = path.dirname(new URL(import.meta.url).pathname);
 export const THEA_ROOT = process.env.THEA_ROOT || path.resolve(_stateFileDir, '..', '..', '..');
-export const MAX_CONCURRENT_WORKERS = 50;
+export const MAX_CONCURRENT_WORKERS = Number(process.env.STRATEGOS_MAX_WORKERS) || 50;
 export const AUTO_CLEANUP_DELAY_MS = 30000;
 export const STALE_WORKER_THRESHOLD_MS = 30 * 60 * 1000;
 
@@ -91,7 +126,7 @@ export const DEFAULT_COLS = 120;
 export const DEFAULT_ROWS = 40;
 
 // Strategos API configuration
-export const STRATEGOS_API = 'http://localhost:38007';
+export const STRATEGOS_API = `http://localhost:${Number(process.env.PORT) || 38007}`;
 
 // Persistence file paths
 export const PERSISTENCE_DIR = path.join(path.dirname(new URL(import.meta.url).pathname), '..', '.tmp');
@@ -100,10 +135,10 @@ export const CHECKPOINT_DIR = path.join(PERSISTENCE_DIR, 'checkpoints');
 
 // Ensure directories exist
 fs.mkdir(CHECKPOINT_DIR, { recursive: true }).catch(err => {
-  console.error(`[Init] Failed to create checkpoint directory ${CHECKPOINT_DIR}: ${err.message}`);
+  logger.error('[workers.state] Failed to create checkpoint directory', { dir: CHECKPOINT_DIR, error: err.message });
 });
 fs.mkdir(PERSISTENCE_DIR, { recursive: true }).catch(err => {
-  console.error(`[Init] Failed to create persistence directory ${PERSISTENCE_DIR}: ${err.message}`);
+  logger.error('[workers.state] Failed to create persistence directory', { dir: PERSISTENCE_DIR, error: err.message });
 });
 
 // Queue processing constants
@@ -129,7 +164,7 @@ export function getWorkerDeathCallback() { return _onWorkerDeath; }
 
 let _tmuxFailCount = 0;
 let _tmuxFirstFailAt = 0;
-export const TMUX_CB_THRESHOLD = 3;
+export const TMUX_CB_THRESHOLD = 7;
 export const TMUX_CB_WINDOW_MS = 60000;
 
 export function getCircuitBreakerStatus() {
@@ -226,7 +261,7 @@ export function spawnTmux(args, timeoutMs = TMUX_TIMEOUT_MS) {
 
     const isQuiet = QUIET_TMUX_COMMANDS.has(args[0]);
     if (!isQuiet) {
-      console.log(`[spawnTmux] Running: tmux ${fullArgs.join(' ')}`);
+      logger.info('[workers.state] spawnTmux running', { cmd: `tmux ${fullArgs.join(' ')}` });
     }
     const proc = spawn('tmux', fullArgs, { stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '';
@@ -248,7 +283,7 @@ export function spawnTmux(args, timeoutMs = TMUX_TIMEOUT_MS) {
       settled = true;
       clearTimeout(timeout);
       if (!isQuiet || code !== 0) {
-        console.log(`[spawnTmux] Exited with code ${code}${stderr ? `, stderr: ${stderr}` : ''}`);
+        logger.info('[workers.state] spawnTmux exited', { code, ...(stderr ? { stderr } : {}) });
       }
       if (code === 0) {
         resolve({ stdout, stderr });
@@ -261,7 +296,7 @@ export function spawnTmux(args, timeoutMs = TMUX_TIMEOUT_MS) {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
-      console.error(`[spawnTmux] Error:`, err);
+      logger.error('[workers.state] spawnTmux error', { error: err.message || String(err) });
       reject(err);
     });
   });
@@ -391,5 +426,12 @@ export function normalizeWorker(worker) {
     taskReceivedAt: worker.taskReceivedAt ?? null,
     taskQualityScore: worker.taskQualityScore ?? null,
     autoRespawn: worker.autoRespawn ?? false,
+    contextInjected: worker.contextInjected ?? false,
+    effortLevel: worker.effortLevel ?? null,
+    contextTokens: worker.contextTokens ?? null,
+    contextTokensUpdatedAt: worker.contextTokensUpdatedAt ?? null,
+    originalModel: worker.originalModel ?? null,
+    originalEffort: worker.originalEffort ?? null,
+    fallbackReason: worker.fallbackReason ?? null,
   };
 }

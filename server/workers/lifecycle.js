@@ -11,23 +11,47 @@ import {
   SESSION_PREFIX, THEA_ROOT, MAX_CONCURRENT_WORKERS, AUTO_CLEANUP_DELAY_MS,
   DEFAULT_COLS, DEFAULT_ROWS, STRATEGOS_API,
   TMUX_CB_THRESHOLD, TMUX_CB_WINDOW_MS,
-  path, fs, spawn, uuidv4,
+  path, fs, spawn, uuidv4, existsSync, unlinkSync,
   addActivity, normalizeWorker,
   escapePromptXml, escapeJsonValue,
   spawnTmux, safeSendKeys, validateSessionName, sessionExists,
   getWorkerDeathCallback,
   isCircuitBreakerTripped, incrementCircuitBreaker, resetCircuitBreakerOnSuccess,
+  withTmuxLock,
 } from './state.js';
 
 import {
-  detectWorkerType, isProtectedWorker,
+  detectWorkerType,
   writeStrategosContext, removeStrategosContext,
-  writeGeminiContext, removeGeminiContext,
-  writeAiderContext, removeAiderContext,
-  generateAiderContext,
 } from './templates.js';
 
+import { createWorktree, removeWorktree } from './worktree.js';
+
 import { checkSpawnResources } from './resources.js';
+
+import { shouldFallback as _shouldFallback } from '../services/modelFallbackService.js';
+
+/**
+ * Apply per-model auto-fallback at spawn time. Returns
+ *   { model, effortLevel, fallback: { reason, originalModel, originalEffort } | null }
+ * where `model` and `effortLevel` are the (possibly substituted) values to spawn with.
+ */
+function applyModelFallback(label, model, effortLevel) {
+  // No model selected = inherit from claude defaults; fallback service decides only when target is explicit.
+  if (!model) return { model, effortLevel, fallback: null };
+  const decision = _shouldFallback(model, label);
+  if (!decision.fallback) return { model, effortLevel, fallback: null };
+  logger.warn(`[ModelFallback] ${label}: ${model} → ${decision.replacementModel} (${decision.reason})`);
+  return {
+    model: decision.replacementModel,
+    effortLevel: decision.replacementEffort,
+    fallback: {
+      reason: decision.reason,
+      originalModel: model,
+      originalEffort: effortLevel ?? null,
+    },
+  };
+}
 
 // ============================================
 // TOOL RESTRICTIONS BY ROLE
@@ -38,6 +62,15 @@ const READ_ONLY_ROLES = new Set(['GENERAL', 'COLONEL', 'REVIEW', 'RESEARCH']);
 
 // --tools flag: comma-separated, restricts which built-in tools EXIST (not just permissions)
 // --allowedTools only controls permission prompts — does NOT prevent usage!
+//
+// NOTE: Bash IS intentionally included here. Generals and colonels must be able to run
+// `curl` commands against the Strategos API (localhost:38007) for spawning workers and
+// Ralph signals. Removing Bash would break API coordination entirely.
+//
+// STRUCTURAL prevention: Edit, Write, NotebookEdit are ABSENT from this list — they
+// literally do not exist for these workers and cannot be called.
+// PROMPT prevention: The general template explicitly forbids all non-curl bash usage
+// with a BASH BLACKLIST and CORRECT ALTERNATIVES section. Two layers of defense.
 const READ_ONLY_TOOLS = 'Read,Glob,Grep,Bash,WebSearch,WebFetch';
 
 /**
@@ -59,17 +92,17 @@ function getToolRestrictionArgs(label) {
 // ============================================
 
 const EFFORT_LEVELS = {
-  GENERAL: 'high',     // strategic decisions need deep reasoning
-  COLONEL: 'medium',   // coordination
-  RESEARCH: 'medium',  // balanced exploration
-  IMPL: 'medium',      // balanced
-  FIX: 'medium',       // balanced debugging
-  REVIEW: 'low',       // pattern-matching, not deep reasoning
-  TEST: 'low',         // running tests is straightforward
+  GENERAL: 'max',      // strategic decisions need maximum reasoning
+  COLONEL: 'high',     // coordination with full context
+  RESEARCH: 'high',    // thorough exploration
+  IMPL: 'high',        // full implementation quality
+  FIX: 'high',         // thorough debugging
+  REVIEW: 'high',      // careful review
+  TEST: 'high',        // thorough test coverage
 };
 
 const DEFAULT_EFFORT = 'medium';
-const VALID_EFFORTS = new Set(['low', 'medium', 'high']);
+const VALID_EFFORTS = new Set(['low', 'medium', 'high', 'max']);
 
 /**
  * Returns the effort level for a worker based on its type.
@@ -92,13 +125,156 @@ function getEffortArgs(label, override = null) {
   return ['--effort', effort];
 }
 
+// ============================================
+// SHARED BACKEND LAUNCH + FAILURE-CLEANUP HELPERS
+// ============================================
+//
+// Single source of truth for the tmux spawn command per backend and for the
+// failure-cleanup teardown. Previously the immediate path (spawnWorker) and the
+// deferred path (startPendingWorker) each inlined this — and DIVERGED: the
+// immediate path hardcoded `claude` and ignored the requested backend, so a
+// dependency-free gemini/aider worker silently launched claude. Routing both
+// paths through buildBackendLaunchArgs() fixes that latent bug.
+
+/**
+ * Build the tmux `new-session` argv for a worker, selecting the binary + flags
+ * from the requested backend. Pure (depends only on its args + process.env).
+ *
+ * For backend 'claude' the caller passes the already-resolved (post-fallback)
+ * model/effortLevel so each spawn path keeps its own fallback timing. For
+ * 'aider' `model` is the aider model (defaulted here). For 'gemini' both are
+ * ignored. `id` is used only to name the per-worker aider context file.
+ *
+ * @param {object} opts
+ * @param {string} opts.backend - 'claude' (default), 'gemini', or 'aider'
+ * @param {string} opts.id - worker id (used for the aider context filename)
+ * @param {string} opts.sessionName - tmux session name
+ * @param {string} opts.workingDir - tmux cwd (worktree when isolated)
+ * @param {string} opts.label - worker label (drives tool/effort args for claude)
+ * @param {string|null} [opts.model] - resolved model (claude) / aider model
+ * @param {string|null} [opts.effortLevel] - resolved effort level (claude only)
+ * @returns {string[]} argv passed to spawnTmux
+ */
+export function buildBackendLaunchArgs({ backend, id, sessionName, workingDir, label, model = null, effortLevel = null }) {
+  if (backend === 'gemini') {
+    const geminiEnvArgs = [];
+    if (process.env.GEMINI_API_KEY) {
+      geminiEnvArgs.push('-e', `GEMINI_API_KEY=${process.env.GEMINI_API_KEY}`);
+    }
+    return [
+      'new-session', '-d',
+      '-s', sessionName,
+      '-x', String(DEFAULT_COLS),
+      '-y', String(DEFAULT_ROWS),
+      ...geminiEnvArgs,
+      '-c', workingDir,
+      'gemini', '--yolo'
+    ];
+  }
+
+  if (backend === 'aider') {
+    const aiderModel = model || 'ollama_chat/qwen2.5-coder:32b-instruct';
+    const aiderContextFile = `.aider.strategos-${id}.md`;
+    const isOpenAICompat = aiderModel.startsWith('openai/');
+    const backendEnvArgs = isOpenAICompat
+      ? ['-e', `OPENAI_API_BASE=${process.env.ZHIPUAI_API_BASE || process.env.OPENAI_API_BASE || 'https://open.bigmodel.cn/api/paas/v4/'}`,
+         '-e', `OPENAI_API_KEY=${process.env.ZHIPUAI_API_KEY || process.env.OPENAI_API_KEY || ''}`]
+      : ['-e', `OLLAMA_API_BASE=${process.env.OLLAMA_API_BASE || 'http://localhost:11434'}`];
+    return [
+      'new-session', '-d',
+      '-s', sessionName,
+      '-x', String(DEFAULT_COLS),
+      '-y', String(DEFAULT_ROWS),
+      ...backendEnvArgs,
+      '-c', workingDir,
+      'aider', '--model', aiderModel, '--yes', '--no-auto-commits',
+      '--read', aiderContextFile
+    ];
+  }
+
+  // Default: claude.
+  const toolArgs = getToolRestrictionArgs(label);
+  const effortArgs = getEffortArgs(label, effortLevel);
+  const modelArgs = model ? ['--model', model] : [];
+  return [
+    'new-session', '-d',
+    '-s', sessionName,
+    '-x', String(DEFAULT_COLS),
+    '-y', String(DEFAULT_ROWS),
+    '-e', `CLAUDE_CODE_EFFORT_LEVEL=${getEffortLevel(label, effortLevel)}`,
+    '-e', 'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=65',
+    '-c', workingDir,
+    'claude', '--dangerously-skip-permissions', ...modelArgs, ...toolArgs, ...effortArgs
+  ];
+}
+
+/**
+ * Launch a worker's tmux session for the given backend. Thin wrapper over
+ * buildBackendLaunchArgs() + spawnTmux() so both spawn paths share one code path.
+ */
+async function _launchWorker(opts) {
+  await spawnTmux(buildBackendLaunchArgs(opts));
+}
+
+/**
+ * Shared failure-cleanup for a spawn that threw. Tears down the half-created
+ * worker: marks it failed, drops dependency edges, purges per-worker state maps,
+ * removes the rules file + worktree, and emits an error activity.
+ *
+ * Caller-specific concerns stay in the caller: circuit-breaker accounting,
+ * inFlightSpawns/pendingWorkers bookkeeping, and the duplicate-error rethrow.
+ *
+ * @param {string} id - worker id
+ * @param {object} ctx
+ * @param {string} ctx.workingDir - tmux cwd / worktree dir (rules-file location)
+ * @param {boolean} ctx.isolated - whether a worktree was created (needs removal)
+ * @param {string} ctx.projectPath - canonical repo path (worktree parent)
+ * @param {string} ctx.projectName - project name (for the activity record)
+ * @param {string} ctx.label - worker label (for the activity record)
+ * @param {object|null} ctx.io - socket.io instance (may be null)
+ * @param {Error} ctx.error - the thrown error (message used in the activity)
+ * @param {string} ctx.activityVerb - leading text of the error activity message
+ */
+async function _cleanupFailedSpawn(id, { workingDir, isolated, projectPath, projectName, label, io, error, activityVerb }) {
+  markWorkerFailed(id);
+  removeWorkerDependencies(id);
+
+  if (workers.has(id)) {
+    stopPtyCapture(id);
+    stopHealthMonitor(id);
+    workers.delete(id);
+    invalidateWorkersCache();
+    outputBuffers.delete(id);
+    commandQueues.delete(id);
+    sessionFailCounts.delete(id);
+    ptyInstances.delete(id);
+    lastResizeSize.delete(id);
+  }
+  respawnAttempts.delete(id);
+
+  await removeStrategosContext(workingDir, id);
+  clearWorkerContext(id);
+
+  // Early-spawn-failure (§3.4): if a worktree was created before the throw, remove it.
+  if (isolated) {
+    await removeWorktree(projectPath, id);
+  }
+
+  const activity = addActivity('error', id, label, projectName,
+    `${activityVerb}: ${error.message}`);
+
+  if (io) {
+    io.emit('activity:new', activity);
+  }
+}
+
 import {
-  startPtyCapture, stopPtyCapture, sendInputDirect, sendInput,
+  startPtyCapture, stopPtyCapture, sendInputDirect, sendInput, flushCurrentOutputToDb,
 } from './output.js';
 
 import {
   startHealthMonitor, stopHealthMonitor,
-  addRespawnSuggestion,
+  addRespawnSuggestion, isProtectedOrColonel,
 } from './health.js';
 
 import { clearWorkerContext } from '../summaryService.js';
@@ -169,13 +345,24 @@ function initializeWorker(id, config, io) {
     autoAccept, ralphMode, backend, model,
     autoDismissAfterDone,
     autoRespawn, autoRespawnConfig,
+    injectProjectContext = false,
+    forcedAutonomy = false,
+    bulldozeMode: configBulldozeMode = false,
+    fallbackInfo = null,
+    // Worktree isolation: workingDir is the tmux cwd (the worktree when isolated);
+    // repoPath is the canonical repo. Default to projectPath = today's shared-cwd behavior.
+    workingDir = projectPath,
+    repoPath = projectPath,
+    isolated = false,
   } = config;
 
   const worker = {
     id,
     label,
     project: projectName,
-    workingDir: projectPath,
+    workingDir,
+    repoPath,
+    isolated,
     tmuxSession: sessionName,
     status: 'running',
     mode: 'tmux',
@@ -210,7 +397,7 @@ function initializeWorker(id, config, io) {
     ralphSignalCount: 0,
     firstRalphAt: null,
     lastRalphSignalAt: null,
-    bulldozeMode: false,
+    bulldozeMode: configBulldozeMode || false,
     bulldozePaused: false,
     bulldozeIdleCount: 0,
     bulldozeCyclesCompleted: 0,
@@ -228,9 +415,24 @@ function initializeWorker(id, config, io) {
     // Intelligence improvements
     autoDismissAfterDone: autoDismissAfterDone !== false, // default true
     taskReceivedAt: task ? new Date() : null,
+    forcedAutonomy: forcedAutonomy || false,
+    // ForcedAutonomy nudge tracking — initialize explicitly to prevent NaN in backoff math
+    _forcedAutonomyNudgeCount: 0,
+    _forcedAutonomyIdleCount: 0,
+    _forcedAutonomyLastNudge: null,
+    _missionComplete: false,
+    _missionCompleteNotified: false,
+    _pendingMissionCompleteReminder: false,
     // Auto-respawn support
     autoRespawn: autoRespawn === true,
     autoRespawnConfig: autoRespawnConfig || null,
+    _handoffRotating: false,
+    _successorId: null,
+    contextInjected: injectProjectContext,
+    // Auto-fallback observability — set when modelFallbackService substituted model+effort.
+    originalModel: fallbackInfo?.originalModel ?? null,
+    originalEffort: fallbackInfo?.originalEffort ?? null,
+    fallbackReason: fallbackInfo?.reason ?? null,
   };
 
   workers.set(id, worker);
@@ -330,11 +532,6 @@ function initializeWorker(id, config, io) {
             logger.warn(`[TaskDelivery] Task message too long (${stdinMsg.length} chars) for ${label}, truncating to ${TMUX_MAX_CHARS}`);
             stdinMsg = stdinMsg.slice(0, TMUX_MAX_CHARS) + '\n\n[...truncated, full task in context file...]';
           }
-          // Aider treats each newline as a prompt submission, so collapse
-          // multi-line task messages into a single line for aider workers
-          if (currentWorker.backend === 'aider') {
-            stdinMsg = stdinMsg.replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim();
-          }
           await sendInputDirect(id, stdinMsg, 'lifecycle:stdin');
           logger.info(`Sent initial task to ${label}`);
         }
@@ -357,8 +554,7 @@ function initializeWorker(id, config, io) {
     setTimeout(() => {
       const w = workers.get(id);
       if (w && w.ralphMode && w.status === 'running' && (!w.ralphStatus || w.ralphStatus === 'pending')) {
-        const rulesLocation = worker.backend === 'gemini' ? 'GEMINI.md' : worker.backend === 'aider' ? 'initial message' : '.claude/rules/';
-        const reminderMsg = `Reminder: Signal your progress via Ralph. The curl command is in your rules file (${rulesLocation}).`;
+        const reminderMsg = `Reminder: Signal your progress via Ralph. The curl command is in your rules file (.claude/rules/).`;
         sendInputDirect(id, reminderMsg, 'lifecycle:ralph_reminder').catch(err => { logger.warn(`[Ralph] Failed to send reminder: ${err.message}`); });
         logger.info(`[Ralph] Sent 60s reminder to ${label}`);
       }
@@ -407,9 +603,6 @@ function initializeWorker(id, config, io) {
             logger.warn(`[TaskRedelivery] Redelivery message too long (${redeliveryMsg.length} chars) for ${label}, truncating`);
             redeliveryMsg = redeliveryMsg.slice(0, 8000) + '\n\n[...truncated, full task in context file...]';
           }
-          if (w.backend === 'aider') {
-            redeliveryMsg = redeliveryMsg.replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim();
-          }
           await sendInputDirect(id, redeliveryMsg, 'lifecycle:task_redelivery');
           logger.info(`[TaskRedelivery] Re-sent task to ${label}`);
         }
@@ -426,6 +619,14 @@ function initializeWorker(id, config, io) {
 // WORKER SPAWNING
 // ============================================
 
+/**
+ * @param {string} projectPath - Absolute path to the project directory
+ * @param {string|null} label - Worker label (e.g. "IMPL: fix auth bug")
+ * @param {object|null} io - Socket.io instance for live updates
+ * @param {object} [options={}]
+ * @param {boolean|string} [options.injectProjectContext='auto'] - Whether to inject program.md into worker rules.
+ *   true = always inject; false = never; 'auto' = inject for RESEARCH/COLONEL/GENERAL, skip for specialists.
+ */
 export async function spawnWorker(projectPath, label = null, io = null, options = {}) {
   const projectName = path.basename(projectPath);
   const workerLabel = label || projectName;
@@ -455,7 +656,26 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
     effortLevel = null,
     autoRespawn = false,
     autoRespawnConfig = null,
+    injectProjectContext = 'auto',
+    forcedAutonomy = false,
+    bulldozeMode = false,
   } = options;
+
+  const _ctxPrefix = detectWorkerType(workerLabel).prefix;
+  const _HIGH_CTX = new Set(['RESEARCH', 'COLONEL', 'GENERAL']);
+  const effectiveInjectCtx = injectProjectContext === true ? true
+    : injectProjectContext === false ? false
+    : _HIGH_CTX.has(_ctxPrefix) ? true : false;
+
+  let effectiveModel = model;
+  let effectiveEffort = effortLevel;
+  let fallbackInfo = null;
+  if (backend === 'claude') {
+    const fb = applyModelFallback(workerLabel, model, effortLevel);
+    effectiveModel = fb.model;
+    effectiveEffort = fb.effortLevel;
+    fallbackInfo = fb.fallback;
+  }
 
   const id = uuidv4().slice(0, 8);
   const sessionName = `${SESSION_PREFIX}${id}`;
@@ -465,11 +685,20 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
     throw new Error(`Invalid project path: ${projectPath}`);
   }
 
-  const runningWorkers = Array.from(workers.values()).filter(w => w.status === 'running');
-  const totalActive = runningWorkers.length + pendingWorkers.size + inFlightSpawns.size;
-  if (totalActive >= MAX_CONCURRENT_WORKERS) {
-    throw new Error(`Cannot spawn worker: maximum concurrent workers (${MAX_CONCURRENT_WORKERS}) reached. ` +
-      `Currently running: ${runningWorkers.length}, pending: ${pendingWorkers.size}, spawning: ${inFlightSpawns.size}. Kill some workers or wait for completion.`);
+  const activeWorkersList = Array.from(workers.values()).filter(
+    w => (w.status === 'running' || w.status === 'pending') && !w.awaitingReviewAt
+  );
+  const activeCount = activeWorkersList.length + inFlightSpawns.size;
+  if (activeCount >= MAX_CONCURRENT_WORKERS) {
+    const capErr = new Error(
+      `Max concurrent workers (${MAX_CONCURRENT_WORKERS}) reached — refusing to spawn. ` +
+      `Active: ${activeCount} (${activeWorkersList.length} workers + ${inFlightSpawns.size} in-flight). ` +
+      `Set STRATEGOS_MAX_WORKERS env var to raise the cap.`
+    );
+    capErr.code = 'MAX_WORKERS_EXCEEDED';
+    capErr.limit = MAX_CONCURRENT_WORKERS;
+    capErr.active = activeCount;
+    throw capErr;
   }
 
   // System resource check — prevent spawning when memory/swap is critically low
@@ -483,7 +712,7 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
 
   const spawnKey = `${workerLabel}::${projectName}`;
   if (!allowDuplicate) {
-    const existingDuplicate = runningWorkers.find(
+    const existingDuplicate = activeWorkersList.find(
       w => w.label === workerLabel && w.project === projectName
     );
     if (existingDuplicate) {
@@ -551,8 +780,16 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
       backend,
       model,
       effortLevel,
+      autoDismissAfterDone,
+      autoRespawn,
+      autoRespawnConfig,
+      forcedAutonomy,
+      bulldozeMode,
+      injectProjectContext: effectiveInjectCtx,
       createdAt: Date.now()
     });
+
+    if (io) { io.emit('worker:created', normalizeWorker(pendingWorker)); }
 
     const activity = addActivity('worker_pending', id, workerLabel, projectName,
       `Worker "${workerLabel}" waiting on ${dependsOn.length} dependencies`);
@@ -566,6 +803,11 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
     return pendingWorker;
   }
 
+  let tmuxCreated = false;
+  // Worktree isolation state — declared here so the catch block can clean up a worktree
+  // that was created before tmux threw. Defaults = today's shared-cwd behavior.
+  let workingDir = projectPath;
+  let isolated = false;
   // Dependencies are satisfied, spawn immediately
   try {
     if (isCircuitBreakerTripped()) {
@@ -579,75 +821,46 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
 
     const ralphToken = ralphMode ? (externalRalphToken || crypto.randomBytes(16).toString('hex')) : null;
 
-    logger.info(`[SpawnWorker] Writing worker rules for ${id} (backend: ${backend})${ralphToken ? ` (Ralph token: ${ralphToken.slice(0, 8)}...)` : ''}`);
-    if (backend === 'gemini') {
-      await writeGeminiContext(id, workerLabel, projectPath, ralphToken, {
-        parentWorkerId,
-        parentLabel,
-        bulldozeMode: false,
-      });
-    } else if (backend === 'aider') {
-      await writeAiderContext(id, workerLabel, projectPath, ralphToken, {
-        parentWorkerId,
-        parentLabel,
-        bulldozeMode: false,
-      });
-    } else {
-      await writeStrategosContext(id, workerLabel, projectPath, ralphToken, {
-        parentWorkerId,
-        parentLabel,
-        bulldozeMode: false,
-      });
-    }
+    // NEW (§3.2) — establish per-worker working dir (worktree) before init/rules/tmux.
+    // No-op (workingDir = projectPath, isolated = false) when isolation is disabled.
+    ({ workingDir, isolated } = await createWorktree(projectPath, id));
+
+    const worker = initializeWorker(id, {
+      label: workerLabel, projectName, projectPath, sessionName, ralphToken,
+      dependsOn, workflowId, taskId,
+      parentWorkerId, parentLabel, task, initialInput,
+      autoAccept, ralphMode, backend, model: effectiveModel, autoDismissAfterDone,
+      autoRespawn, autoRespawnConfig, injectProjectContext: effectiveInjectCtx,
+      fallbackInfo,
+      workingDir, repoPath: projectPath, isolated,
+    }, io);
+
+    logger.info(`[SpawnWorker] Writing worker rules for ${id}${ralphToken ? ` (Ralph token: ${ralphToken.slice(0, 8)}...)` : ''}`);
+    await writeStrategosContext(id, workerLabel, workingDir, ralphToken, {
+      parentWorkerId,
+      parentLabel,
+      bulldozeMode: false,
+      injectProjectContext: effectiveInjectCtx,
+      contextSourcePath: projectPath,
+    });
     logger.info(`[SpawnWorker] Rules written, now creating tmux session ${sessionName}`);
 
-    if (backend === 'gemini') {
-      // Spawn Gemini CLI with --yolo flag for auto-approval
-      // Pass GEMINI_API_KEY from server environment
-      const geminiEnvArgs = [];
-      if (process.env.GEMINI_API_KEY) {
-        geminiEnvArgs.push('-e', `GEMINI_API_KEY=${process.env.GEMINI_API_KEY}`);
-      }
-      await spawnTmux([
-        'new-session', '-d',
-        '-s', sessionName,
-        '-x', String(DEFAULT_COLS),
-        '-y', String(DEFAULT_ROWS),
-        ...geminiEnvArgs,
-        '-c', projectPath,
-        'gemini', '--yolo'
-      ]);
-    } else if (backend === 'aider') {
-      // Spawn Aider with Ollama model via remote Ollama server
-      const aiderModel = model || 'ollama_chat/qwen2.5-coder:32b-instruct';
-      const aiderContextFile = `.aider.strategos-${id}.md`;
-      await spawnTmux([
-        'new-session', '-d',
-        '-s', sessionName,
-        '-x', String(DEFAULT_COLS),
-        '-y', String(DEFAULT_ROWS),
-        '-e', `OLLAMA_API_BASE=${process.env.OLLAMA_API_BASE || 'http://localhost:11434'}`,
-        '-c', projectPath,
-        'aider', '--model', aiderModel, '--yes', '--no-auto-commits',
-        '--read', aiderContextFile
-      ]);
-    } else {
-      const toolArgs = getToolRestrictionArgs(workerLabel);
-      const effortArgs = getEffortArgs(workerLabel, effortLevel);
-      const modelArgs = model ? ['--model', model] : [];
-      await spawnTmux([
-        'new-session', '-d',
-        '-s', sessionName,
-        '-x', String(DEFAULT_COLS),
-        '-y', String(DEFAULT_ROWS),
-        '-e', `CLAUDE_CODE_EFFORT_LEVEL=${getEffortLevel(workerLabel, effortLevel)}`,
-        '-e', 'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=65',
-        '-c', projectPath,
-        'claude', ...modelArgs, ...toolArgs, ...effortArgs
-      ]);
-    }
+    // Honor the requested backend (claude/gemini/aider) via the shared launcher.
+    // For claude, pass the post-fallback model/effort resolved above; for
+    // aider, effectiveModel === model (fallback only runs for claude). This
+    // fixes the latent bug where the immediate path hardcoded claude.
+    await _launchWorker({
+      backend,
+      id,
+      sessionName,
+      workingDir,
+      label: workerLabel,
+      model: effectiveModel,
+      effortLevel: effectiveEffort,
+    });
     logger.info(`[SpawnWorker] tmux session ${sessionName} created successfully`);
     resetCircuitBreakerOnSuccess();
+    tmuxCreated = true;
 
     const spawnDuration = Date.now() - spawnStartTime;
     try {
@@ -656,13 +869,16 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
       logger.error(`[SpawnWorker] Metrics recording failed (non-fatal): ${metricsErr.message}`);
     }
 
-    const worker = initializeWorker(id, {
-      label: workerLabel, projectName, projectPath, sessionName, ralphToken,
-      dependsOn, workflowId, taskId,
-      parentWorkerId, parentLabel, task, initialInput,
-      autoAccept, ralphMode, backend, model, autoDismissAfterDone,
-      autoRespawn, autoRespawnConfig,
-    }, io);
+    // Consume handoff doc after successor has had time to read it
+    const handoffPath = path.join(workingDir, `tmp/handoff-${id}.md`);
+    setTimeout(() => {
+      try {
+        if (existsSync(handoffPath)) {
+          unlinkSync(handoffPath);
+          logger.info(`[Handoff] Consumed handoff doc for ${id}`);
+        }
+      } catch (e) { /* ignore */ }
+    }, 60000);
 
     inFlightSpawns.delete(spawnKey);
 
@@ -683,41 +899,20 @@ export async function spawnWorker(projectPath, label = null, io = null, options 
   } catch (error) {
     inFlightSpawns.delete(spawnKey);
 
-    if (!workers.has(id)) {
+    if (!tmuxCreated) {
+      // Duplicate-spawn races (label/in-flight collisions) are not tmux failures — skip breaker increment.
+      if (error.message && error.message.includes('Duplicate worker')) {
+        throw error;
+      }
       incrementCircuitBreaker();
       logger.error(`[CircuitBreaker] Tmux spawn failure`);
     }
 
-    markWorkerFailed(id);
-    removeWorkerDependencies(id);
-
-    if (workers.has(id)) {
-      stopPtyCapture(id);
-      stopHealthMonitor(id);
-      workers.delete(id);
-      invalidateWorkersCache();
-      outputBuffers.delete(id);
-      commandQueues.delete(id);
-      sessionFailCounts.delete(id);
-      ptyInstances.delete(id);
-      lastResizeSize.delete(id);
-    }
-    respawnAttempts.delete(id);
-
-    if (backend === 'gemini') {
-      await removeGeminiContext(projectPath, id);
-    } else if (backend === 'aider') {
-      await removeAiderContext(projectPath, id);
-    } else {
-      await removeStrategosContext(projectPath, id);
-    }
-
-    const activity = addActivity('error', id, workerLabel, projectName,
-      `Failed to start worker: ${error.message}`);
-
-    if (io) {
-      io.emit('activity:new', activity);
-    }
+    await _cleanupFailedSpawn(id, {
+      workingDir, isolated, projectPath, projectName,
+      label: workerLabel, io, error,
+      activityVerb: 'Failed to start worker',
+    });
 
     throw error;
   }
@@ -733,8 +928,10 @@ async function startPendingWorker(workerId, io = null) {
     return null;
   }
 
-  const runningWorkers = Array.from(workers.values()).filter(w => w.status === 'running');
-  if (runningWorkers.length + inFlightSpawns.size >= MAX_CONCURRENT_WORKERS) {
+  const activeForPending = Array.from(workers.values()).filter(
+    w => (w.status === 'running' || w.status === 'pending') && !w.awaitingReviewAt
+  );
+  if (activeForPending.length + inFlightSpawns.size >= MAX_CONCURRENT_WORKERS) {
     logger.warn(`[StartPending] Worker ${workerId} (${pending.label}) blocked — at limit`);
     pendingWorkers.set(workerId, pending);
     return null;
@@ -745,6 +942,11 @@ async function startPendingWorker(workerId, io = null) {
   const sessionName = `${SESSION_PREFIX}${workerId}`;
   const projectName = path.basename(pending.projectPath);
   const effectiveIo = io || pending.io;
+  const pendingBackend = pending.backend || 'claude';
+
+  // Worktree isolation state — declared here so the catch block can clean up. (§3.3)
+  let workingDir = pending.projectPath;
+  let isolated = false;
 
   try {
     if (isCircuitBreakerTripped()) {
@@ -755,57 +957,40 @@ async function startPendingWorker(workerId, io = null) {
 
     const ralphToken = pending.ralphMode ? (pending.externalRalphToken || crypto.randomBytes(16).toString('hex')) : null;
 
-    const pendingBackend = pending.backend || 'claude';
-    if (pendingBackend === 'gemini') {
-      await writeGeminiContext(workerId, pending.label, pending.projectPath, ralphToken);
-    } else if (pendingBackend === 'aider') {
-      await writeAiderContext(workerId, pending.label, pending.projectPath, ralphToken);
-    } else {
-      await writeStrategosContext(workerId, pending.label, pending.projectPath, ralphToken);
-    }
+    // NEW (§3.3) — per-worker worktree before rules/tmux. No-op when isolation disabled.
+    ({ workingDir, isolated } = await createWorktree(pending.projectPath, workerId));
 
-    if (pendingBackend === 'gemini') {
-      const geminiEnvArgs = [];
-      if (process.env.GEMINI_API_KEY) {
-        geminiEnvArgs.push('-e', `GEMINI_API_KEY=${process.env.GEMINI_API_KEY}`);
-      }
-      await spawnTmux([
-        'new-session', '-d',
-        '-s', sessionName,
-        '-x', String(DEFAULT_COLS),
-        '-y', String(DEFAULT_ROWS),
-        ...geminiEnvArgs,
-        '-c', pending.projectPath,
-        'gemini', '--yolo'
-      ]);
-    } else if (pendingBackend === 'aider') {
-      const aiderModel = pending.model || 'ollama_chat/qwen2.5-coder:32b-instruct';
-      const aiderContextFile = `.aider.strategos-${workerId}.md`;
-      await spawnTmux([
-        'new-session', '-d',
-        '-s', sessionName,
-        '-x', String(DEFAULT_COLS),
-        '-y', String(DEFAULT_ROWS),
-        '-e', `OLLAMA_API_BASE=${process.env.OLLAMA_API_BASE || 'http://localhost:11434'}`,
-        '-c', pending.projectPath,
-        'aider', '--model', aiderModel, '--yes', '--no-auto-commits',
-        '--read', aiderContextFile
-      ]);
-    } else {
-      const toolArgs = getToolRestrictionArgs(pending.label);
-      const effortArgs = getEffortArgs(pending.label, pending.effortLevel || null);
-      const modelArgs = pending.model ? ['--model', pending.model] : [];
-      await spawnTmux([
-        'new-session', '-d',
-        '-s', sessionName,
-        '-x', String(DEFAULT_COLS),
-        '-y', String(DEFAULT_ROWS),
-        '-e', `CLAUDE_CODE_EFFORT_LEVEL=${getEffortLevel(pending.label, pending.effortLevel || null)}`,
-        '-e', 'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=65',
-        '-c', pending.projectPath,
-        'claude', ...modelArgs, ...toolArgs, ...effortArgs
-      ]);
+    await writeStrategosContext(workerId, pending.label, workingDir, ralphToken, {
+      parentWorkerId: pending.parentWorkerId,
+      parentLabel: pending.parentLabel,
+      bulldozeMode: pending.bulldozeMode || false,
+      forcedAutonomy: pending.forcedAutonomy || false,
+      injectProjectContext: pending.injectProjectContext || false,
+      contextSourcePath: pending.projectPath,
+    });
+
+    // claude: re-apply fallback at resume time using freshest cached usage. The
+    // worker may have been pending for hours and the bucket state may have
+    // shifted. gemini/aider have no fallback — model/effort flow through as-is.
+    let launchModel = pending.model || null;
+    let launchEffort = pending.effortLevel || null;
+    if (pendingBackend === 'claude') {
+      const fb = applyModelFallback(pending.label, pending.model || null, pending.effortLevel || null);
+      pending._effectiveModel = fb.model;
+      pending._effectiveEffort = fb.effortLevel;
+      pending._fallbackInfo = fb.fallback;
+      launchModel = fb.model;
+      launchEffort = fb.effortLevel;
     }
+    await _launchWorker({
+      backend: pendingBackend,
+      id: workerId,
+      sessionName,
+      workingDir,
+      label: pending.label,
+      model: launchModel,
+      effortLevel: launchEffort,
+    });
     resetCircuitBreakerOnSuccess();
 
     const worker = initializeWorker(workerId, {
@@ -814,7 +999,16 @@ async function startPendingWorker(workerId, io = null) {
       parentWorkerId: pending.parentWorkerId, parentLabel: pending.parentLabel,
       task: pending.task, initialInput: pending.initialInput,
       autoAccept: pending.autoAccept ?? true, ralphMode: pending.ralphMode || false,
-      backend: pending.backend || 'claude', model: pending.model || null,
+      backend: pending.backend || 'claude',
+      model: pending._effectiveModel ?? (pending.model || null),
+      fallbackInfo: pending._fallbackInfo || null,
+      autoDismissAfterDone: pending.autoDismissAfterDone !== false,
+      autoRespawn: pending.autoRespawn || false,
+      autoRespawnConfig: pending.autoRespawnConfig || null,
+      injectProjectContext: pending.injectProjectContext || false,
+      forcedAutonomy: pending.forcedAutonomy || false,
+      bulldozeMode: pending.bulldozeMode || false,
+      workingDir, repoPath: pending.projectPath, isolated,
     }, effectiveIo);
 
     const activity = addActivity('worker_started', workerId, pending.label, projectName,
@@ -836,37 +1030,13 @@ async function startPendingWorker(workerId, io = null) {
     if (!workers.has(workerId)) {
       incrementCircuitBreaker();
     }
-
-    markWorkerFailed(workerId);
-    removeWorkerDependencies(workerId);
     pendingWorkers.delete(workerId);
 
-    if (workers.has(workerId)) {
-      stopPtyCapture(workerId);
-      stopHealthMonitor(workerId);
-      workers.delete(workerId);
-      invalidateWorkersCache();
-      outputBuffers.delete(workerId);
-      commandQueues.delete(workerId);
-      sessionFailCounts.delete(workerId);
-      lastResizeSize.delete(workerId);
-    }
-    respawnAttempts.delete(workerId);
-
-    if (pendingBackend === 'gemini') {
-      await removeGeminiContext(pending.projectPath, workerId);
-    } else if (pendingBackend === 'aider') {
-      await removeAiderContext(pending.projectPath, workerId);
-    } else {
-      await removeStrategosContext(pending.projectPath, workerId);
-    }
-
-    const activity = addActivity('error', workerId, pending.label, projectName,
-      `Failed to start pending worker: ${error.message}`);
-
-    if (effectiveIo) {
-      effectiveIo.emit('activity:new', activity);
-    }
+    await _cleanupFailedSpawn(workerId, {
+      workingDir, isolated, projectPath: pending.projectPath, projectName,
+      label: pending.label, io: effectiveIo, error,
+      activityVerb: 'Failed to start pending worker',
+    });
 
     throw error;
   }
@@ -879,7 +1049,7 @@ async function startPendingWorker(workerId, io = null) {
 async function teardownWorker(workerId, worker, io, { activityMessage, logPrefix = 'Teardown', skipTmuxKill = false, reason = 'killed', skipAutoRespawn = false } = {}) {
   const deathCb = getWorkerDeathCallback();
   if (deathCb && worker.ralphToken) {
-    try { deathCb(worker); } catch (e) { /* ignore */ }
+    try { deathCb(worker); } catch (e) { getLogger().error('[lifecycle.worker] deathCb failed', e?.message); }
   }
 
   // Trigger auto-respawn for generals that die unexpectedly (not dismissed/completed)
@@ -894,6 +1064,12 @@ async function teardownWorker(workerId, worker, io, { activityMessage, logPrefix
         logger.error(`[AutoRespawn] handleGeneralDeath failed for ${workerId}: ${e.message}`)
       );
     }).catch(e => logger.error(`[AutoRespawn] Import failed: ${e.message}`));
+  } else if (skipAutoRespawn && worker.autoRespawn) {
+    // Intentional kill of a respawn-registered worker — deregister to cancel any
+    // pending cooldown-retry timeouts in the service that could still fire after teardown.
+    import('../services/autoRespawnService.js').then(({ deregisterAutoRespawn }) => {
+      deregisterAutoRespawn(workerId);
+    }).catch(() => {});
   }
 
   stopPtyCapture(workerId);
@@ -902,19 +1078,19 @@ async function teardownWorker(workerId, worker, io, { activityMessage, logPrefix
     try {
       validateSessionName(worker.tmuxSession);
       await spawnTmux(['kill-session', '-t', worker.tmuxSession]);
-    } catch { /* already dead or invalid */ }
+    } catch (err) { getLogger().debug('[lifecycle.worker] tmux kill-session failed in teardown (session may already be dead)', err?.message); }
   }
 
   dbEndSession(workerId, 'stopped');
 
   if (worker.workingDir) {
-    if (worker.backend === 'gemini') {
-      await removeGeminiContext(worker.workingDir, workerId);
-    } else if (worker.backend === 'aider') {
-      await removeAiderContext(worker.workingDir, workerId);
-    } else {
-      await removeStrategosContext(worker.workingDir, workerId);
-    }
+    await removeStrategosContext(worker.workingDir, workerId);
+  }
+
+  // NEW (§3.4) — best-effort worktree teardown. Single chokepoint: dismiss, kill, crash,
+  // timeout, and cleanup all funnel through teardownWorker. No-op when not isolated.
+  if (worker.isolated && worker.repoPath) {
+    await removeWorktree(worker.repoPath, workerId);
   }
 
   try {
@@ -926,7 +1102,7 @@ async function teardownWorker(workerId, worker, io, { activityMessage, logPrefix
       }
     }
   } catch (e) {
-    // Worker may not have been registered
+    getLogger().error('[lifecycle.worker] markWorkerFailed failed in teardown (worker may not be in dependency graph)', e?.message);
   }
 
   if (worker.parentWorkerId) {
@@ -968,7 +1144,7 @@ async function teardownWorker(workerId, worker, io, { activityMessage, logPrefix
   // Clean up bulldoze state file if it exists
   if (worker.workingDir) {
     const bulldozeStatePath = path.join(worker.workingDir, 'tmp', `bulldoze-state-${workerId}.md`);
-    try { await fs.unlink(bulldozeStatePath); } catch { /* ENOENT is fine */ }
+    try { await fs.unlink(bulldozeStatePath); } catch (err) { getLogger().debug('[lifecycle.worker] bulldoze state cleanup failed (ENOENT is fine)', err?.message); }
   }
 
   logger.info(`[${logPrefix}] Worker ${workerId} cleanup complete`);
@@ -990,35 +1166,45 @@ export async function cleanupWorker(workerId, io) {
   if (!worker) return;
 
   if (worker.beingCleanedUp) return;
+  worker.beingCleanedUp = true;
 
-  const { writeWorkerCheckpoint } = await import('./persistence.js');
-  writeWorkerCheckpoint(workerId, 'cleanup');
+  try {
+    const { writeWorkerCheckpoint } = await import('./persistence.js');
+    writeWorkerCheckpoint(workerId, 'cleanup');
 
-  // Record failure in learnings DB if worker never signaled done.
-  // Skip if worker completed successfully (awaiting_review = signaled done but not yet dismissed).
-  const { persistFailureLearning } = await import('./ralph.js');
-  const successfulRalphStatuses = new Set(['done', 'awaiting_review']);
-  if (!successfulRalphStatuses.has(worker.ralphStatus)) {
-    persistFailureLearning(worker, workerId, 'cleanup');
-  }
-
-  addRespawnSuggestion(workerId, worker);
-
-  if (isProtectedWorker(worker)) {
-    logger.error(`[CleanupWorker] BLOCKED: Refusing to cleanup protected worker ${workerId} (${worker.label}).`);
-    if (io) {
-      io.emit('worker:kill:blocked', { workerId, label: worker.label, reason: 'protected_tier_cleanup' });
+    // Record failure in learnings DB if worker never signaled done.
+    // Skip if worker completed successfully (awaiting_review = signaled done but not yet dismissed).
+    const { persistFailureLearning } = await import('./ralph.js');
+    const successfulRalphStatuses = new Set(['done', 'awaiting_review']);
+    if (!successfulRalphStatuses.has(worker.ralphStatus)) {
+      persistFailureLearning(worker, workerId, 'cleanup');
     }
-    return;
-  }
 
-  await teardownWorker(workerId, worker, io, {
-    activityMessage: `Worker "${worker.label}" cleaned up`,
-    logPrefix: 'CleanupWorker',
-  });
+    addRespawnSuggestion(workerId, worker);
+
+    if (isProtectedOrColonel(worker)) {
+      logger.error(`[CleanupWorker] BLOCKED: Refusing to cleanup protected worker ${workerId} (${worker.label}).`);
+      if (io) {
+        io.emit('worker:kill:blocked', { workerId, label: worker.label, reason: 'protected_tier_cleanup' });
+      }
+      return;
+    }
+
+    await teardownWorker(workerId, worker, io, {
+      activityMessage: `Worker "${worker.label}" cleaned up`,
+      logPrefix: 'CleanupWorker',
+    });
+  } finally {
+    worker.beingCleanedUp = false;
+  }
 }
 
 export async function killWorker(workerId, io = null, options = {}) {
+  if (process.env.STRATEGOS_PAUSE_AUTO_KILL === "1" && options.reason !== "dismissed") {
+    getLogger().warn(`[lifecycle.worker] STRATEGOS_PAUSE_AUTO_KILL=1 — refusing auto-kill of ${workerId} (reason=${options.reason || "unspecified"})`);
+    return;
+  }
+
   const worker = workers.get(workerId);
 
   if (!worker) {
@@ -1059,33 +1245,46 @@ export async function killWorker(workerId, io = null, options = {}) {
     }
 
     if (!isAncestor) {
-      worker.beingCleanedUp = false;
       const callerLabel = caller?.label || 'unknown';
-      logger.error(`[KillWorker] BLOCKED: Worker ${options.callerWorkerId} (${callerLabel}) attempted to kill non-descendant ${workerId} (${worker.label}).`);
-      try { getLogger().error('Kill blocked: not a descendant', { callerWorkerId: options.callerWorkerId, callerLabel, targetWorkerId: workerId, targetLabel: worker.label }); } catch { /* best effort */ }
-      if (io) {
-        io.emit('worker:kill:blocked', {
-          workerId,
-          callerWorkerId: options.callerWorkerId,
-          callerLabel,
-          targetLabel: worker.label,
-          reason: 'not_descendant',
-        });
+      const callerIsOrchestrator = isProtectedOrColonel(caller);
+
+      // Exception 1: E2E_FIXTURE workers are test artifacts — any general/colonel can clean them up
+      const targetIsFixture = worker.label?.toUpperCase().includes('E2E_FIXTURE');
+      if (targetIsFixture && callerIsOrchestrator) {
+        logger.info(`[KillWorker] Hierarchy exception: orchestrator "${callerLabel}" killing E2E_FIXTURE worker "${worker.label}" (allowed)`);
       }
-      throw new Error(`Worker "${callerLabel}" cannot kill "${worker.label}" — not a descendant.`);
+      // Exception 2: Orphan workers (no parent chain) can be killed by any general/colonel
+      else if (!worker.parentWorkerId && callerIsOrchestrator) {
+        logger.info(`[KillWorker] Hierarchy exception: orchestrator "${callerLabel}" killing orphan worker "${worker.label}" (allowed)`);
+      }
+      else {
+        worker.beingCleanedUp = false;
+        logger.error(`[KillWorker] BLOCKED: Worker ${options.callerWorkerId} (${callerLabel}) attempted to kill non-descendant ${workerId} (${worker.label}).`);
+        try { getLogger().error('Kill blocked: not a descendant', { callerWorkerId: options.callerWorkerId, callerLabel, targetWorkerId: workerId, targetLabel: worker.label }); } catch { /* best effort */ }
+        if (io) {
+          io.emit('worker:kill:blocked', {
+            workerId,
+            callerWorkerId: options.callerWorkerId,
+            callerLabel,
+            targetLabel: worker.label,
+            reason: 'not_descendant',
+          });
+        }
+        throw new Error(`Worker "${callerLabel}" cannot kill "${worker.label}" — not a descendant.`);
+      }
     }
 
     logger.info(`[KillWorker] Hierarchy validated: ${options.callerWorkerId} is ancestor of ${workerId}`);
   }
 
-  // GENERAL protection
-  if (isProtectedWorker(worker) && !options.force) {
+  // GENERAL/COLONEL protection
+  if (isProtectedOrColonel(worker) && !options.force) {
     worker.beingCleanedUp = false;
     logger.error(`[KillWorker] BLOCKED: Refusing to kill protected worker ${workerId} (${worker.label}).`);
     if (io) {
       io.emit('worker:kill:blocked', { workerId, label: worker.label, reason: 'protected_tier' });
     }
-    throw new Error(`Cannot kill GENERAL-tier worker "${worker.label}" without force flag.`);
+    throw new Error(`Cannot kill GENERAL/COLONEL-tier worker "${worker.label}" without force flag.`);
   }
 
   logger.info(`[KillWorker] Killing worker ${workerId} (${worker.label})`);
@@ -1101,6 +1300,11 @@ export async function killWorker(workerId, io = null, options = {}) {
 
   const { writeWorkerCheckpoint } = await import('./persistence.js');
   writeWorkerCheckpoint(workerId, options.reason || 'killed');
+
+  // Flush current terminal snapshot to DB before failure-learning collection runs.
+  // Ensures persistFailureLearning sees the last-known state even if the 1-in-10
+  // DB throttle left the DB stale (RC-4 silent-death breadcrumb gap, plan 5dc5550).
+  try { flushCurrentOutputToDb(workerId); } catch { /* best effort — don't block kill */ }
 
   // Record failure in learnings DB if worker never signaled done.
   // Skip if: worker was dismissed/killed after completing (awaiting_review = signaled done but not yet dismissed).
@@ -1129,8 +1333,8 @@ export async function killWorker(workerId, io = null, options = {}) {
     logger.warn(`[KillWorker] Session still exists, force killing...`);
     try {
       await spawnTmux(['kill-session', '-t', worker.tmuxSession]);
-    } catch {
-      // Ignore
+    } catch (err) {
+      getLogger().debug('[lifecycle.worker] force tmux kill-session failed (session may already be gone)', err?.message);
     }
   }
 
@@ -1168,7 +1372,7 @@ export async function killWorker(workerId, io = null, options = {}) {
     logPrefix: 'KillWorker',
     skipTmuxKill: true,
     reason: options.reason || 'killed',
-    skipAutoRespawn: options.reason === 'dismissed' || options.reason === 'completed',
+    skipAutoRespawn: !!options.suppressRespawn || options.reason === 'dismissed' || options.reason === 'completed' || options.reason === 'killed_by_human',
   });
 
   return true;
@@ -1197,11 +1401,15 @@ export async function dismissWorker(workerId, io = null) {
       logger.warn(`[Dismiss] Worker ${workerId} (${worker.label}) has uncommitted changes: ${stdout.trim()}`);
     }
   } catch (e) {
-    // Best effort
+    getLogger().error('[lifecycle.worker] git status check failed in dismiss (non-fatal)', e?.message);
   }
 
   logger.info(`[Dismiss] Dismissing worker ${workerId} (${worker.label})`);
   recordWorkerIntelligenceMetrics(worker, true);
+  worker.status = 'dismissed';
+  if (io) {
+    io.emit('worker:dismissed', { workerId, label: worker.label });
+  }
   await killWorker(workerId, io, { reason: 'dismissed', force: true });
 
   return { dismissed: true, uncommittedWarning };
@@ -1263,13 +1471,12 @@ export async function completeWorker(workerId, io = null, options = {}) {
     });
   }
 
-  if (autoCleanup && !isProtectedWorker(worker)) {
+  if (autoCleanup && !isProtectedOrColonel(worker)) {
     const timerId = setTimeout(async () => {
       autoCleanupTimers.delete(workerId);
       try {
         const currentWorker = workers.get(workerId);
         if (currentWorker && currentWorker.status === 'completed' && !currentWorker.beingCleanedUp) {
-          currentWorker.beingCleanedUp = true;
           logger.info(`[AutoCleanup] Cleaning up completed worker ${workerId} (${worker.label})`);
           await killWorker(workerId, io);
         }
@@ -1278,8 +1485,8 @@ export async function completeWorker(workerId, io = null, options = {}) {
       }
     }, AUTO_CLEANUP_DELAY_MS);
     autoCleanupTimers.set(workerId, timerId);
-  } else if (autoCleanup && isProtectedWorker(worker)) {
-    logger.warn(`[AutoCleanup] Skipping auto-cleanup for GENERAL worker ${workerId} (${worker.label}).`);
+  } else if (autoCleanup && isProtectedOrColonel(worker)) {
+    logger.warn(`[AutoCleanup] Skipping auto-cleanup for GENERAL/COLONEL worker ${workerId} (${worker.label}).`);
   }
 
   return {
@@ -1443,8 +1650,10 @@ export async function resizeWorkerTerminal(workerId, cols, rows, io = null) {
 
   try {
     validateSessionName(worker.tmuxSession);
-    await spawnTmux(['resize-window', '-t', worker.tmuxSession, '-x', String(cols), '-y', String(rows)]);
-    await spawnTmux(['send-keys', '-t', worker.tmuxSession, 'C-l']);
+    await withTmuxLock(workerId, async () => {
+      await spawnTmux(['resize-window', '-t', worker.tmuxSession, '-x', String(cols), '-y', String(rows)]);
+      await spawnTmux(['send-keys', '-t', worker.tmuxSession, 'C-l']);
+    });
     logger.info(`Resized ${worker.label} to ${cols}x${rows}`);
     return { cols, rows };
   } catch (error) {
@@ -1505,8 +1714,8 @@ export async function discoverExistingWorkers(io = null) {
         } else {
           logger.warn(`[Discover] Session ${sessionName} has workingDir outside thea root (${resolvedDir}), using default`);
         }
-      } catch {
-        // Use default
+      } catch (err) {
+        getLogger().debug('[lifecycle.worker] could not determine pane working dir, using default', err?.message);
       }
 
       const projectName = path.basename(workingDir);
@@ -1521,7 +1730,7 @@ export async function discoverExistingWorkers(io = null) {
         } else if (paneCmdTrimmed.includes('aider')) {
           detectedBackend = 'aider';
         }
-      } catch { /* default to claude */ }
+      } catch (err) { getLogger().debug('[lifecycle.worker] could not detect backend for session, defaulting to claude', err?.message); }
 
       const worker = {
         id,
@@ -1658,7 +1867,7 @@ export async function runHeadless(projectPath, prompt, options = {}) {
         settled = true;
         proc.kill();
         const killTimer = setTimeout(() => {
-          try { proc.kill('SIGKILL'); } catch (e) { /* process may already be dead */ }
+          try { proc.kill('SIGKILL'); } catch (e) { getLogger().debug('[lifecycle.worker] SIGKILL failed (process may already be dead)', e?.message); }
         }, 5000);
         killTimer.unref();
         reject(new Error('Headless operation timed out'));

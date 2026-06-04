@@ -8,6 +8,9 @@
 import fs from 'fs';
 import path from 'path';
 import { THEA_ROOT } from './workers/state.js';
+import { getLogger } from './logger.js';
+
+const logger = getLogger('status.writer');
 
 const STATUS_FILE = path.join(THEA_ROOT, 'shared', 'status', 'strategos.json');
 const UPDATE_INTERVAL = 30000; // 30 seconds
@@ -32,7 +35,7 @@ class StatusWriter {
       }
       this._statusFileWritable = true;
     } catch (err) {
-      console.error(`[StatusWriter] Cannot create status directory ${dir}: ${err.message}`);
+      logger.error('[status.writer] Cannot create status directory', { dir, error: err.message });
       this._statusFileWritable = false;
     }
   }
@@ -72,8 +75,8 @@ class StatusWriter {
       fs.renameSync(tmpFile, STATUS_FILE);
     } catch (err) {
       // Don't crash the server, but log so failures are visible
-      console.error(`[StatusWriter] Write failed: ${err.message}`);
-      try { fs.unlinkSync(tmpFile); } catch (e) { console.warn(`[StatusWriter] Temp file cleanup failed: ${e.message}`); }
+      logger.error('[status.writer] Write failed', { error: err.message });
+      try { fs.unlinkSync(tmpFile); } catch (e) { logger.warn('[status.writer] Temp file cleanup failed', { error: e.message }); }
     }
   }
 
@@ -138,8 +141,8 @@ class StatusWriter {
       fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2) + '\n');
       fs.renameSync(tmpFile, STATUS_FILE);
     } catch (err) {
-      console.error(`[StatusWriter] Shutdown write failed: ${err.message}`);
-      try { fs.unlinkSync(tmpFile); } catch (e) { console.warn(`[StatusWriter] Temp file cleanup failed: ${e.message}`); }
+      logger.error('[status.writer] Shutdown write failed', { error: err.message });
+      try { fs.unlinkSync(tmpFile); } catch (e) { logger.warn('[status.writer] Temp file cleanup failed', { error: e.message }); }
     }
   }
 
@@ -180,8 +183,8 @@ class StatusWriter {
       fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2) + '\n');
       fs.renameSync(tmpFile, STATUS_FILE);
     } catch (err) {
-      console.error(`[StatusWriter] Crash write failed: ${err?.message}`);
-      try { fs.unlinkSync(tmpFile); } catch (e) { console.warn(`[StatusWriter] Temp file cleanup failed: ${e.message}`); }
+      logger.error('[status.writer] Crash write failed', { error: err?.message });
+      try { fs.unlinkSync(tmpFile); } catch (e) { logger.warn('[status.writer] Temp file cleanup failed', { error: e.message }); }
     }
   }
 

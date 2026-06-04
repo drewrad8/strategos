@@ -14,8 +14,8 @@
  * Non-blocking: always resolves with a decision, even on Haiku failure.
  * The gate ANNOTATES delivery — it never blocks it.
  *
- * TODO: blackboard warning — on fail/conditional, optionally write a warning
- * entry to the hierarchy blackboard so sibling workers see it immediately.
+ * On fail/conditional: writes a warning entry to the hierarchy blackboard so
+ * sibling workers see the review status immediately.
  */
 
 import Anthropic from '@anthropic-ai/sdk';
@@ -23,8 +23,8 @@ import { execSync } from 'child_process';
 import { addReviewResult } from '../learningsDb.js';
 import { getLogger } from '../logger.js';
 
-// Worker types that pass through the review gate
-const REVIEW_GATE_TYPES = new Set(['impl', 'fix', 'colonel']);
+// Worker types that pass through the review gate (all types are now reviewed)
+const REVIEW_GATE_TYPES = new Set(['impl', 'fix', 'colonel', 'general', 'research', 'test', 'review']);
 
 // Red-flag phrases — suggest serious defect (trigger Stage 2)
 const RED_FLAGS = [
@@ -94,16 +94,13 @@ export async function runReviewGate(worker, workerId, templateType) {
     softFlags.push('no learnings reported (impl/fix workers should describe what changed)');
   }
 
-  // Git activity check: impl/fix workers that committed nothing are suspicious.
-  // Colonels excluded — their output is the work of children, not direct commits.
-  // We count commits made SINCE THE WORKER WAS SPAWNED (not just the last commit),
-  // so a worker that committed cleanly is not flagged as suspicious.
+  // ─── Type-specific Stage 1 checks ──────────────────────────────────────────
+
+  // impl/fix: must have git commits — otherwise nothing changed
   if (templateType === 'impl' || templateType === 'fix') {
     try {
       const projectPath = worker.projectPath || worker.project;
       if (projectPath) {
-        // Use createdAt to count commits made after the worker was spawned.
-        // git log --after uses ISO 8601 or epoch; we pass ISO string for clarity.
         const createdAt = worker.createdAt ? new Date(worker.createdAt).toISOString() : null;
         const sinceFlag = createdAt ? `--after="${createdAt}"` : '';
         const commitCount = execSync(
@@ -111,13 +108,9 @@ export async function runReviewGate(worker, workerId, templateType) {
           { timeout: 5000, encoding: 'utf8' }
         ).trim();
         const commits = parseInt(commitCount, 10);
-
-        if (commits > 0) {
-          // Worker committed — git activity looks healthy, no flag needed
-        } else {
-          // No commits found since spawn — evaluate suspicion by runtime
+        if (commits === 0) {
           const uptimeMs = worker.createdAt ? Date.now() - new Date(worker.createdAt).getTime() : null;
-          const ranLong = uptimeMs === null || uptimeMs > 5 * 60 * 1000; // >5 min or unknown
+          const ranLong = uptimeMs === null || uptimeMs > 5 * 60 * 1000;
           if (ranLong) {
             redFlags.push('no commits since worker was spawned and worker ran >5 min (impl/fix worker with no changes is suspicious)');
           } else {
@@ -127,6 +120,77 @@ export async function runReviewGate(worker, workerId, templateType) {
       }
     } catch {
       // Non-fatal: git check failure doesn't affect decision
+    }
+  }
+
+  // general/colonel: should NOT make direct commits — role violation if they did
+  if (templateType === 'general' || templateType === 'colonel') {
+    try {
+      const projectPath = worker.projectPath || worker.project;
+      if (projectPath) {
+        const createdAt = worker.createdAt ? new Date(worker.createdAt).toISOString() : null;
+        const sinceFlag = createdAt ? `--after="${createdAt}"` : '';
+        const commitLines = execSync(
+          `git -C "${projectPath}" log --oneline ${sinceFlag} 2>/dev/null`,
+          { timeout: 5000, encoding: 'utf8' }
+        ).trim();
+        const commits = commitLines ? commitLines.split('\n').length : 0;
+        if (commits > 0) {
+          redFlags.push(`${templateType.toUpperCase()} made ${commits} direct git commit(s) — role violation (commanders must delegate implementation)`);
+        }
+      }
+    } catch {
+      // Non-fatal
+    }
+  }
+
+  // research: should only write to report/research output files — flag if other files changed
+  if (templateType === 'research') {
+    try {
+      const projectPath = worker.projectPath || worker.project;
+      if (projectPath) {
+        const createdAt = worker.createdAt ? new Date(worker.createdAt).toISOString() : null;
+        const sinceFlag = createdAt ? `--after="${createdAt}"` : '';
+        const changedFiles = execSync(
+          `git -C "${projectPath}" log --name-only --pretty=format: ${sinceFlag} 2>/dev/null | sort -u`,
+          { timeout: 5000, encoding: 'utf8' }
+        ).trim();
+        if (changedFiles) {
+          const files = changedFiles.split('\n').filter(Boolean);
+          const nonReportFiles = files.filter(f => {
+            const lower = f.toLowerCase();
+            return !lower.includes('research/') && !lower.includes('reports/') &&
+                   !lower.includes('report.') && !lower.includes('findings') &&
+                   !lower.endsWith('.md') && !lower.endsWith('.txt');
+          });
+          if (nonReportFiles.length > 0) {
+            redFlags.push(`RESEARCH worker modified non-report files (role violation): ${nonReportFiles.slice(0, 3).join(', ')}`);
+          }
+        }
+      }
+    } catch {
+      // Non-fatal
+    }
+    // Research workers must report findings in learnings
+    if (!worker.ralphLearnings) {
+      redFlags.push('RESEARCH worker reported no learnings — findings must be documented');
+    }
+  }
+
+  // test: must report actual test results (pass/fail counts or specific test names)
+  if (templateType === 'test') {
+    const testResultPatterns = [
+      /\d+\s+(?:test|spec|case)s?\s+(?:pass|fail|skip)/i,
+      /(?:pass|fail|error)(?:ed|ing)?[:\s]+\d+/i,
+      /\d+\s+pass(?:ing|ed)?/i,
+      /\d+\s+fail(?:ing|ed)?/i,
+      /all\s+\d+\s+test/i,
+      /✓|✗|PASS|FAIL|PASSED|FAILED/,
+    ];
+    const learningsLower = (worker.ralphLearnings || '').toLowerCase();
+    const hasTestResults = testResultPatterns.some(p => p.test(worker.ralphLearnings || ''));
+    if (!hasTestResults) {
+      softFlags.push('TEST worker learnings do not report actual test results (pass/fail counts expected)');
     }
   }
 
@@ -160,17 +224,17 @@ export async function runReviewGate(worker, workerId, templateType) {
   // ─── Stage 2: LLM review (2+ soft flags or any red flag) ──────────────────
 
   if (!process.env.ANTHROPIC_API_KEY) {
-    // No API key: fall back to conditional
-    const verdict = redFlags[0] || softFlags[0] || 'review check inconclusive';
+    // No API key: annotate neutrally so workers aren't penalized for mentioning keywords in context
+    const neutralVerdict = `LLM unavailable — ${allFlags.length} keyword flag(s) detected, manual review recommended`;
     addReviewResult({
       workerId,
       stage1Flags: JSON.stringify(allFlags),
       finalDecision: 'conditional',
-      stage2Verdict: `API key unavailable — ${verdict}`,
+      stage2Verdict: neutralVerdict,
       deliveredWithAnnotation: 1,
       durationMs: Date.now() - startMs,
     });
-    return { decision: 'conditional', annotation: `[REVIEW: ${verdict} — LLM check unavailable]` };
+    return { decision: 'conditional', annotation: `[REVIEW: ${neutralVerdict}]` };
   }
 
   try {
@@ -201,7 +265,8 @@ Respond with JSON only:
   "decision": "pass" | "fail" | "conditional",
   "verdict": "one sentence — the specific issue or confirmation of completeness",
   "keyTasksCovered": ["list which KEY TASKS from the spec are addressed"],
-  "keyTasksMissed": ["list which KEY TASKS from the spec are NOT addressed or only partially addressed"]
+  "keyTasksMissed": ["list which KEY TASKS from the spec are NOT addressed or only partially addressed"],
+  "completionScore": <integer 0-100 measuring how thoroughly the KEY TASKS were addressed; 100=fully addressed all tasks, 0=addressed nothing>
 }`;
 
     const response = await getClient().messages.create({
@@ -212,9 +277,17 @@ Respond with JSON only:
 
     const text = response.content[0]?.text?.trim() || '';
     const parsed = JSON.parse(text);
-    const { decision, verdict } = parsed;
+    const { decision, verdict, completionScore } = parsed;
 
     const normalizedDecision = ['pass', 'fail', 'conditional'].includes(decision) ? decision : 'conditional';
+    const scoreValue = (typeof completionScore === 'number' && completionScore >= 0 && completionScore <= 100)
+      ? Math.round(completionScore)
+      : null;
+
+    // Flag likely-incomplete workers (score < 50) with a soft flag annotation
+    if (scoreValue !== null && scoreValue < 50 && normalizedDecision === 'pass') {
+      softFlags.push(`completion score ${scoreValue}/100 — task may be only partially addressed`);
+    }
 
     addReviewResult({
       workerId,
@@ -225,6 +298,7 @@ Respond with JSON only:
       finalDecision: normalizedDecision,
       deliveredWithAnnotation: normalizedDecision !== 'pass' ? 1 : 0,
       durationMs: Date.now() - startMs,
+      completionScore: scoreValue,
     });
 
     if (normalizedDecision === 'pass') {
@@ -235,17 +309,17 @@ Respond with JSON only:
       return { decision: 'conditional', annotation: `[REVIEW: ${verdict}]` };
     }
   } catch (err) {
-    // Stage 2 failure: annotate with Stage 1 result, never block delivery
+    // Stage 2 failure: annotate neutrally so workers aren't penalized for mentioning keywords in context
     getLogger().warn(`[ReviewGate] Stage 2 LLM call failed for ${workerId}: ${err.message}`, { workerId });
-    const verdict = redFlags[0] || softFlags[0] || 'review check inconclusive';
+    const neutralVerdict = `LLM unavailable — ${allFlags.length} keyword flag(s) detected, manual review recommended`;
     addReviewResult({
       workerId,
       stage1Flags: JSON.stringify(allFlags),
       finalDecision: 'conditional',
-      stage2Verdict: `LLM review unavailable — ${verdict}`,
+      stage2Verdict: neutralVerdict,
       deliveredWithAnnotation: 1,
       durationMs: Date.now() - startMs,
     });
-    return { decision: 'conditional', annotation: `[REVIEW: ${verdict} — LLM check unavailable]` };
+    return { decision: 'conditional', annotation: `[REVIEW: ${neutralVerdict}]` };
   }
 }

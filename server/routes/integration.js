@@ -18,7 +18,7 @@ import {
 } from '../validation.js';
 
 /**
- * Integration routes for thea-architect to control workers
+ * Integration routes for external orchestrators to control workers
  * Base path: /api/integration
  */
 export function createIntegrationRoutes(theaRoot, io) {

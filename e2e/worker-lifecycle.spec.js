@@ -566,6 +566,24 @@ test.describe('Template Spawning', () => {
     expect(worker.model).toBe('sonnet');
   });
 
+
+  test('POST /workers/spawn-from-template - research template assigns sonnet model', async ({ request }) => {
+    const res = await request.post(`${API}/workers/spawn-from-template`, {
+      data: {
+        template: 'research',
+        label: 'E2E_FIXTURE: Model Routing research',
+        projectPath: 'strategos',
+        task: 'E2E_FIXTURE: Model routing verification — check spawn response and exit immediately.',
+        allowDuplicate: true,
+      }
+    });
+    expect(res.ok()).toBeTruthy();
+
+    const worker = await res.json();
+    workerId = worker.id;
+    expect(worker.model).toBe('sonnet');
+  });
+
   test('POST /workers/spawn-from-template - rejects unknown template', async ({ request }) => {
     const res = await request.post(`${API}/workers/spawn-from-template`, {
       data: {
@@ -1084,6 +1102,70 @@ test.describe('Ralph Signals', () => {
     });
     // Should be 404 or 400 for unknown token
     expect([400, 404]).toContain(res.status());
+  });
+
+  test('valid in_progress signal updates ralphStatus and progress', async ({ request }) => {
+    // ralphToken is stripped from API responses (security); use by-worker path (primary signaling path)
+    const worker = await spawnTestWorker(request, {
+      label: 'E2E_FIXTURE: Ralph InProgress Signal',
+      ralphMode: true,
+    });
+    workerId = worker.id;
+
+    const res = await request.post(`${API}/ralph/signal/by-worker/${workerId}`, {
+      data: { status: 'in_progress', progress: 42, currentStep: 'e2e in_progress check' }
+    });
+    expect(res.ok()).toBeTruthy();
+    const body = await res.json();
+    expect(body.success).toBe(true);
+
+    const workerRes = await request.get(`${API}/workers/${workerId}`);
+    const updated = await workerRes.json();
+    expect(updated.ralphStatus).toBe('in_progress');
+    expect(updated.ralphProgress).toBe(42);
+    expect(updated.ralphCurrentStep).toBe('e2e in_progress check');
+    // in_progress signal must NOT change the worker run status
+    expect(updated.status).toBe('running');
+  });
+
+  test('valid done signal transitions worker to awaiting_review and delivers to parent', async ({ request }) => {
+    const parent = await spawnTestWorker(request, {
+      label: 'E2E_FIXTURE: Ralph Done Parent',
+      ralphMode: true,
+    });
+
+    const child = await spawnTestWorker(request, {
+      label: 'E2E_FIXTURE: Ralph Done Child',
+      ralphMode: true,
+      parentWorkerId: parent.id,
+    });
+    workerId = child.id; // afterEach handles child cleanup
+
+    const beforeSignal = Date.now();
+
+    const res = await request.post(`${API}/ralph/signal/by-worker/${child.id}`, {
+      data: { status: 'done', progress: 100, learnings: 'e2e done signal test' }
+    });
+    expect(res.ok()).toBeTruthy();
+    const body = await res.json();
+    expect(body.success).toBe(true);
+
+    // Child must transition to awaiting_review with correct ralph fields
+    const childRes = await request.get(`${API}/workers/${child.id}`);
+    const childData = await childRes.json();
+    expect(childData.status).toBe('awaiting_review');
+    expect(childData.ralphStatus).toBe('done');
+    expect(childData.ralphProgress).toBe(100);
+    // lastActivity is updated by updateWorkerRalphStatus on every signal
+    expect(new Date(childData.lastActivity).getTime()).toBeGreaterThanOrEqual(beforeSignal);
+
+    // Parent must still be alive — deliverResultsToParent was invoked (sends input to parent tmux session)
+    const parentRes = await request.get(`${API}/workers/${parent.id}`);
+    expect(parentRes.ok()).toBeTruthy();
+    const parentData = await parentRes.json();
+    expect(['running', 'pending', 'awaiting_review']).toContain(parentData.status);
+
+    await killTestWorker(request, parent.id);
   });
 });
 

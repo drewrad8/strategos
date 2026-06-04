@@ -12,7 +12,6 @@ import {
   spawnTmux, validateSessionName, sessionExists,
 } from './state.js';
 
-import { isProtectedWorker } from './templates.js';
 import { startPtyCapture, stopPtyCapture, sendInputDirect } from './output.js';
 import { tryAutoPromoteWorker } from './ralph.js';
 import {
@@ -26,13 +25,45 @@ import {
   markWorkerFailed,
 } from '../dependencyGraph.js';
 import { invalidateWorkersCache } from './queries.js';
+import { pruneWorktrees } from './worktree.js';
 import {
   startSession as dbStartSession,
 } from '../workerOutputDb.js';
+import { getLogger } from '../logger.js';
+
+const logger = getLogger();
 
 // ============================================
 // WORKER CHECKPOINTING
 // ============================================
+
+const CHECKPOINT_COUNT_CAP = 500;
+const CHECKPOINT_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days in ms
+
+/**
+ * Evict excess and age-stale checkpoint files from dir.
+ * Keeps the newest CHECKPOINT_COUNT_CAP files; additionally removes any file
+ * older than 30 days that survived the count cut.
+ */
+export function pruneCheckpoints(dir) {
+  try {
+    const now = Date.now();
+    const files = readdirSync(dir)
+      .filter(f => f.endsWith('.json'))
+      .map(f => ({ name: f, mtime: statSync(path.join(dir, f)).mtime }))
+      .sort((a, b) => b.mtime - a.mtime); // newest first
+    for (const f of files.slice(CHECKPOINT_COUNT_CAP)) {
+      try { unlinkSync(path.join(dir, f.name)); } catch { /* best-effort */ }
+    }
+    for (const f of files.slice(0, CHECKPOINT_COUNT_CAP)) {
+      if (now - f.mtime > CHECKPOINT_AGE_MS) {
+        try { unlinkSync(path.join(dir, f.name)); } catch { /* best-effort */ }
+      }
+    }
+  } catch (e) {
+    logger.warn(`[Checkpoint] pruneCheckpoints failed: ${e.message}`);
+  }
+}
 
 /**
  * Write a checkpoint for a dying worker — captures everything we know about it
@@ -82,22 +113,54 @@ export function writeWorkerCheckpoint(workerId, reason = 'unknown') {
 
     const filePath = path.join(CHECKPOINT_DIR, `${workerId}.json`);
     writeFileSync(filePath, JSON.stringify(checkpoint, null, 2));
-    console.log(`[Checkpoint] Saved checkpoint for ${worker.label} (${workerId}) → ${filePath} [reason: ${reason}]`);
+    logger.info(`[Checkpoint] Saved checkpoint for ${worker.label} (${workerId}) → ${filePath} [reason: ${reason}]`);
 
-    // Keep only last 50 checkpoints to prevent disk bloat
-    try {
-      const files = readdirSync(CHECKPOINT_DIR)
-        .filter(f => f.endsWith('.json'))
-        .map(f => ({ name: f, mtime: statSync(path.join(CHECKPOINT_DIR, f)).mtime }))
-        .sort((a, b) => b.mtime - a.mtime);
-      for (const f of files.slice(50)) {
-        try { unlinkSync(path.join(CHECKPOINT_DIR, f.name)); } catch { /* best-effort cleanup */ }
-      }
-    } catch (e) {
-      // Cleanup is best-effort
-    }
+    pruneCheckpoints(CHECKPOINT_DIR);
   } catch (err) {
-    console.error(`[Checkpoint] Failed to write checkpoint for ${workerId}:`, err.message);
+    logger.error(`[Checkpoint] Failed to write checkpoint for ${workerId}: ${err.message}`);
+  }
+}
+
+/**
+ * Write an emergency checkpoint for a GENERAL/COLONEL that vanished before
+ * registering in the workers Map. Provides a forensic trail when no worker
+ * object exists to draw from (P1-VAN gap — stability-gaps-2026-04-20.md).
+ *
+ * @param {string} workerId   - Extracted from the tmux session name
+ * @param {string} sessionName - Full tmux session name (e.g. 'thea-worker-abc123')
+ * @param {string} [lastOutput] - Last ~100 lines captured from tmux (may be empty)
+ */
+export function writeOrphanedGeneralCheckpoint(workerId, sessionName, lastOutput = '') {
+  try {
+    const snippet = (lastOutput || '').split('\n').filter(l => l.trim()).slice(-100).join('\n');
+    const checkpoint = {
+      workerId,
+      label: 'ORPHANED',
+      tmuxSession: sessionName,
+      lastOutput: snippet,
+      crashedAt: new Date().toISOString(),
+      reason: 'orphaned-general-vanish',
+    };
+    const filePath = path.join(CHECKPOINT_DIR, `${workerId}.json`);
+    writeFileSync(filePath, JSON.stringify(checkpoint, null, 2));
+    logger.info(`[Checkpoint] Saved orphaned checkpoint for ${workerId} → ${filePath}`);
+    pruneCheckpoints(CHECKPOINT_DIR);
+  } catch (err) {
+    logger.error(`[Checkpoint] Failed to write orphaned checkpoint for ${workerId}: ${err.message}`);
+  }
+}
+
+/**
+ * Write a best-effort checkpoint for every currently-tracked worker.
+ * Called at the end of the shutdown grace window so a last-known-state snapshot
+ * exists on disk even if workers didn't have time to signal done/held.
+ * @param {string} reason - Reason tag written to each checkpoint (e.g. 'server_shutdown')
+ */
+export function bulkCheckpointRunningWorkers(reason = 'server_shutdown') {
+  for (const [workerId] of workers) {
+    try {
+      writeWorkerCheckpoint(workerId, reason);
+    } catch { /* best-effort — individual failures must not block shutdown */ }
   }
 }
 
@@ -147,6 +210,8 @@ function serializeWorker(w) {
     label: w.label,
     project: w.project,
     workingDir: w.workingDir,
+    repoPath: w.repoPath ?? w.workingDir,
+    isolated: w.isolated ?? false,
     tmuxSession: w.tmuxSession,
     backend: w.backend || 'claude',
     model: w.model || null,
@@ -198,6 +263,10 @@ function serializeWorker(w) {
     autoDismissAfterDone: w.autoDismissAfterDone ?? true,
     taskReceivedAt: w.taskReceivedAt ?? null,
     taskQualityScore: w.taskQualityScore ?? null,
+    // Auto-fallback observability — set when modelFallbackService substituted spawn args.
+    originalModel: w.originalModel ?? null,
+    originalEffort: w.originalEffort ?? null,
+    fallbackReason: w.fallbackReason ?? null,
   };
 }
 
@@ -213,7 +282,7 @@ async function _doSaveWorkerState() {
     await fs.writeFile(tmpFile, JSON.stringify(state, null, 2));
     await fs.rename(tmpFile, PERSISTENCE_FILE);
   } catch (error) {
-    console.error('Failed to save worker state:', error.message);
+    logger.error(`[persistence] Failed to save worker state: ${error.message}`);
   }
 }
 
@@ -237,9 +306,9 @@ export function saveWorkerStateSync() {
     const tmpFile = PERSISTENCE_FILE + '.tmp';
     writeFileSync(tmpFile, JSON.stringify(state, null, 2));
     renameSync(tmpFile, PERSISTENCE_FILE);
-    console.error(`[CrashSave] Saved ${state.workers.length} workers to ${PERSISTENCE_FILE}`);
+    logger.error(`[CrashSave] Saved ${state.workers.length} workers to ${PERSISTENCE_FILE}`);
   } catch (error) {
-    console.error('[CrashSave] Failed to save worker state:', error.message);
+    logger.error(`[CrashSave] Failed to save worker state: ${error.message}`);
   }
 }
 
@@ -249,7 +318,7 @@ export async function restoreWorkerState(io = null) {
     const MAX_PERSISTENCE_SIZE = 10 * 1024 * 1024; // 10MB
     const fileStat = await fs.stat(PERSISTENCE_FILE).catch(() => null);
     if (fileStat && fileStat.size > MAX_PERSISTENCE_SIZE) {
-      console.error(`[Restore] Persistence file too large (${fileStat.size} bytes, max ${MAX_PERSISTENCE_SIZE}) — refusing to load`);
+      logger.error(`[Restore] Persistence file too large (${fileStat.size} bytes, max ${MAX_PERSISTENCE_SIZE}) — refusing to load`);
       return [];
     }
 
@@ -258,18 +327,18 @@ export async function restoreWorkerState(io = null) {
 
     // Schema validation: ensure saved state has expected structure
     if (!state || !Array.isArray(state.workers)) {
-      console.error('[Restore] Invalid persistence file: missing workers array');
+      logger.error('[Restore] Invalid persistence file: missing workers array');
       return [];
     }
 
     // Cap workers array size (defense-in-depth against tampered file with millions of entries)
     const MAX_RESTORE_WORKERS = 500;
     if (state.workers.length > MAX_RESTORE_WORKERS) {
-      console.error(`[Restore] Too many workers in persistence file (${state.workers.length}, max ${MAX_RESTORE_WORKERS}) — truncating`);
+      logger.error(`[Restore] Too many workers in persistence file (${state.workers.length}, max ${MAX_RESTORE_WORKERS}) — truncating`);
       state.workers = state.workers.slice(0, MAX_RESTORE_WORKERS);
     }
 
-    console.log(`Restoring ${state.workers.length} workers from saved state...`);
+    logger.info(`[persistence] Restoring ${state.workers.length} workers from saved state`);
 
     const restoredIds = new Set();
     for (const savedWorker of state.workers) {
@@ -277,24 +346,24 @@ export async function restoreWorkerState(io = null) {
       if (!savedWorker || typeof savedWorker.id !== 'string' || !savedWorker.id ||
           typeof savedWorker.tmuxSession !== 'string' || !savedWorker.tmuxSession ||
           typeof savedWorker.workingDir !== 'string' || !savedWorker.workingDir) {
-        console.warn(`  Skipping entry with missing required fields (id/tmuxSession/workingDir)`);
+        logger.warn('[Restore] Skipping entry with missing required fields (id/tmuxSession/workingDir)');
         continue;
       }
       // Validate worker ID format (defense-in-depth: ID is used in checkpoint filenames)
       if (!/^[a-zA-Z0-9_-]{1,36}$/.test(savedWorker.id)) {
-        console.warn(`  Skipping entry with invalid worker ID format: ${String(savedWorker.id).slice(0, 50)}`);
+        logger.warn(`[Restore] Skipping entry with invalid worker ID format: ${String(savedWorker.id).slice(0, 50)}`);
         continue;
       }
       // Check if tmux session still exists
       const exists = await sessionExists(savedWorker.tmuxSession);
       if (!exists) {
-        console.log(`  Skipping ${savedWorker.label} (${savedWorker.id}) - session no longer exists`);
+        logger.info(`[Restore] Skipping ${savedWorker.label} (${savedWorker.id}) - session no longer exists`);
         // Clean up orphaned bulldoze state file
         if (savedWorker.workingDir && savedWorker.bulldozeMode) {
           const normalizedWd = path.resolve(savedWorker.workingDir);
           if (path.isAbsolute(normalizedWd) && !normalizedWd.includes('..')) {
             const bulldozeStatePath = path.join(normalizedWd, 'tmp', `bulldoze-state-${savedWorker.id}.md`);
-            try { await fs.unlink(bulldozeStatePath); console.log(`  Cleaned up orphaned bulldoze state: ${bulldozeStatePath}`); } catch { /* ENOENT is fine */ }
+            try { await fs.unlink(bulldozeStatePath); logger.info(`[Restore] Cleaned up orphaned bulldoze state: ${bulldozeStatePath}`); } catch { /* ENOENT is fine */ }
           }
         }
         // Clean up orphaned context file if no other worker shares the path
@@ -317,7 +386,7 @@ export async function restoreWorkerState(io = null) {
                 for (const f of ruleFiles) {
                   if (f.startsWith('strategos-worker-') && f.endsWith('.md')) {
                     await fs.unlink(path.join(rulesDir, f));
-                    console.log(`  Cleaned up orphaned rules file: ${f}`);
+                    logger.info(`[Restore] Cleaned up orphaned rules file: ${f}`);
                   }
                 }
               } catch (e) { /* ignore ENOENT */ }
@@ -330,7 +399,7 @@ export async function restoreWorkerState(io = null) {
                 for (const f of dirFiles) {
                   if (f.startsWith('GEMINI-strategos-worker-') && f.endsWith('.md')) {
                     await fs.unlink(path.join(normalizedDir, f));
-                    console.log(`  Cleaned up orphaned Gemini context: ${f}`);
+                    logger.info(`[Restore] Cleaned up orphaned Gemini context: ${f}`);
                   }
                 }
                 // Remove Strategos-managed master GEMINI.md
@@ -338,7 +407,7 @@ export async function restoreWorkerState(io = null) {
                   const masterContent = await fs.readFile(path.join(normalizedDir, 'GEMINI.md'), 'utf-8');
                   if (masterContent.includes('<!-- Strategos managed -->')) {
                     await fs.unlink(path.join(normalizedDir, 'GEMINI.md'));
-                    console.log(`  Cleaned up orphaned master GEMINI.md`);
+                    logger.info('[Restore] Cleaned up orphaned master GEMINI.md');
                   }
                 } catch { /* ignore ENOENT */ }
               } catch (e) { /* ignore ENOENT */ }
@@ -357,9 +426,9 @@ export async function restoreWorkerState(io = null) {
           };
           const checkpointPath = path.join(CHECKPOINT_DIR, `${savedWorker.id}.json`);
           writeFileSync(checkpointPath, JSON.stringify(checkpoint, null, 2));
-          console.warn(`[Restore] ⚠ Dead-session worker checkpointed: ${savedWorker.label} (${savedWorker.id}) — last progress: ${savedWorker.ralphProgress ?? 'unknown'}%, step: ${savedWorker.ralphCurrentStep ?? 'unknown'}`);
+          logger.warn(`[Restore] ⚠ Dead-session worker checkpointed: ${savedWorker.label} (${savedWorker.id}) — last progress: ${savedWorker.ralphProgress ?? 'unknown'}%, step: ${savedWorker.ralphCurrentStep ?? 'unknown'}`);
         } catch (cpErr) {
-          console.error(`[Restore] Failed to write checkpoint for dead worker ${savedWorker.id}:`, cpErr.message);
+          logger.error(`[Restore] Failed to write checkpoint for dead worker ${savedWorker.id}: ${cpErr.message}`);
         }
         continue;
       }
@@ -368,7 +437,7 @@ export async function restoreWorkerState(io = null) {
       try {
         validateSessionName(savedWorker.tmuxSession);
       } catch {
-        console.warn(`  Skipping ${savedWorker.label} (${savedWorker.id}) - invalid session name in saved state`);
+        logger.warn(`[Restore] Skipping ${savedWorker.label} (${savedWorker.id}) - invalid session name in saved state`);
         continue;
       }
 
@@ -377,7 +446,7 @@ export async function restoreWorkerState(io = null) {
       try {
         await spawnTmux(['capture-pane', '-t', savedWorker.tmuxSession, '-p']);
       } catch {
-        console.warn(`  Skipping ${savedWorker.label} (${savedWorker.id}) - session exists but capture-pane failed (zombie session)`);
+        logger.warn(`[Restore] Skipping ${savedWorker.label} (${savedWorker.id}) - session exists but capture-pane failed (zombie session)`);
         // Checkpoint zombie-session workers so the operator has visibility into what was lost
         try {
           const checkpoint = {
@@ -390,9 +459,9 @@ export async function restoreWorkerState(io = null) {
           };
           const checkpointPath = path.join(CHECKPOINT_DIR, `${savedWorker.id}.json`);
           writeFileSync(checkpointPath, JSON.stringify(checkpoint, null, 2));
-          console.warn(`[Restore] ⚠ Zombie-session worker checkpointed: ${savedWorker.label} (${savedWorker.id}) — last progress: ${savedWorker.ralphProgress ?? 'unknown'}%, step: ${savedWorker.ralphCurrentStep ?? 'unknown'}`);
+          logger.warn(`[Restore] ⚠ Zombie-session worker checkpointed: ${savedWorker.label} (${savedWorker.id}) — last progress: ${savedWorker.ralphProgress ?? 'unknown'}%, step: ${savedWorker.ralphCurrentStep ?? 'unknown'}`);
         } catch (cpErr) {
-          console.error(`[Restore] Failed to write checkpoint for zombie worker ${savedWorker.id}:`, cpErr.message);
+          logger.error(`[Restore] Failed to write checkpoint for zombie worker ${savedWorker.id}: ${cpErr.message}`);
         }
         continue;
       }
@@ -402,7 +471,7 @@ export async function restoreWorkerState(io = null) {
       const savedStatus = typeof savedWorker.status === 'string' ? savedWorker.status : '';
       const savedHealth = typeof savedWorker.health === 'string' ? savedWorker.health : '';
       if (['error', 'stopped', 'completed'].includes(savedStatus) || savedHealth === 'dead') {
-        console.log(`[Restore] Killing zombie tmux session for dead worker ${savedWorker.id} (${savedWorker.label}) — status: ${savedStatus}, health: ${savedHealth}`);
+        logger.info(`[Restore] Killing zombie tmux session for dead worker ${savedWorker.id} (${savedWorker.label}) — status: ${savedStatus}, health: ${savedHealth}`);
         try {
           await spawnTmux(['kill-session', '-t', savedWorker.tmuxSession]);
         } catch { /* session may already be gone */ }
@@ -419,7 +488,7 @@ export async function restoreWorkerState(io = null) {
       // not be reanimated from persistence — the watchdog will re-create them if needed.
       const workerLabel = typeof savedWorker.label === 'string' ? savedWorker.label.toLowerCase() : '';
       if (workerLabel.startsWith('auto-bulldoze')) {
-        console.log(`[Restore] Skipping ephemeral worker ${savedWorker.label} (${savedWorker.id}) — auto-bulldoze workers are not restored`);
+        logger.info(`[Restore] Skipping ephemeral worker ${savedWorker.label} (${savedWorker.id}) — auto-bulldoze workers are not restored`);
         try {
           await spawnTmux(['kill-session', '-t', savedWorker.tmuxSession]);
         } catch { /* session may already be gone */ }
@@ -432,7 +501,7 @@ export async function restoreWorkerState(io = null) {
         const { stdout: paneCmd } = await spawnTmux(['list-panes', '-t', savedWorker.tmuxSession, '-F', '#{pane_current_command}']);
         const cmd = (paneCmd || '').trim();
         if (!cmd || cmd === 'bash' || cmd === 'zsh' || cmd === 'sh') {
-          console.warn(`  [Restore] Session ${savedWorker.tmuxSession} has dead process (${cmd || 'empty'}), will mark as crashed`);
+          logger.warn(`[Restore] Session ${savedWorker.tmuxSession} has dead process (${cmd || 'empty'}), will mark as crashed`);
           _processHealthy = false;
         }
       } catch {
@@ -451,6 +520,10 @@ export async function restoreWorkerState(io = null) {
         label: typeof savedWorker.label === 'string' ? savedWorker.label : String(savedWorker.label ?? ''),
         project: typeof savedWorker.project === 'string' ? savedWorker.project : String(savedWorker.project ?? ''),
         workingDir: savedWorker.workingDir,
+        // Worktree isolation fields (§3.5). repoPath falls back to workingDir for
+        // pre-isolation saved state; isolated is strictly boolean.
+        repoPath: typeof savedWorker.repoPath === 'string' ? savedWorker.repoPath : savedWorker.workingDir,
+        isolated: savedWorker.isolated === true,
         tmuxSession: savedWorker.tmuxSession,
         // Backend ('claude' or 'gemini')
         backend: ['gemini', 'aider'].includes(savedWorker.backend) ? savedWorker.backend : 'claude',
@@ -545,6 +618,10 @@ export async function restoreWorkerState(io = null) {
         // Task received timestamp
         taskReceivedAt: savedWorker.taskReceivedAt ? new Date(savedWorker.taskReceivedAt) : null,
         taskQualityScore: savedWorker.taskQualityScore ?? null,
+        // Auto-fallback observability — set when modelFallbackService substituted spawn args.
+        originalModel: typeof savedWorker.originalModel === 'string' ? savedWorker.originalModel : null,
+        originalEffort: typeof savedWorker.originalEffort === 'string' ? savedWorker.originalEffort : null,
+        fallbackReason: typeof savedWorker.fallbackReason === 'string' ? savedWorker.fallbackReason : null,
       };
 
       // Per-worker try-catch: if one worker fails to initialize, continue restoring others
@@ -586,18 +663,18 @@ export async function restoreWorkerState(io = null) {
             const w = workers.get(wId);
             if (w && w.ralphMode && w.status === 'running' && (!w.ralphStatus || w.ralphStatus === 'pending')) {
               const restoreMsg = (w.backend === 'gemini' || w.backend === 'aider')
-                ? `Signal your progress via Ralph. Run: curl -s -X POST http://localhost:38007/api/ralph/signal/by-worker/${wId} -H "Content-Type: application/json" -d '{"status":"in_progress","progress":10,"currentStep":"what you are doing"}'`
+                ? `Signal your progress via Ralph. Run: curl -s --retry 3 --retry-delay 2 --retry-connrefused -X POST http://localhost:38007/api/ralph/signal/by-worker/${wId} -H "Content-Type: application/json" -d '{"status":"in_progress","progress":10,"currentStep":"what you are doing"}'`
                 : `Signal your progress via the strategos_signal MCP tool: strategos_signal(status: "in_progress", progress: 10, currentStep: "what you are doing"). Your worker ID is ${wId} (auto-detected if omitted). Use strategos_whoami if unsure of your identity.`;
-              sendInputDirect(wId, restoreMsg, 'persistence:restore_reminder').catch(err => { console.warn(`[Ralph] Failed to send restore reminder: ${err.message}`); });
-              console.log(`[Ralph] Sent post-restore reminder to ${worker.label}`);
+              sendInputDirect(wId, restoreMsg, 'persistence:restore_reminder').catch(err => { logger.warn(`[Ralph] Failed to send restore reminder: ${err.message}`); });
+              logger.info(`[Ralph] Sent post-restore reminder to ${worker.label}`);
             }
           }, 30000); // 30s after restore (shorter than 60s spawn delay since worker already running)
         }
 
         restoredIds.add(savedWorker.id);
-        console.log(`  Restored ${savedWorker.label}`);
+        logger.info(`[Restore] Restored ${savedWorker.label}`);
       } catch (workerErr) {
-        console.error(`[Restore] Failed to initialize worker ${savedWorker.id} (${savedWorker.label}): ${workerErr.message}`);
+        logger.error(`[Restore] Failed to initialize worker ${savedWorker.id} (${savedWorker.label}): ${workerErr.message}`);
         // Clean up partial state to prevent orphaned entries
         stopPtyCapture(savedWorker.id);
         stopHealthMonitor(savedWorker.id);
@@ -607,6 +684,14 @@ export async function restoreWorkerState(io = null) {
         commandQueues.delete(savedWorker.id);
         continue; // Skip to next worker, don't abort entire restore
       }
+    }
+
+    // Enforce the checkpoint cap after the batch restore writes.
+    // Dead/zombie workers each write one checkpoint; a large restore can transiently exceed 500.
+    try {
+      pruneCheckpoints(CHECKPOINT_DIR);
+    } catch (pruneErr) {
+      logger.warn(`[Restore] pruneCheckpoints failed after batch restore: ${pruneErr.message}`);
     }
 
     // Clean up childWorkerIds that reference dead workers — move them to childWorkerHistory
@@ -623,7 +708,7 @@ export async function restoreWorkerState(io = null) {
               worker.childWorkerHistory.push(deadId);
             }
           }
-          console.log(`  Pruned ${deadChildIds.length} dead child reference(s) from ${worker.label} (moved to history)`);
+          logger.info(`[Restore] Pruned ${deadChildIds.length} dead child reference(s) from ${worker.label} (moved to history)`);
         }
       }
     }
@@ -638,7 +723,7 @@ export async function restoreWorkerState(io = null) {
         try {
           registerWorkerDependencies(workerId, [], null, worker.workflowId);
         } catch (err) {
-          console.warn(`  Failed to register standalone worker ${worker.label} in graph: ${err.message}`);
+          logger.warn(`[Restore] Failed to register standalone worker ${worker.label} in graph: ${err.message}`);
         }
       }
     }
@@ -648,10 +733,10 @@ export async function restoreWorkerState(io = null) {
         try {
           registerWorkerDependencies(workerId, liveDeps, null, worker.workflowId);
           if (liveDeps.length > 0) {
-            console.log(`  Rebuilt dependency graph for ${worker.label} (${liveDeps.length} deps)`);
+            logger.info(`[Restore] Rebuilt dependency graph for ${worker.label} (${liveDeps.length} deps)`);
           }
         } catch (err) {
-          console.warn(`  Failed to rebuild dependencies for ${worker.label}: ${err.message}`);
+          logger.warn(`[Restore] Failed to rebuild dependencies for ${worker.label}: ${err.message}`);
         }
       }
     }
@@ -668,10 +753,25 @@ export async function restoreWorkerState(io = null) {
       }
     }
 
+    // Boot-time worktree GC (§3.5/E4): remove orphan worktree dirs whose owning worker
+    // no longer exists (crashed during downtime). Keep dirs for live restored workers.
+    try {
+      const liveWorkerIds = [...workers.keys()];
+      const repoPaths = [...new Set(
+        [...workers.values()].map(w => w.repoPath).filter(p => typeof p === 'string')
+      )];
+      const { removed } = await pruneWorktrees(liveWorkerIds, repoPaths);
+      if (removed.length > 0) {
+        logger.info(`[Restore] Pruned ${removed.length} orphan worktree dir(s)`);
+      }
+    } catch (gcErr) {
+      logger.warn(`[Restore] Worktree GC failed (non-fatal): ${gcErr.message}`);
+    }
+
     // After all workers restored, do a delayed crash check (allow output buffers to populate)
     setTimeout(async () => {
       try {
-        console.log('[CrashCheck] Running post-restore crash detection...');
+        logger.info('[CrashCheck] Running post-restore crash detection');
         for (const [workerId, worker] of workers.entries()) {
           // Skip completed/stopped workers — their output may contain past error strings
           if (worker.status === 'completed' || worker.status === 'stopped') continue;
@@ -680,7 +780,7 @@ export async function restoreWorkerState(io = null) {
           for (const pattern of crashPatterns) {
             if (pattern.test()) {
               if (worker.health !== 'crashed') {
-                console.error(`[CrashDetect] Worker ${workerId} (${worker.label}) crashed during previous session: ${pattern.reason}`);
+                logger.error(`[CrashDetect] Worker ${workerId} (${worker.label}) crashed during previous session: ${pattern.reason}`);
                 worker.health = 'crashed';
                 worker.crashReason = `${pattern.reason} (detected on restore)`;
                 worker.crashedAt = new Date();
@@ -688,13 +788,13 @@ export async function restoreWorkerState(io = null) {
                   io.emit('worker:crashed', { workerId, label: worker.label, reason: worker.crashReason });
                 }
                 handleCrashedWorker(workerId, worker, io)
-                  .catch(err => console.error(`[CrashCheck] handleCrashedWorker failed for ${workerId}: ${err.message}`));
+                  .catch(err => logger.error(`[CrashCheck] handleCrashedWorker failed for ${workerId}: ${err.message}`));
               }
               break;
             }
           }
         }
-        console.log('[CrashCheck] Post-restore crash detection complete');
+        logger.info('[CrashCheck] Post-restore crash detection complete');
 
         // Post-restore auto-promotion re-evaluation:
         // Workers at >= 90% in_progress with completion keywords in their currentStep
@@ -709,16 +809,16 @@ export async function restoreWorkerState(io = null) {
           }
         }
         if (promoted > 0) {
-          console.log(`[Restore] Auto-promoted ${promoted} worker(s) to done on restore`);
+          logger.info(`[Restore] Auto-promoted ${promoted} worker(s) to done on restore`);
         }
       } catch (err) {
-        console.error(`[CrashCheck] Post-restore crash detection failed: ${err.message}`);
+        logger.error(`[CrashCheck] Post-restore crash detection failed: ${err.message}`);
       }
     }, 5000); // Wait 5 seconds for output buffers to populate
 
   } catch (error) {
     if (error.code !== 'ENOENT') {
-      console.error('Failed to restore worker state:', error.message);
+      logger.error(`[persistence] Failed to restore worker state: ${error.message}`);
     }
   }
 }

@@ -15,13 +15,9 @@
  */
 
 import crypto from 'crypto';
-import { readFileSync, writeFileSync, existsSync } from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import { getSummaryStats, getRecentFailures, getRecentFailuresByType } from '../learningsDb.js';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const OVERRIDES_PATH = path.join(__dirname, '..', 'template-overrides.json');
+import { getLogger } from '../logger.js';
+import { OVERRIDES_PATH, readOverrides, writeOverridesAtomic } from './templateOverridesStore.js';
 
 const ANALYSIS_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
 
@@ -57,6 +53,16 @@ const STOP_WORDS = new Set([
   'my', 'we', 'they', 'he', 'she', 'what', 'which', 'who', 'how', 'where',
   'purpose', 'tasks', 'task', 'worker', 'workers', 'spawn', 'check',
   'commit', 'file', 'files', 'code', 'make', 'ensure', 'update',
+  // Strategos workflow roles — ubiquitous in labels/tasks, not failure signals
+  'research', 'impl', 'fix', 'test', 'review', 'colonel', 'general',
+  // Ralph/signaling vocabulary
+  'ralph', 'signal', 'signaled', 'status',
+  // Lifecycle state words
+  'done', 'state', 'crash', 'cleanup', 'started', 'starting', 'completed', 'complete',
+  // Generic analysis noise
+  'production', 'real', 'error', 'pattern', 'analysis', 'failure', 'success',
+  // Learning/output vocabulary
+  'learning', 'learnings', 'output', 'outputs', 'input',
 ]);
 
 // ============================================
@@ -104,7 +110,7 @@ export function runAnalysis() {
           : 'info';
         const msg = `${type.toUpperCase()} workers at ${pct}% success rate (${severity})`;
         analysis.alerts.push({ severity, message: msg });
-        console.log(`[InsightAnalyzer] ${msg}`);
+        getLogger().info(`[insights.analyzer] ${msg}`);
       }
 
       // 2. Uptime anomalies
@@ -112,42 +118,42 @@ export function runAnalysis() {
         if (row.avgUptime < UPTIME_TOO_SHORT) {
           const anomaly = { type, avgUptime: row.avgUptime, issue: 'too_short' };
           analysis.uptimeAnomalies.push(anomaly);
-          console.log(`[InsightAnalyzer] ${type.toUpperCase()} avg uptime ${row.avgUptime}s — too short (likely crash)`);
+          getLogger().info(`[insights.analyzer] ${type.toUpperCase()} avg uptime ${row.avgUptime}s — too short (likely crash)`);
         } else if (row.avgUptime > UPTIME_TOO_LONG) {
           const anomaly = { type, avgUptime: row.avgUptime, issue: 'too_long' };
           analysis.uptimeAnomalies.push(anomaly);
-          console.log(`[InsightAnalyzer] ${type.toUpperCase()} avg uptime ${row.avgUptime}s — too long (likely stall)`);
+          getLogger().info(`[insights.analyzer] ${type.toUpperCase()} avg uptime ${row.avgUptime}s — too long (likely stall)`);
         }
       }
     }
   } catch (err) {
-    console.log(`[InsightAnalyzer] Error reading summary stats: ${err.message}`);
+    getLogger().error(`[insights.analyzer] Error reading summary stats: ${err.message}`);
   }
 
   // 3. Global failure pattern clustering
   try {
-    const failures = getRecentFailures(7);
+    const failures = getRecentFailures(6);
     if (failures.length > 0) {
       analysis.failurePatterns = _clusterFailures(failures);
       if (analysis.failurePatterns.length > 0) {
-        console.log(`[InsightAnalyzer] Found ${analysis.failurePatterns.length} failure pattern(s) in ${failures.length} recent failures`);
+        getLogger().info(`[insights.analyzer] Found ${analysis.failurePatterns.length} failure pattern(s) in ${failures.length} recent failures`);
       }
     }
   } catch (err) {
-    console.log(`[InsightAnalyzer] Error reading recent failures: ${err.message}`);
+    getLogger().error(`[insights.analyzer] Error reading recent failures: ${err.message}`);
   }
 
   // 4. Per-type failure pattern extraction
   try {
     for (const [type, stats] of Object.entries(analysis.successRates)) {
       if (type === 'unknown' || stats.failures === 0) continue;
-      const typeFailures = getRecentFailuresByType(type, 30);
+      const typeFailures = getRecentFailuresByType(type, 6);
       if (typeFailures.length > 0) {
         analysis.typeFailurePatterns[type] = _extractTypeFailureData(typeFailures);
       }
     }
   } catch (err) {
-    console.log(`[InsightAnalyzer] Error extracting type failures: ${err.message}`);
+    getLogger().error(`[insights.analyzer] Error extracting type failures: ${err.message}`);
   }
 
   latestAnalysis = analysis;
@@ -199,9 +205,22 @@ function _clusterFailures(failures) {
     }
   }
 
-  // Sort by frequency descending, take top 10
+  // Sort by frequency descending
   patterns.sort((a, b) => b.count - a.count);
-  return patterns.slice(0, 10);
+
+  // Dedup: when two patterns share identical sorted-examples + count, keep the longer
+  // keyword (more specific term wins over shorter synonym hitting the same workers).
+  const exampleKey = p => JSON.stringify([...p.examples].sort()) + ':' + p.count;
+  const bestByKey = new Map();
+  for (const p of patterns) {
+    const key = exampleKey(p);
+    const existing = bestByKey.get(key);
+    if (!existing || p.pattern.length > existing.pattern.length) {
+      bestByKey.set(key, p);
+    }
+  }
+  const kept = new Set(bestByKey.values());
+  return patterns.filter(p => kept.has(p)).slice(0, 10);
 }
 
 /**
@@ -284,19 +303,11 @@ function _runAutoTuner(analysis) {
   const overrides = _readOverrides();
   let overridesChanged = false;
 
-  // Clear any existing append_to_mission content — injection is permanently disabled
-  for (const type of Object.keys(overrides.overrides)) {
-    if (overrides.overrides[type].append_to_mission) {
-      overrides.overrides[type].append_to_mission = '';
-      overridesChanged = true;
-    }
-  }
-
   // Clear old investigation proposals — they are noise
   const oldProposalCount = proposals.length;
   proposals = [];
   if (oldProposalCount > 0) {
-    console.log(`[AutoTuner] Cleared ${oldProposalCount} stale proposals`);
+    getLogger().info(`[insights.autoTuner] Cleared ${oldProposalCount} stale proposals`);
   }
 
   // Tiered auto-apply for worker types below threshold
@@ -325,14 +336,18 @@ function _runAutoTuner(analysis) {
     if (!overrides.overrides[type]) {
       overrides.overrides[type] = {};
     }
-    overrides.overrides[type].append_to_mission = ''; // analysis kept, injection disabled
+    // SINGLE-OWNER: the auto-tuner owns `tier_warning`, NOT `append_to_mission`.
+    // append_to_mission is owned solely by learningsFeedbackService. The spawn-time
+    // consumer (templates.js) concatenates append_to_mission + tier_warning +
+    // failure_warnings, so no field is dual-owned / last-writer-wins anymore.
+    overrides.overrides[type].tier_warning = warning;
     overrides.overrides[type].tier = stats.rate < THRESHOLD_CRITICAL ? 'critical'
       : stats.rate < THRESHOLD_DANGER ? 'danger' : 'warning';
     overrides.overrides[type].successRate = stats.rate;
     overrides.overrides[type].sampleSize = stats.total;
     overrides.overrides[type].updatedAt = new Date().toISOString();
     overridesChanged = true;
-    console.log(`[AutoTuner] Auto-applied ${overrides.overrides[type].tier} override for ${type.toUpperCase()} (${pct}% success rate)`);
+    getLogger().info(`[insights.autoTuner] Auto-applied ${overrides.overrides[type].tier} override for ${type.toUpperCase()} (${pct}% success rate)`);
   }
 
   // Low-risk: add stability warnings for types with short uptime
@@ -344,11 +359,12 @@ function _runAutoTuner(analysis) {
     if (!overrides.overrides[anomaly.type]) {
       overrides.overrides[anomaly.type] = {};
     }
-    // Only set if no existing success-rate override already covers this
-    if (!overrides.overrides[anomaly.type].append_to_mission) {
-      overrides.overrides[anomaly.type].append_to_mission = ''; // analysis kept, injection disabled
+    // Only set if the tuner has not already written a tier_warning for this type.
+    // (tier_warning is tuner-owned; never touch append_to_mission here.)
+    if (!overrides.overrides[anomaly.type].tier_warning) {
+      overrides.overrides[anomaly.type].tier_warning = warning;
       overridesChanged = true;
-      console.log(`[AutoTuner] Applied override: ${anomaly.type.toUpperCase()} stability warning (avg uptime ${anomaly.avgUptime}s)`);
+      getLogger().info(`[insights.autoTuner] Applied override: ${anomaly.type.toUpperCase()} stability warning (avg uptime ${anomaly.avgUptime}s)`);
     }
   }
 
@@ -441,7 +457,7 @@ function _cleanRecoveredOverrides(analysis) {
       if (!uptimeAnomaly) {
         delete overrides.overrides[type];
         changed = true;
-        console.log(`[AutoTuner] Removed override: ${type.toUpperCase()} recovered above ${(THRESHOLD_WARNING * 100).toFixed(0)}% threshold`);
+        getLogger().info(`[insights.autoTuner] Removed override: ${type.toUpperCase()} recovered above ${(THRESHOLD_WARNING * 100).toFixed(0)}% threshold`);
       }
     }
   }
@@ -458,21 +474,17 @@ function _cleanRecoveredOverrides(analysis) {
 // ============================================
 
 function _readOverrides() {
-  try {
-    if (existsSync(OVERRIDES_PATH)) {
-      return JSON.parse(readFileSync(OVERRIDES_PATH, 'utf8'));
-    }
-  } catch {
-    // Fall through to default
-  }
-  return { version: 0, updatedAt: null, overrides: {} };
+  return readOverrides(OVERRIDES_PATH);
 }
 
 function _writeOverrides(data) {
+  // Route through the shared store: temp-file + atomic rename, so a crash
+  // mid-write can never truncate the file (which would null out overrides for
+  // every spawned worker). Versioning is handled by the callers below.
   try {
-    writeFileSync(OVERRIDES_PATH, JSON.stringify(data, null, 2), 'utf8');
+    writeOverridesAtomic(data, OVERRIDES_PATH);
   } catch (err) {
-    console.log(`[AutoTuner] Failed to write overrides: ${err.message}`);
+    getLogger().error(`[insights.autoTuner] Failed to write overrides: ${err.message}`);
   }
 }
 
@@ -524,9 +536,9 @@ export function triggerAnalysis() {
     debounceTimer = null;
     try {
       runAnalysis();
-      console.log('[InsightAnalyzer] Event-driven analysis completed');
+      getLogger().info('[insights.analyzer] Event-driven analysis completed');
     } catch (err) {
-      console.log(`[InsightAnalyzer] Event-driven analysis failed: ${err.message}`);
+      getLogger().error(`[insights.analyzer] Event-driven analysis failed: ${err.message}`);
     }
   }, DEBOUNCE_MS);
   if (debounceTimer.unref) debounceTimer.unref();
@@ -537,13 +549,13 @@ export function triggerAnalysis() {
 // ============================================
 
 export function startInsightAnalyzer() {
-  console.log('[InsightAnalyzer] Starting insight analyzer (10-min interval + event-driven)');
+  getLogger().info('[insights.analyzer] Starting insight analyzer (10-min interval + event-driven)');
 
   // Run initial analysis immediately
   try {
     runAnalysis();
   } catch (err) {
-    console.log(`[InsightAnalyzer] Initial analysis failed: ${err.message}`);
+    getLogger().error(`[insights.analyzer] Initial analysis failed: ${err.message}`);
   }
 
   // Schedule recurring analysis
@@ -551,7 +563,7 @@ export function startInsightAnalyzer() {
     try {
       runAnalysis();
     } catch (err) {
-      console.log(`[InsightAnalyzer] Scheduled analysis failed: ${err.message}`);
+      getLogger().error(`[insights.analyzer] Scheduled analysis failed: ${err.message}`);
     }
   }, ANALYSIS_INTERVAL_MS);
 
@@ -570,5 +582,5 @@ export function stopInsightAnalyzer() {
     clearTimeout(debounceTimer);
     debounceTimer = null;
   }
-  console.log('[InsightAnalyzer] Stopped');
+  getLogger().info('[insights.analyzer] Stopped');
 }

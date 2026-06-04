@@ -30,6 +30,7 @@ export {
 // From output.js — PTY capture, input handling, worker settings
 export {
   sendInput,
+  sendInputDirect,
   sendRawInput,
   interruptWorker,
   processQueue,

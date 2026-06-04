@@ -49,6 +49,9 @@ import {
 } from '../metricsService.js';
 import { getResourceReport } from '../workers/resources.js';
 import { sanitizeErrorMessage } from '../errorUtils.js';
+import { getLogger } from '../logger.js';
+
+const logger = getLogger('system.route');
 import {
   CONTROL_CHAR_RE, isValidSessionId,
   MAX_PROMPT_LENGTH, MAX_SYSTEM_PROMPT_LENGTH,
@@ -338,7 +341,7 @@ export function createSystemRoutes(theaRoot, io) {
       }
 
       if (blockedPaths.length > 0) {
-        console.warn(`[SECURITY] Batch operation blocked ${blockedPaths.length} path traversal attempts`);
+        logger.warn('[system.route] Batch path traversal attempts blocked', { event: 'security.path_traversal', count: blockedPaths.length });
       }
 
       if (validPaths.length === 0) {
@@ -705,22 +708,24 @@ export function createSystemRoutes(theaRoot, io) {
   // ?detailed=true returns memory, workers, and database status
   router.get('/health', (req, res) => {
     try {
+      const capStats = getResourceStats();
       const result = {
         status: 'ok',
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        activeWorkers: capStats.running + capStats.spawning,
+        maxWorkers: capStats.maxConcurrent
       };
 
       if (req.query.detailed === 'true') {
         const mem = process.memoryUsage();
-        const stats = getResourceStats();
         result.memory = {
           heapUsedMb: Math.round(mem.heapUsed / 1024 / 1024),
           rssMb: Math.round(mem.rss / 1024 / 1024)
         };
         result.workers = {
-          running: stats.running,
-          total: stats.total,
-          errors: stats.error
+          running: capStats.running,
+          total: capStats.total,
+          errors: capStats.error
         };
         result.uptime = Math.floor(process.uptime());
 
@@ -967,90 +972,26 @@ export function createSystemRoutes(theaRoot, io) {
   });
 
   // ─── Claude Usage / Rate Limits ──────────────────────────────────────────────
-  // Reads ~/.claude/.credentials.json server-side to check rate limits via Anthropic API.
-  // Only rate limit utilization data is returned to client — no tokens or credentials are exposed.
-  let _usageCache = null;
-  let _usageCacheTime = 0;
-  const USAGE_CACHE_TTL = 60_000; // 60s
-
+  // Anthropic exposes only `anthropic-ratelimit-unified-*` headers (combined across
+  // models). To detect per-model exhaustion, usageService probes haiku/sonnet/opus
+  // separately — a 429+rate_limit_error with no ratelimit headers means that model
+  // bucket is exhausted while others may still have headroom. Documented in
+  // server/services/usageService.js (motivating incident: 2026-05-01 Sonnet wall).
   router.get('/usage', async (req, res) => {
-
     try {
-    const now = Date.now();
-    if (_usageCache && (now - _usageCacheTime) < USAGE_CACHE_TTL) {
-      return res.json(_usageCache);
-    }
-      const credsPath = path.join(os.homedir(), '.claude', '.credentials.json');
-      if (!fs.existsSync(credsPath)) {
-        return res.status(404).json({ error: 'No Claude credentials found' });
-      }
-
-      const creds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));
-      const token = creds.claudeAiOauth?.accessToken;
-      if (!token) {
-        return res.status(401).json({ error: 'No access token in credentials' });
-      }
-
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 10_000);
-
-      const apiRes = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'anthropic-version': '2023-06-01',
-          'anthropic-beta': 'oauth-2025-04-20',
-          'authorization': `Bearer ${token}`
-        },
-        body: JSON.stringify({
-          model: 'claude-haiku-4-5-20251001',
-          max_tokens: 1,
-          messages: [{ role: 'user', content: 'hi' }]
-        }),
-        signal: controller.signal
-      });
-      clearTimeout(timeout);
-
-      const h = (name) => apiRes.headers.get(name);
-
-      // Only parse usage if the API returned rate limit headers.
-      // On 401/error responses, headers are absent — returning 0% would be wrong.
-      const hasUtilization = h('anthropic-ratelimit-unified-5h-utilization') !== null;
-      if (!hasUtilization) {
-        // Return stale cache if available (better than 0%), otherwise error
-        if (_usageCache) {
-          return res.json({ ..._usageCache, stale: true });
-        }
-        return res.status(502).json({ error: `Anthropic API returned ${apiRes.status} without rate limit headers` });
-      }
-
-      const policy = (process.env.STRATEGOS_USAGE_POLICY || 'unlimited').toLowerCase();
-
-      const usage = {
-        status: h('anthropic-ratelimit-unified-status') || 'unknown',
-        session: {
-          status: h('anthropic-ratelimit-unified-5h-status'),
-          utilization: parseFloat(h('anthropic-ratelimit-unified-5h-utilization')),
-          reset: parseInt(h('anthropic-ratelimit-unified-5h-reset') || '0', 10)
-        },
-        weekly: {
-          status: h('anthropic-ratelimit-unified-7d-status'),
-          utilization: parseFloat(h('anthropic-ratelimit-unified-7d-utilization') || '0'),
-          reset: parseInt(h('anthropic-ratelimit-unified-7d-reset') || '0', 10)
-        },
-        representativeClaim: h('anthropic-ratelimit-unified-representative-claim'),
-        fallbackPercentage: parseFloat(h('anthropic-ratelimit-unified-fallback-percentage') || '0'),
-        overageStatus: h('anthropic-ratelimit-unified-overage-status'),
-        subscription: creds.claudeAiOauth?.subscriptionType || 'unknown',
-        tier: creds.claudeAiOauth?.rateLimitTier || 'unknown',
-        policy,
-        fetchedAt: new Date().toISOString()
-      };
-
-      _usageCache = usage;
-      _usageCacheTime = now;
+      const { getUsage } = await import('../services/usageService.js');
+      const usage = await getUsage();
       res.json(usage);
     } catch (err) {
+      if (err.code === 'NO_CREDS') {
+        return res.status(404).json({ error: 'No Claude credentials found' });
+      }
+      if (err.code === 'NO_TOKEN') {
+        return res.status(401).json({ error: 'No access token in credentials' });
+      }
+      if (err.code === 'NO_HEADERS') {
+        return res.status(502).json({ error: 'Anthropic API returned no rate limit headers' });
+      }
       if (err.name === 'AbortError') {
         return res.status(504).json({ error: 'Anthropic API timeout' });
       }

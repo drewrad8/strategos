@@ -16,6 +16,7 @@
 
 import { spawn } from 'child_process';
 import { getWorkers, getCircuitBreakerStatus, getResourceStats } from './workerManager.js';
+import { getLogger } from './logger.js';
 
 // Dedicated tmux socket — must match workerManager.js
 const TMUX_SOCKET = 'strategos';
@@ -170,15 +171,7 @@ export async function runDiagnostics() {
 
   // --- Ralph Stall Detection ---
   const now = Date.now();
-  const ralphStalls = [];
-  for (const w of runningWorkers) {
-    if (w.ralphMode && w.ralphStatus === 'pending') {
-      const ageMs = now - new Date(w.createdAt).getTime();
-      if (ageMs > 5 * 60 * 1000) { // 5 min without signaling
-        ralphStalls.push(`${w.id}(${w.label}) — ${Math.round(ageMs / 60000)}min without Ralph signal`);
-      }
-    }
-  }
+  const ralphStalls = _detectRalphStalls(runningWorkers, now);
   if (ralphStalls.length > 0) {
     warnings.push(`Ralph stalls: ${ralphStalls.join(', ')}`);
   }
@@ -203,12 +196,33 @@ export async function runDiagnostics() {
 
   // Log if unhealthy
   if (status === 'unhealthy') {
-    console.error(`[Sentinel] UNHEALTHY: ${issues.join(' | ')}`);
+    getLogger().error('[sentinel] UNHEALTHY', { issues });
   } else if (status === 'degraded') {
-    console.warn(`[Sentinel] DEGRADED: ${warnings.join(' | ')}`);
+    getLogger().warn('[sentinel] DEGRADED', { warnings });
   }
 
   return result;
+}
+
+/**
+ * Detect Ralph stall workers from a list.
+ * Pending workers stall after 5 min; in_progress workers after 60 min.
+ * Exported for unit testing.
+ */
+export function _detectRalphStalls(workers, now) {
+  const stalls = [];
+  for (const w of workers) {
+    if (!w.ralphMode) continue;
+    if (w.ralphStatus !== 'pending' && w.ralphStatus !== 'in_progress') continue;
+    const lastSignalMs = w.lastRalphSignalAt
+      ? now - new Date(w.lastRalphSignalAt).getTime()
+      : now - new Date(w.createdAt).getTime();
+    const threshold = w.ralphStatus === 'pending' ? 5 * 60 * 1000 : 60 * 60 * 1000;
+    if (lastSignalMs > threshold) {
+      stalls.push(`${w.id}(${w.label}) — ${Math.round(lastSignalMs / 60000)}min without Ralph update`);
+    }
+  }
+  return stalls;
 }
 
 /**
@@ -217,15 +231,15 @@ export async function runDiagnostics() {
 export function startSentinel() {
   if (_interval) return;
   _startedAt = Date.now();
-  console.log(`[Sentinel] Started (interval: ${SENTINEL_INTERVAL_MS / 1000}s)`);
+  getLogger().info('[sentinel] Started', { intervalSeconds: SENTINEL_INTERVAL_MS / 1000 });
 
   // Run first check after 30s (let server fully initialize)
   setTimeout(() => {
-    runDiagnostics().catch(err => console.error(`[Sentinel] Diagnostic error: ${err.message}`));
+    runDiagnostics().catch(err => getLogger().error('[sentinel] Diagnostic error', err?.message));
   }, 30000);
 
   _interval = setInterval(() => {
-    runDiagnostics().catch(err => console.error(`[Sentinel] Diagnostic error: ${err.message}`));
+    runDiagnostics().catch(err => getLogger().error('[sentinel] Diagnostic error', err?.message));
   }, SENTINEL_INTERVAL_MS);
 }
 
@@ -236,7 +250,7 @@ export function stopSentinel() {
   if (_interval) {
     clearInterval(_interval);
     _interval = null;
-    console.log('[Sentinel] Stopped');
+    getLogger().info('[sentinel] Stopped');
   }
 }
 

@@ -29,6 +29,7 @@ function computeMetrics(afterTimestamp) {
   // This matches the filter used by getSummaryStats() so baseline snapshots reflect real work only.
   const allLearnings = getLearnings(null, 90).filter(l =>
     !(l.label && l.label.includes(': TEST: ')) &&
+    !(l.label && /E2E_FIXTURE:/i.test(l.label)) &&
     !(l.taskDescription == null && l.parentWorkerId == null)
   );
 

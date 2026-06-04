@@ -567,4 +567,6 @@ export function getLogger() {
   return loggerInstance;
 }
 
+export { FileRotator };
+
 export default { initLogger, getLogger, LogLevel, LifecycleEvent };

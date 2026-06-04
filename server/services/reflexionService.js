@@ -73,8 +73,15 @@ Respond with only the JSON object.`;
     const text = response.content[0]?.text?.trim();
     if (!text) return;
 
-    // Validate it's parseable JSON
+    // Validate it's parseable JSON and has required schema fields
     const reflection = JSON.parse(text);
+
+    const requiredFields = ['whatAttempted', 'whatWentWrong', 'rootCause', 'avoidNextTime'];
+    const missingFields = requiredFields.filter(f => !reflection[f]);
+    if (missingFields.length > 0) {
+      getLogger().warn(`[Reflexion] Schema validation failed for ${workerId}: missing fields [${missingFields.join(', ')}]`);
+      return;
+    }
 
     addFailureReflection({
       workerId,

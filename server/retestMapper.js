@@ -13,6 +13,7 @@
 
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import { getLogger } from './logger.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -317,7 +318,7 @@ export async function getChangedFiles(ref = 'HEAD~1') {
     });
     return stdout.trim().split('\n').filter(Boolean);
   } catch (err) {
-    console.error(`[retestMapper] git diff failed for ref "${ref}":`, err.message);
+    getLogger('[retest.mapper]').error('git diff failed', { ref, error: err.message });
     return [];
   }
 }

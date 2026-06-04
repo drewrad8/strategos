@@ -9,14 +9,33 @@
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
   <link rel="apple-touch-icon" href="/favicon.svg" />
   <title>Strategos</title>
+  <!-- FOUC prevention: apply theme class before React renders -->
+  <script>
+    (function() {
+      var html = document.documentElement;
+      html.classList.add('no-transition');
+      var stored = localStorage.getItem('strategos.theme');
+      if (stored === 'light') {
+        // no dark class — light mode
+      } else if (stored === 'system') {
+        var prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+        if (prefersDark) { html.classList.add('dark'); }
+      } else {
+        // 'dark' or absent — default is dark
+        html.classList.add('dark');
+      }
+    })();
+  </script>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700;800;900&family=Rajdhani:wght@300;400;500;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet" />
-  <script type="module" crossorigin src="/assets/index-DsmEkpii.js"></script>
-  <link rel="modulepreload" crossorigin href="/assets/vendor-react-wGySg1uH.js">
+  <!-- Highlight.js dark theme for code syntax highlighting -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css" />
+  <script type="module" crossorigin src="/assets/index-B2Jd797G.js"></script>
+  <link rel="modulepreload" crossorigin href="/assets/vendor-react-KfUPlHYY.js">
   <link rel="modulepreload" crossorigin href="/assets/vendor-socket-BcxXcwBL.js">
   <link rel="modulepreload" crossorigin href="/assets/vendor-terminal-CyaXSNWE.js">
-  <link rel="stylesheet" crossorigin href="/assets/index-BEbT_z6D.css">
+  <link rel="stylesheet" crossorigin href="/assets/index-4_dKOFfB.css">
 </head>
 <body>
   <div id="root"></div>

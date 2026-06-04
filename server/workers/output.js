@@ -7,7 +7,7 @@ import crypto from 'crypto';
 import {
   workers, outputBuffers, commandQueues, ptyInstances, sessionFailCounts,
   pendingWorkers, autoCleanupTimers, lastResizeSize, respawnAttempts,
-  _sendingInput, _processingQueues, _tmuxSendLock,
+  _sendingInput, _processingQueues, _tmuxSendLock, withTmuxLock,
   SESSION_FAIL_THRESHOLD, PROCESS_QUEUE_MAX_DRAIN, PROCESS_QUEUE_DELAY_MS, MAX_QUEUE_SIZE,
   path, fs, execAsync,
   simpleHash, stripAnsiCodes, normalizeWorker, addActivity,
@@ -24,12 +24,14 @@ import {
   FORCED_AUTONOMY_BASE_THRESHOLD, FORCED_AUTONOMY_MAX_THRESHOLD, FORCED_AUTONOMY_BACKOFF_FACTOR,
   BULLDOZE_MAX_COMPACTIONS, BULLDOZE_CONTINUATION_PREFIX,
   RATE_LIMIT_PATTERN, RATE_LIMIT_RESET_RE,
+  RATE_LIMIT_WALL_A_CONFIRM, RATE_LIMIT_WALL_B,
+  RATE_LIMIT_WALL_C, RATE_LIMIT_WALL_C_CONFIRM,
+  RATE_LIMIT_WALL_D, RATE_LIMIT_WALL_D_CONFIRM,
   AUTO_CONTINUE_RATE_LIMIT_COOLDOWN,
   AUTO_CONTINUE_MAX_ATTEMPTS, AUTO_CONTINUE_MESSAGE,
-  detectWorkerType, isProtectedWorker,
+  CONTEXT_COMPACTION_PATTERNS,
+  detectWorkerType, isProtectedOrColonel, isProtectedWorker,
   writeStrategosContext,
-  writeGeminiContext,
-  writeAiderContext,
 } from './templates.js';
 
 import {
@@ -45,38 +47,91 @@ import { getLogger } from '../logger.js';
 
 const logger = getLogger();
 
-// Per-worker tmux send-keys serialization lock (Promise chain pattern)
-const TMUX_LOCK_TIMEOUT_MS = 5000;
+// Dependency-injection hook for testability (same pattern as ralph.js)
+export const _outputDbFns = { storeOutput: dbStoreOutput };
 
-async function withTmuxLock(workerId, fn) {
-  const prev = _tmuxSendLock.get(workerId) || Promise.resolve();
-  const next = prev.then(
-    () => runWithTimeout(fn, TMUX_LOCK_TIMEOUT_MS),
-    () => runWithTimeout(fn, TMUX_LOCK_TIMEOUT_MS)
-  );
-  const settled = next.catch(() => {}); // Prevent rejection from blocking chain
-  _tmuxSendLock.set(workerId, settled);
-  // Cleanup to avoid memory leak
-  settled.finally(() => {
-    if (_tmuxSendLock.get(workerId) === settled) {
-      _tmuxSendLock.delete(workerId);
-    }
-  });
-  return next;
-}
-
-function runWithTimeout(fn, ms) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`tmux send lock timed out after ${ms}ms`)), ms);
-    Promise.resolve(fn()).then(
-      (val) => { clearTimeout(timer); resolve(val); },
-      (err) => { clearTimeout(timer); reject(err); }
-    );
-  });
-}
+// DI hook for rate-limit wall Ralph signaling — replaceable in tests to avoid
+// dynamic-import timing issues (mock.module interception of cached ESM modules is unreliable).
+export const _rateLimitWallFns = {
+  signalRalphBlocked: (workerId, data, io) => {
+    import('./ralph.js').then(({ updateWorkerRalphStatus }) => {
+      updateWorkerRalphStatus(workerId, data, io);
+    }).catch(err => logger.error(`[rate-limit] Ralph signal failed for ${workerId}: ${err.message}`));
+  },
+};
 
 // Global PTY capture interval
 let globalCaptureInterval = null;
+
+// ============================================
+// ORPHANED-SESSION SCANNER  (P1-VAN)
+// ============================================
+
+// Throttle: scan once every 12 × 5s = ~60s within the global capture loop
+let _orphanScanCycle = 0;
+const ORPHAN_SCAN_EVERY_N = 12;
+
+/**
+ * Scan live tmux sessions for thea-worker-* names that have no corresponding
+ * entry in the workers Map and no existing checkpoint. For each orphan, capture
+ * the last 100 output lines and write an emergency checkpoint so the Commander
+ * has a forensic trail even if the worker crashed before registration.
+ *
+ * Called from the global PTY capture interval (every ~60s) and may be called
+ * directly on server startup.
+ */
+export async function scanOrphanedSessions(io) {
+  // Lazily import session/path constants to avoid breaking module-mock tests
+  // that stub state.js without these exports.
+  const { SESSION_PREFIX, CHECKPOINT_DIR, existsSync } = await import('./state.js');
+
+  let sessionList;
+  try {
+    sessionList = await spawnTmux(['list-sessions', '-F', '#{session_name}']);
+  } catch {
+    return; // no tmux server running or no sessions at all
+  }
+
+  const sessionNames = sessionList.split('\n').map(s => s.trim()).filter(Boolean);
+
+  for (const sessionName of sessionNames) {
+    if (!sessionName.startsWith(SESSION_PREFIX)) continue;
+    const workerId = sessionName.slice(SESSION_PREFIX.length);
+    if (!workerId) continue;
+
+    // Already registered in the workers Map — not orphaned
+    if (workers.has(workerId)) continue;
+
+    // Already tracked by the PTY capture loop — not orphaned
+    if (ptyInstances.has(workerId)) continue;
+
+    // Checkpoint already written — do not overwrite existing forensic data
+    if (existsSync(path.join(CHECKPOINT_DIR, `${workerId}.json`))) continue;
+
+    // Orphaned session found — try to capture last 100 lines of output
+    let lastOutput = '';
+    try {
+      lastOutput = await spawnTmux(
+        ['capture-pane', '-t', sessionName, '-p', '-S', '-100'],
+        TMUX_CAPTURE_TIMEOUT_MS,
+      );
+    } catch { /* session may already be dead — proceed with empty output */ }
+
+    logger.warn(`[OrphanScan] Orphaned tmux session ${sessionName} — writing emergency checkpoint`);
+
+    const { writeOrphanedGeneralCheckpoint } = await import('./persistence.js');
+    writeOrphanedGeneralCheckpoint(workerId, sessionName, lastOutput);
+
+    if (io) {
+      io.emit('worker:general:dead', {
+        workerId,
+        label: 'ORPHANED',
+        message: 'Orphaned GENERAL tmux session detected — emergency checkpoint written',
+        orphaned: true,
+      });
+    }
+  }
+}
 
 // ============================================
 // BACKEND-AWARE PATTERN HELPERS
@@ -218,7 +273,7 @@ async function trySessionRecovery(workerId, io) {
     ts => now - ts < SESSION_RECOVERY_WINDOW_MS
   );
 
-  const recoveryMax = detectWorkerType(worker.label).isGeneral ? SESSION_RECOVERY_MAX_GENERAL : SESSION_RECOVERY_MAX;
+  const recoveryMax = isProtectedOrColonel(worker) ? SESSION_RECOVERY_MAX_GENERAL : SESSION_RECOVERY_MAX;
   if (worker._sessionRecoveryTimestamps.length >= recoveryMax) {
     worker._sessionRecoverySuppressed = true;
     logger.warn(`[SessionRecovery] Worker ${workerId} (${worker.label}) hit recovery rate limit (${recoveryMax}/${SESSION_RECOVERY_WINDOW_MS / 60000}min) — suppressing further recoveries`);
@@ -232,6 +287,7 @@ async function trySessionRecovery(workerId, io) {
         ralphProgress: worker.ralphProgress,
         ralphCurrentStep: worker.ralphCurrentStep,
         ralphLearnings: worker.ralphLearnings,
+        ralphBlockedReason: worker.ralphBlockedReason,
       };
       import('../services/autoRespawnService.js').then(({ handleGeneralDeath }) => {
         handleGeneralDeath(workerId, 'session_exhausted', io, workerSnapshot).catch(e =>
@@ -327,8 +383,8 @@ async function checkGeneralRoleViolation(workerId, output, io, cleanedOutput = n
   const worker = workers.get(workerId);
   if (!worker) return;
 
-  // Only check GENERAL-labeled workers
-  if (!isProtectedWorker(worker)) return;
+  // Only check GENERAL/COLONEL-labeled workers
+  if (!isProtectedOrColonel(worker)) return;
 
   const cleaned = cleanedOutput ?? stripAnsiCodes(output);
   const tail = cleaned.slice(-2000);
@@ -405,9 +461,14 @@ async function checkGeneralRoleViolation(workerId, output, io, cleanedOutput = n
   }
   worker.delegationMetrics.roleViolations = worker.roleViolations;
 
-  const correctionMessage = `ROLE VIOLATION: You are a GENERAL. You just attempted to ${violation}. Generals do NOT write code, edit files, or run implementation commands. Spawn a worker instead: curl -s -X POST http://localhost:38007/api/workers/spawn-from-template -H "Content-Type: application/json" -d '{"template":"impl","label":"IMPL: <task>","projectPath":"<path>","parentWorkerId":"${workerId}","task":{"description":"<what needs doing>"}}'`;
+  const isColonelWorker = isProtectedOrColonel(worker) && !isProtectedWorker(worker);
+  const roleName = isColonelWorker ? 'COLONEL' : 'GENERAL';
+  const roleConstraint = isColonelWorker
+    ? 'Colonels do NOT run test suites, build commands, or scripts inline. Spawn a TEST or IMPL worker instead'
+    : 'Generals do NOT write code, edit files, or run implementation commands. Spawn a worker instead';
+  const correctionMessage = `ROLE VIOLATION: You are a ${roleName}. You just attempted to ${violation}. ${roleConstraint}: curl -s -X POST ${STRATEGOS_API}/api/workers/spawn-from-template -H "Content-Type: application/json" -d '{"template":"impl","label":"IMPL: <task>","projectPath":"<path>","parentWorkerId":"${workerId}","task":{"description":"<what needs doing>"}}'`;
 
-  logger.info(`[Sentinel] ROLE VIOLATION detected for GENERAL ${workerId} (${worker.label}): ${violation} (count: ${worker.roleViolations})`);
+  logger.info(`[Sentinel] ROLE VIOLATION detected for ${roleName} ${workerId} (${worker.label}): ${violation} (count: ${worker.roleViolations})`);
 
   // Emit socket event
   if (io) {
@@ -424,15 +485,38 @@ async function checkGeneralRoleViolation(workerId, output, io, cleanedOutput = n
   // Interrupt the worker with correction
   try {
     await interruptWorker(workerId, correctionMessage, io);
-    logger.info(`[Sentinel] Interrupted GENERAL ${workerId} with correction message`);
+    logger.info(`[Sentinel] Interrupted ${roleName} ${workerId} with correction message`);
   } catch (err) {
-    logger.error(`[Sentinel] Failed to interrupt GENERAL ${workerId}: ${err.message}`);
+    logger.error(`[Sentinel] Failed to interrupt ${roleName} ${workerId}: ${err.message}`);
   }
 }
 
 // ============================================
 // AUTO-CONTINUE: Rate Limit + Post-Compaction Recovery
 // ============================================
+
+/**
+ * Classify billing-wall patterns in worker stdout tail.
+ * Returns 'A', 'B', 'C', 'D', or null.
+ *
+ * A: per-session hard cap (You've hit your limit + extra-usage upsell).
+ *    Distinct from a normal hourly rate limit — auto-continue is futile.
+ * B: extra-usage balance exhausted.
+ * C: Turn on extra usage interactive billing dialog.
+ * D: Auto-reload billing dialog (recurring charge).
+ *
+ * Why C and D are neutral: these dialogs appear because something already
+ * triggered /extra-usage or auto-reload configuration. Auto-accepting either
+ * dialog would authorize a charge — Commander must approve. See Worker
+ * Protection Protocol. Reference: 2026-04-30 incident, memory #112.
+ */
+export function classifyRateLimitWall(tail) {
+  if (RATE_LIMIT_WALL_B.test(tail)) return 'B';
+  if (RATE_LIMIT_PATTERN.test(tail) && RATE_LIMIT_WALL_A_CONFIRM.test(tail)) return 'A';
+  if (RATE_LIMIT_WALL_C.test(tail) && RATE_LIMIT_WALL_C_CONFIRM.test(tail)) return 'C';
+  if (RATE_LIMIT_WALL_D.test(tail) && RATE_LIMIT_WALL_D_CONFIRM.test(tail)) return 'D';
+  return null;
+}
 
 /**
  * Parse rate limit reset time from Claude Code output.
@@ -522,6 +606,73 @@ function detectSessionLimits(workerId, stdout, io, cleanedOutput = null) {
     // those clear only when auto-continue actually succeeds (in handleAutoContinue).
     worker._rateLimitDetected = false;
     logger.info(`[AutoContinue] Rate limit text scrolled off for ${worker.label} (${workerId}), keeping rate limit state until auto-continue`);
+  }
+
+  // --- Billing-wall detection (Patterns A–D: session/balance caps + billing dialogs) ---
+  // Each pattern fires at most once per worker session (tracked in _rateLimitWallSeen Set).
+  // Patterns A/B: signal Ralph blocked + pause autoAccept, clear session-limit flags so
+  //   auto-continue never fires against a billing wall it cannot resolve.
+  // Patterns C/D: Commander authorization required for billing; emit a notice only.
+  const wallPattern = classifyRateLimitWall(tail);
+  if (wallPattern) {
+    if (!worker._rateLimitWallSeen) worker._rateLimitWallSeen = new Set();
+    if (!worker._rateLimitWallSeen.has(wallPattern)) {
+      worker._rateLimitWallSeen.add(wallPattern);
+      logger.info(`[rate-limit] worker=${workerId} pattern=${wallPattern}`);
+      if (wallPattern === 'A' || wallPattern === 'B') {
+        worker._rateLimitWallDetected = true;
+        // Suppress the normal rate-limit auto-continue path for this worker.
+        worker._sessionLimitDetected = false;
+        worker.rateLimited = false;
+        worker.rateLimitResetAt = null;
+        if (!worker.autoAcceptPaused) {
+          worker.autoAcceptPaused = true;
+          if (io) io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(worker));
+        }
+        const reason = wallPattern === 'A' ? 'rate-limit:session' : 'rate-limit:balance';
+        if (worker.ralphStatus !== 'blocked') {
+          _rateLimitWallFns.signalRalphBlocked(workerId, {
+            status: 'blocked',
+            progress: worker.ralphProgress ?? 50,
+            currentStep: 'rate-limit wall — awaiting Commander',
+            reason,
+          }, io);
+        }
+        if (io) io.emit('worker:rate_limit_wall', { workerId, label: worker.label, pattern: wallPattern, reason });
+      } else {
+        // Patterns C/D: billing dialog — Commander must authorize. Do NOT auto-respond.
+        addActivity('rate_limit_wall', workerId, worker.label, worker.project || 'unknown',
+          `Billing dialog detected (Pattern ${wallPattern}) — Commander authorization required to proceed`);
+        if (io) io.emit('worker:rate_limit_wall', { workerId, label: worker.label, pattern: wallPattern });
+      }
+    }
+  }
+
+  // --- Compaction detection ---
+  // Detect when Claude Code has compacted the conversation context.
+  // Sets _compactionDetected flag for health.js to inject a re-orientation message.
+  const cooldownMs = 5 * 60 * 1000; // 5 minutes
+  const cooldownActive = worker._compactionDetectedAt && (Date.now() - worker._compactionDetectedAt < cooldownMs);
+  if (!worker._compactionDetected && !cooldownActive) {
+    const compactionTail = cleaned.slice(-3000);
+    const isCompacted = CONTEXT_COMPACTION_PATTERNS.some(p => p.test(compactionTail));
+    if (isCompacted) {
+      worker._compactionDetected = true;
+      worker._compactionDetectedAt = Date.now();
+      worker.contextTokens = 0;
+      logger.info(`[Compaction] Context compaction detected for ${worker.label} (${workerId})`);
+      if (io) {
+        io.emit('worker:compacted', { workerId, label: worker.label });
+      }
+    }
+  }
+
+  // --- Context token detection ---
+  // Claude Code shows "/clear to save N.Nk tokens" in idle status bar
+  const tokenMatch = tail.match(/\/clear to save ([\d.]+)k?\s*tokens/i);
+  if (tokenMatch) {
+    worker.contextTokens = parseFloat(tokenMatch[1]);
+    worker.contextTokensUpdatedAt = Date.now();
   }
 
 }
@@ -642,6 +793,14 @@ function startGlobalPtyCapture(io) {
 
     const slots = Array.from({ length: Math.min(CAPTURE_CONCURRENCY, entries.length) }, runNext);
     await Promise.all(slots);
+
+    // Periodic orphan scan — runs every ~60s (every ORPHAN_SCAN_EVERY_N ticks)
+    _orphanScanCycle++;
+    if (_orphanScanCycle >= ORPHAN_SCAN_EVERY_N) {
+      _orphanScanCycle = 0;
+      scanOrphanedSessions(io).catch(err =>
+        logger.error(`[OrphanScan] Scan failed: ${err.message}`));
+    }
   }, 5000);
 
   if (globalCaptureInterval.unref) {
@@ -716,7 +875,7 @@ async function captureWorkerOutput(workerId, instance, io) {
       }
 
       // Forced autonomy: detect idle workers and push them to research/act instead of waiting
-      if (shouldContinueForcedAutonomy(workerId)) {
+      if (_shouldContinueForcedAutonomy(workerId)) {
         worker._forcedAutonomyIdleCount = (worker._forcedAutonomyIdleCount || 0) + 1;
         worker._forcedAutonomyNudgeCount = worker._forcedAutonomyNudgeCount || 0;
 
@@ -739,12 +898,14 @@ async function captureWorkerOutput(workerId, instance, io) {
           if (isAtIdlePrompt && !isActivelyWorking) {
             const msg = generateAutonomyNudge(worker);
             logger.info(`[ForcedAutonomy] Nudge #${worker._forcedAutonomyNudgeCount} for ${worker.label} (${workerId}), next in ${Math.min(currentThreshold * 2, FORCED_AUTONOMY_MAX_THRESHOLD) * 5}s`);
-            // Revert from done if nudging an awaiting_review worker back to activity
-            if (worker.status === 'awaiting_review') {
+            // Revert from done if nudging an awaiting_review worker back to activity.
+            // Skip if MISSION_COMPLETE — done/held GENERALs should not be reverted.
+            if (worker.status === 'awaiting_review' && classifyGeneralIdleState(worker) !== 'MISSION_COMPLETE') {
               import('./ralph.js').then(({ revertFromDone }) => revertFromDone(workerId, io, 'forced_autonomy_nudge')).catch(() => {});
             }
             withTmuxLock(workerId, async () => {
-              await safeSendKeys(worker.tmuxSession, [msg, 'Enter']);
+              await safeSendKeys(worker.tmuxSession, ['-l', msg]);
+              await safeSendKeys(worker.tmuxSession, ['Enter']);
             }).catch(err => logger.error(`[ForcedAutonomy] Idle push failed for ${worker.label}: ${err.message}`));
             worker._forcedAutonomyIdleCount = 0;
             worker._forcedAutonomyNudgeCount++;
@@ -753,10 +914,10 @@ async function captureWorkerOutput(workerId, instance, io) {
         }
       }
 
-      // Auto-continue for rate-limited workers (skip if bulldoze handles it)
+      // Auto-continue for rate-limited workers (skip if bulldoze handles it or billing wall detected)
       if (worker && worker.autoContinue !== false && !worker.bulldozeMode &&
           worker.status === 'running' && worker._sessionLimitDetected &&
-          worker.ralphStatus !== 'done') {
+          worker.ralphStatus !== 'done' && !worker._rateLimitWallDetected) {
 
         if (worker.rateLimitResetAt && Date.now() >= worker.rateLimitResetAt) {
           // Time-driven: reset time reached — fire immediately, no idle pattern check needed.
@@ -803,11 +964,8 @@ async function captureWorkerOutput(workerId, instance, io) {
     }
     if (worker && worker.forcedAutonomy) {
       worker._forcedAutonomyIdleCount = 0;  // Any output change means not idle
-      // Only reset nudge backoff on substantive output (>50 new chars), not cursor blinks/spinners
-      const prevLength = instance.lastCaptureHash ? parseInt(instance.lastCaptureHash.split(':')[0]) || 0 : 0;
-      if ((stdout.length - prevLength) > 50) {
-        worker._forcedAutonomyNudgeCount = 0;
-      }
+      // _forcedAutonomyNudgeCount resets only on Ralph signal receipt (ralph.js),
+      // not on output length — resetting here nullifies the exponential backoff.
     }
 
     // Track consecutive done responses for loop detection
@@ -878,8 +1036,8 @@ async function captureWorkerOutput(workerId, instance, io) {
 
     const w = workers.get(workerId);
 
-    if (w && isProtectedWorker(w)) {
-      logger.error(`[PtyCapture] CRITICAL: GENERAL worker ${workerId} (${w.label}) tmux session is DEAD. NOT auto-deleting — requires human intervention.`);
+    if (w && isProtectedOrColonel(w)) {
+      logger.error(`[PtyCapture] CRITICAL: GENERAL/COLONEL worker ${workerId} (${w.label}) tmux session is DEAD. NOT auto-deleting — requires human intervention.`);
       w.health = 'dead';
       w.status = 'error';
       ptyInstances.delete(workerId);
@@ -890,8 +1048,23 @@ async function captureWorkerOutput(workerId, instance, io) {
       try { markWorkerFailed(workerId); } catch (e) { /* may not be registered */ }
       if (io) {
         io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(w));
-        io.emit('worker:general:dead', { workerId, label: w.label, message: 'GENERAL tmux session died - requires human intervention' });
+        if (isProtectedWorker(w)) {
+          io.emit('worker:general:dead', { workerId, label: w.label, message: 'GENERAL tmux session died - requires human intervention' });
+        } else {
+          io.emit('worker:colonel:dead', { workerId, label: w.label, message: 'COLONEL tmux session died - requires human intervention' });
+        }
       }
+      const { writeWorkerCheckpoint } = await import('./persistence.js');
+      writeWorkerCheckpoint(workerId, 'session_died');
+      if (w.workingDir) {
+        const { removeStrategosContext } = await import('./templates.js');
+        removeStrategosContext(w.workingDir, workerId).catch(err =>
+          logger.error(`[PtyCapture] Failed to remove context for ${workerId}: ${err.message}`));
+      }
+      try {
+        const { persistFailureLearning } = await import('./ralph.js');
+        persistFailureLearning(w, workerId, 'session_died');
+      } catch { /* best effort */ }
       return;
     }
 
@@ -997,6 +1170,18 @@ export function stopPtyCapture(workerId) {
   ptyInstances.delete(workerId);
 }
 
+/**
+ * Force the current in-memory terminal snapshot into the output DB.
+ * Bypasses the 1-in-10 write throttle. Called before killWorker so
+ * persistFailureLearning sees the last-known terminal state.
+ */
+export function flushCurrentOutputToDb(workerId) {
+  const content = outputBuffers.get(workerId);
+  if (content) {
+    try { _outputDbFns.storeOutput(workerId, content, 'stdout'); } catch { /* best effort */ }
+  }
+}
+
 export function stopAllPtyCaptures() {
   const count = ptyInstances.size;
   ptyInstances.clear();
@@ -1074,7 +1259,8 @@ async function handleAutoAcceptCheck(workerId, output, io, cleanedOutput = null)
             worker._lastAutoCommandHash = cmdHash;
             logger.info(`[AutoCommand] Sending "${command}" to ${worker.label} (${description})`);
             try {
-              await safeSendKeys(worker.tmuxSession, [command, 'Escape']);
+              await safeSendKeys(worker.tmuxSession, ['-l', command]);
+              await safeSendKeys(worker.tmuxSession, ['Escape']);
               await new Promise(r => setTimeout(r, 300));
               await safeSendKeys(worker.tmuxSession, ['Enter']);
             } catch (err) {
@@ -1105,7 +1291,8 @@ async function handleAutoAcceptCheck(workerId, output, io, cleanedOutput = null)
     const msg = 'Do NOT ask the user. You have forcedAutonomy enabled. Answer this question yourself using available tools: WebSearch, WebFetch, Grep, Read, Glob. If you cannot find the answer, make your best judgment call and document the assumption. Proceed without human input.';
     try {
       await withTmuxLock(workerId, async () => {
-        await safeSendKeys(worker.tmuxSession, [msg, 'Enter']);
+        await safeSendKeys(worker.tmuxSession, ['-l', msg]);
+        await safeSendKeys(worker.tmuxSession, ['Enter']);
       });
     } catch (err) {
       logger.error(`[ForcedAutonomy] Failed for ${worker.label}: ${err.message}`);
@@ -1168,10 +1355,60 @@ async function handleAutoAcceptCheck(workerId, output, io, cleanedOutput = null)
 // ============================================
 
 /**
+ * Parse the END STATE section from a task description.
+ * Returns the section content string if found, null otherwise.
+ * Stops at the next blank line or uppercase section header (e.g. GUARDRAILS:).
+ */
+function parseEndStateSection(description) {
+  if (!description) return null;
+  const idx = description.indexOf('END STATE:');
+  if (idx === -1) return null;
+  const after = description.slice(idx + 'END STATE:'.length);
+  const lines = after.split('\n');
+  const contentLines = [];
+  for (const line of lines) {
+    if (contentLines.length === 0 && !line.trim()) continue;
+    if (contentLines.length > 0 && !line.trim()) break;
+    if (/^[A-Z][A-Z ]{2,}:/.test(line.trim())) break;
+    contentLines.push(line);
+  }
+  return contentLines.join('\n').trim() || null;
+}
+
+/**
+ * Classify the idle state of a persistent-tier worker (GENERAL/COLONEL) to
+ * determine what kind of nudge (if any) is appropriate.
+ */
+function classifyGeneralIdleState(worker) {
+  const hasLearnings = !!(worker.ralphLearnings && worker.ralphLearnings.trim());
+  const directChildren = [...workers.values()].filter(
+    w => w.parentWorkerId === worker.id && w.health !== 'dead' && w.health !== 'crashed'
+  );
+  const activeChildren = directChildren.filter(
+    w => ['running', 'awaiting_review', 'pending'].includes(w.status)
+  ).length;
+  const uptimeMs = Date.now() - new Date(worker.createdAt).getTime();
+  const hasStarted = (worker._forcedAutonomyNudgeCount || 0) > 0 ||
+                     (worker.ralphStatus && worker.ralphStatus !== 'pending');
+
+  if (worker._missionComplete) return 'MISSION_COMPLETE';
+  if (worker.ralphStatus === 'done' || worker.ralphStatus === 'held') return 'MISSION_COMPLETE';
+  if (hasLearnings && activeChildren === 0) return 'MISSION_COMPLETE';
+  if (parseEndStateSection(worker.task?.description) !== null &&
+      directChildren.length > 0 &&
+      directChildren.every(c => c.ralphStatus === 'done' || c.ralphStatus === 'held')) {
+    return 'MISSION_COMPLETE';
+  }
+  if (activeChildren > 0) return 'AWAITING_CHILDREN';
+  if (!hasStarted && uptimeMs < 5 * 60 * 1000) return 'UNSTARTED';
+  return 'GENUINELY_STUCK';
+}
+
+/**
  * Guard function: should forced autonomy nudge this worker?
  * Mirrors shouldContinueBulldoze() but for the lighter forced autonomy mode.
  */
-function shouldContinueForcedAutonomy(workerId) {
+export function _shouldContinueForcedAutonomy(workerId) {
   const worker = workers.get(workerId);
   if (!worker || !worker.forcedAutonomy) return false;
   // Allow running and awaiting_review (done workers with explicit forcedAutonomy get nudged)
@@ -1180,7 +1417,7 @@ function shouldContinueForcedAutonomy(workerId) {
   // Don't nudge blocked/suppressed workers
   // Note: done/awaiting_review workers ARE nudged if forcedAutonomy was explicitly enabled
   // (Commander override). Auto-suppress flag handles the "finished naturally" case.
-  if (worker.ralphStatus === 'blocked') return false;
+  if (worker.ralphStatus === 'blocked' || worker.ralphStatus === 'held') return false;
   if (worker._forcedAutonomySuppressed) return false;
 
   // Don't nudge session-ended workers (unless recovery is in progress)
@@ -1212,12 +1449,39 @@ function shouldContinueForcedAutonomy(workerId) {
     return false;
   }
 
+  // Don't nudge within 3 min of Commander sending input (prevents spam during active chat)
+  if (Date.now() - (worker._lastHumanInputAt || 0) < 180000) return false;
+
   // Don't nudge if command queue has items
   const queue = commandQueues.get(workerId) || [];
   if (queue.length > 0) return false;
 
   // Don't nudge if actively sending input
   if (_sendingInput.has(workerId)) return false;
+
+  // For persistent-tier workers (GENERALs/COLONELs), classify idle state and suppress if mission-complete
+  if (isProtectedOrColonel(worker)) {
+    const state = classifyGeneralIdleState(worker);
+    if (state === 'MISSION_COMPLETE') {
+      if (worker._missionCompleteNotified) {
+        // Already sent the one-time reminder — suppress permanently
+        if (!worker._forcedAutonomySuppressed) {
+          logger.info(`[ForcedAutonomy] GENERAL mission-complete suppressed after notification`, { label: worker.label, workerId });
+          worker._forcedAutonomySuppressed = true;
+        }
+        return false;
+      }
+      // First time we see MISSION_COMPLETE: allow nudge to fire the targeted reminder
+      worker._pendingMissionCompleteReminder = true;
+      return true;
+    }
+    // AWAITING_CHILDREN: reset idle count, do not nudge
+    if (state === 'AWAITING_CHILDREN') {
+      worker._forcedAutonomyIdleCount = 0;
+      return false;
+    }
+    // UNSTARTED / GENUINELY_STUCK: fall through to standard nudge
+  }
 
   // Don't nudge if active children are running
   const childIds = worker.childWorkerIds || [];
@@ -1239,6 +1503,12 @@ function shouldContinueForcedAutonomy(workerId) {
  * Earlier nudges are gentle; later ones are direct and shorter to save context.
  */
 function generateAutonomyNudge(worker) {
+  if (worker._pendingMissionCompleteReminder) {
+    worker._missionCompleteNotified = true;
+    worker._pendingMissionCompleteReminder = false;
+    return 'Your mission appears complete (learnings filed, no active children). If correct, signal held with reason "mission complete, awaiting dismissal" — the system will then stop nudging you.';
+  }
+
   const nudgeCount = worker._forcedAutonomyNudgeCount || 0;
   const workerType = detectWorkerType(worker.label);
 
@@ -1256,7 +1526,7 @@ function generateAutonomyNudge(worker) {
       return 'You have no active workers. Spawn new ones NOW. Research improvements, run tests, optimize code, fix bugs. A GENERAL must always have workers running. Check git log for recent changes that need testing, check /api/insights/learnings for failure patterns, search the codebase for TODOs and bugs.';
     }
     if (nudgeCount === 1) {
-      return 'You are STILL idle with zero active children. This is a FAILURE STATE. Immediately: 1) Check git log --oneline -20 for recent work to validate. 2) Check /api/insights/success-rate for underperforming areas. 3) Spawn at least 2 workers RIGHT NOW. Do NOT signal done — your mission is continuous.';
+      return 'You appear idle with no active children. If your task is complete or awaiting Commander direction, signal held. If you genuinely have outstanding work, identify and spawn it now. Do NOT invent low-value filler work to stay busy.';
     }
     if (nudgeCount === 2) {
       return 'CRITICAL: A GENERAL with no children is failing its mission. Spawn workers IMMEDIATELY. If you have run out of ideas, use WebSearch to research improvements for this project. Check the codebase for any bugs, missing tests, performance issues, or code quality problems. You must NEVER be idle.';
@@ -1319,7 +1589,7 @@ function shouldContinueBulldoze(workerId) {
     return false;
   }
 
-  if (worker.bulldozeStartedAt && !isProtectedWorker(worker)) {
+  if (worker.bulldozeStartedAt && !isProtectedOrColonel(worker)) {
     const hoursElapsed = (Date.now() - new Date(worker.bulldozeStartedAt).getTime()) / 3600000;
     if (hoursElapsed >= BULLDOZE_MAX_HOURS) {
       logger.info(`[Bulldoze] Worker ${workerId} hit time limit (${BULLDOZE_MAX_HOURS}h), pausing`);
@@ -1327,6 +1597,22 @@ function shouldContinueBulldoze(workerId) {
       worker.bulldozePauseReason = 'time_limit';
       return false;
     }
+  }
+
+  // Held-state backoff: after 2+ bulldoze cycles while held, require a 4-hour minimum
+  // interval before firing another continuation. The worker is intentionally waiting for
+  // Commander direction — repeated nudges are noise, not value.
+  if (worker.ralphStatus === 'held') {
+    if ((worker._heldBulldozeCycles || 0) >= 2) {
+      const HELD_BACKOFF_MS = 4 * 60 * 60 * 1000;
+      const lastCycleAt = worker.bulldozeLastCycleAt
+        ? new Date(worker.bulldozeLastCycleAt).getTime()
+        : 0;
+      if (Date.now() - lastCycleAt < HELD_BACKOFF_MS) return false;
+    }
+  } else {
+    // Worker transitioned out of held — reset the held-cycle counter
+    worker._heldBulldozeCycles = 0;
   }
 
   if ((worker.bulldozeConsecutiveErrors || 0) >= 3) {
@@ -1367,13 +1653,13 @@ function generateBulldozeContinuation(worker) {
 
   if (isAuditCycle) {
     if (workerType.isGeneral) {
-      return `${BULLDOZE_CONTINUATION_PREFIX} cycle ${cycleNum} - AUDIT]\nCommander, conduct a strategic review. State file: ${stateFilePath}\n\nASSESS: git log --oneline -20, check children status via /children endpoint, review error logs. What improved since last cycle? What degraded? What's the highest-impact work remaining?\n\nACT: Update the state file with fresh findings. Spawn workers for the top discoveries. If you have zero active children, IMMEDIATELY spawn workers for new improvement tracks.\n\nIMPORTANT: Do NOT write EXHAUSTED. Do NOT signal done. Your mission is CONTINUOUS. Check /api/insights/learnings for past failure patterns to fix. Check /api/insights/success-rate for worker types that need improvement. If your backlog is empty, research new improvements via WebSearch, audit the codebase, or review git log for untested changes.${autonomyReminder}`;
+      return `${BULLDOZE_CONTINUATION_PREFIX} cycle ${cycleNum} - AUDIT]\nCommander, conduct a strategic review. State file: ${stateFilePath}\n\nASSESS: git log --oneline -20, check children status via /children endpoint, review error logs. What improved since last cycle? What degraded? What's the highest-impact work remaining?\n\nACT: Update the state file with fresh findings. Spawn workers for the top discoveries. If you have zero active children, IMMEDIATELY spawn workers for new improvement tracks.\n\nIf your audit reveals genuine completion or no high-priority work remains, signal held with a clear stopping point. Do NOT invent low-value filler work to stay busy. The mission resumes when there is real work to do.${autonomyReminder}`;
     }
     return `${BULLDOZE_CONTINUATION_PREFIX} cycle ${cycleNum} - AUDIT]\nConduct a fresh audit of your domain. State file: ${stateFilePath}\n\nASSESS: git log --oneline -20, run test suites, review error logs, compare to best practices. Add NEW findings to your backlog.\n\nACT: Pick the highest-impact finding and implement it. Commit. Update state file.${autonomyReminder}`;
   }
 
   if (workerType.isGeneral) {
-    return `${BULLDOZE_CONTINUATION_PREFIX} cycle ${cycleNum}]\nCommander, next mission cycle. State file: ${stateFilePath}\n\nSITREP: Read state file. Check git log --oneline -10. Check children status via /children endpoint.\n\nEXECUTE: Identify the highest-priority incomplete item. Spawn a worker for it — do NOT implement it yourself. Monitor and drive to completion. Update the state file.\n\nIf you have zero active children, IMMEDIATELY spawn workers for new improvement tracks. Check git log for recent changes that need testing, check the codebase for bugs, research optimizations. A GENERAL with no children is FAILING.\n\nDo NOT write EXHAUSTED. Do NOT signal done. If all current items need human action, write "## Status: NEEDS_HUMAN" for those items but FIND NEW WORK for everything else.${autonomyReminder}`;
+    return `${BULLDOZE_CONTINUATION_PREFIX} cycle ${cycleNum}]\nCommander, next mission cycle. State file: ${stateFilePath}\n\nSITREP: Read state file. Check git log --oneline -10. Check children status via /children endpoint.\n\nEXECUTE: Identify the highest-priority incomplete item. Spawn a worker for it — do NOT implement it yourself. Monitor and drive to completion. Update the state file.\n\nIf you have zero active children, IMMEDIATELY spawn workers for new improvement tracks. Check git log for recent changes that need testing, check the codebase for bugs, research optimizations. A GENERAL with no children is FAILING.\n\nIf all current items need human action, write "## Status: NEEDS_HUMAN" for those items and signal held — do NOT invent filler work for the rest. A GENERAL waiting on Commander direction is operating correctly.${autonomyReminder}`;
   }
 
   return `${BULLDOZE_CONTINUATION_PREFIX} cycle ${cycleNum}]\nNext mission cycle. State file: ${stateFilePath}\n\nSITREP: Read state file. Check git log --oneline -10 to avoid redoing committed work.\n\nEXECUTE: Pick the highest-priority incomplete item. Implement it thoroughly. Test. Commit with descriptive message. Update state file — mark complete, add any new discoveries. Signal Ralph.\n\nIf all remaining items are low-impact or need human action, write "## Status: EXHAUSTED" in the state file.${autonomyReminder}`;
@@ -1402,7 +1688,7 @@ export async function createBulldozeStateFile(worker, settings = {}) {
     : '- [ ] Audit codebase for improvements\n- [ ] Run tests and fix failures\n- [ ] Review error handling';
 
   const defaultStandingOrders = workerType.isGeneral
-    ? '- NEVER write "## Status: EXHAUSTED" — your mission is continuous\n- NEVER signal done via Ralph — you operate indefinitely\n- Always maintain 3-5 active child workers\n- If backlog is empty, FIND MORE WORK: check git log, search for TODOs, research optimizations, review code quality\n- Check /api/insights/learnings for past failure patterns to fix\n- Check /api/insights/success-rate for underperforming worker types\n- Git commit after every meaningful change\n- A GENERAL with zero active children is in a FAILURE STATE'
+    ? '- NEVER write "## Status: EXHAUSTED" — use held-state when backlog is exhausted\n- When backlog is empty, signal held with reason — do not invent filler work\n- Check /api/insights/learnings for past failure patterns to fix\n- Check /api/insights/success-rate for underperforming worker types\n- Git commit after every meaningful change\n- COLONELs may signal done when their cycle completes — that is correct behavior, not a failure'
     : '- Git commit after every meaningful change\n- Run tests before and after changes\n- Never break existing functionality';
 
   const standingOrdersSection = standingOrders
@@ -1536,8 +1822,8 @@ async function handleBulldozeContinuation(workerId, io) {
 
     if (newCommits === 0) {
       worker._bulldozeNoCommitCycles = (worker._bulldozeNoCommitCycles || 0) + 1;
-      // GENERALs delegate — they don't commit code, their children do. Skip no_commits pause.
-      if (!isProtectedWorker(worker) && worker._bulldozeNoCommitCycles >= 5) {
+      // GENERALs/COLONELs delegate — they don't commit code, their children do. Skip no_commits pause.
+      if (!isProtectedOrColonel(worker) && worker._bulldozeNoCommitCycles >= 5) {
         logger.warn(`[Bulldoze] Worker ${workerId} stalled — ${worker._bulldozeNoCommitCycles} cycles without commits, auto-pausing`);
         worker.bulldozePaused = true;
         worker.bulldozePauseReason = 'no_commits';
@@ -1550,7 +1836,7 @@ async function handleBulldozeContinuation(workerId, io) {
           });
         }
         return;
-      } else if (!isProtectedWorker(worker) && worker._bulldozeNoCommitCycles >= 3) {
+      } else if (!isProtectedOrColonel(worker) && worker._bulldozeNoCommitCycles >= 3) {
         logger.warn(`[Bulldoze] Worker ${workerId} has gone ${worker._bulldozeNoCommitCycles} cycles without commits — possible stall`);
       }
     } else {
@@ -1570,6 +1856,9 @@ async function handleBulldozeContinuation(workerId, io) {
     worker.lastActivity = new Date();
     worker.bulldozeIdleCount = 0;
     worker.bulldozeConsecutiveErrors = 0;
+    if (worker.ralphStatus === 'held') {
+      worker._heldBulldozeCycles = (worker._heldBulldozeCycles || 0) + 1;
+    }
 
     const isAudit = worker.bulldozeCyclesCompleted % BULLDOZE_AUDIT_EVERY_N_CYCLES === 0;
     logger.info(`[Bulldoze] Sent cycle ${worker.bulldozeCyclesCompleted} to ${worker.label} (${workerId})${isAudit ? ' [AUDIT]' : ''}`);
@@ -1682,29 +1971,12 @@ export function updateWorkerSettings(workerId, settings, io = null) {
     } else {
       logger.info(`[Bulldoze] ${worker.label} bulldoze mode DISABLED (${worker.bulldozeCyclesCompleted || 0} cycles completed)`);
       // Rewrite rules file without <bulldoze> section
-      let rewriteContext;
-      if (worker.backend === 'gemini') {
-        rewriteContext = writeGeminiContext(worker.id, worker.label, worker.workingDir, worker.ralphToken, {
-            parentWorkerId: worker.parentWorkerId,
-            parentLabel: worker.parentLabel,
-            bulldozeMode: false,
-            forcedAutonomy: worker.forcedAutonomy,
-          });
-      } else if (worker.backend === 'aider') {
-        rewriteContext = writeAiderContext(worker.id, worker.label, worker.workingDir, worker.ralphToken, {
-            parentWorkerId: worker.parentWorkerId,
-            parentLabel: worker.parentLabel,
-            bulldozeMode: false,
-            forcedAutonomy: worker.forcedAutonomy,
-          });
-      } else {
-        rewriteContext = writeStrategosContext(worker.id, worker.label, worker.workingDir, worker.ralphToken, {
-            parentWorkerId: worker.parentWorkerId,
-            parentLabel: worker.parentLabel,
-            bulldozeMode: false,
-            forcedAutonomy: worker.forcedAutonomy,
-          });
-      }
+      const rewriteContext = writeStrategosContext(worker.id, worker.label, worker.workingDir, worker.ralphToken, {
+        parentWorkerId: worker.parentWorkerId,
+        parentLabel: worker.parentLabel,
+        bulldozeMode: false,
+        forcedAutonomy: worker.forcedAutonomy,
+      });
       rewriteContext.catch(err => logger.error(`[Bulldoze] Failed to rewrite rules for ${workerId}: ${err.message}`));
     }
   }
@@ -1776,15 +2048,24 @@ export async function sendInput(workerId, input, io = null, { fromWorkerId, sour
   const effectiveSource = source || (fromWorkerId ? `worker:${fromWorkerId}` : 'unknown');
   if (worker.status === 'awaiting_review' && !systemSources.has(effectiveSource)) {
     import('./ralph.js').then(({ revertFromDone }) => revertFromDone(workerId, io, `sendInput:${effectiveSource}`)).catch(() => {});
+  // Commander-only: only Commander UI or REST API input should un-hold a held worker; worker-to-worker input leaves held state intact.
+  } else if (worker.ralphStatus === 'held' && (effectiveSource === 'web_ui' || effectiveSource === 'rest_api')) {
+    import('./ralph.js').then(({ revertFromHeld }) => revertFromHeld(workerId, io, `sendInput:${effectiveSource}`)).catch(() => {});
   } else {
     // Cancel auto-dismiss timer for any input (lazy import to avoid circular dep)
     import('./ralph.js').then(({ cancelAutoDismissTimer }) => cancelAutoDismissTimer(workerId)).catch(() => {});
+  }
+
+  // Track last human input time to suppress nudges during active chat
+  if (effectiveSource === 'web_ui' || effectiveSource === 'rest_api') {
+    worker._lastHumanInputAt = Date.now();
   }
 
   // --- Input Audit Log ---
   const truncated = typeof input === 'string' ? input.slice(0, 200) : '(non-string)';
   const src = source || (fromWorkerId ? `worker:${fromWorkerId}` : 'unknown');
   logger.info(`[InputAudit] to=${workerId} (${worker.label}) from=${src} len=${typeof input === 'string' ? input.length : 0} text="${truncated.replace(/[\n\r]/g, ' ')}"`);
+  logger.info(`[input] accepted for worker ${workerId} from ${fromWorkerId || 'human'} source=${effectiveSource}`);
 
   const queue = commandQueues.get(workerId) || [];
 
@@ -1851,6 +2132,8 @@ export async function sendRawInput(workerId, keys) {
     throw new Error(`Worker ${workerId} not found`);
   }
 
+  logger.info(`[InputAudit] to=${workerId} (${worker.label}) from=socket:raw len=${typeof keys === 'string' ? keys.length : 0} raw=true`);
+
   return withTmuxLock(workerId, async () => {
     try {
       await safeSendKeys(worker.tmuxSession, ['-l', keys]);
@@ -1866,6 +2149,13 @@ export async function interruptWorker(workerId, followUp = null, io = null) {
 
   if (!worker) {
     throw new Error(`Worker ${workerId} not found`);
+  }
+
+  if (worker.status === 'awaiting_review') {
+    if (!worker._pendingInterrupts) worker._pendingInterrupts = [];
+    worker._pendingInterrupts.push({ followUp, io });
+    logger.info(`[InterruptWorker] Worker ${workerId} in awaiting_review — queued interrupt (queue size: ${worker._pendingInterrupts.length})`);
+    return false;
   }
 
   if (worker.status !== 'running') {
@@ -1958,3 +2248,18 @@ export async function processQueue(workerId, io = null) {
     _processingQueues.delete(workerId);
   }
 }
+
+// Test handle — lets test files call detectSessionLimits directly without making it
+// part of the module's public API.
+export const _detectSessionLimitsForTest = detectSessionLimits;
+
+// Test handle for bulldoze copy assertions.
+export const _generateBulldozeContinuationForTest = generateBulldozeContinuation;
+
+// Test handle for held-anchor cadence backoff assertions.
+export const _shouldContinueBulldozeForTest = shouldContinueBulldoze;
+
+// Test handles for FA classifier + nudge copy assertions.
+export const _classifyGeneralIdleStateForTest = classifyGeneralIdleState;
+export const _generateAutonomyNudgeForTest = generateAutonomyNudge;
+export const _parseEndStateSectionForTest = parseEndStateSection;

@@ -15,9 +15,10 @@ import {
   getWorkerDeathCallback,
 } from './state.js';
 
-import { isProtectedWorker } from './templates.js';
+import { isProtectedWorker, isProtectedOrColonel as _isProtectedOrColonelFromTemplates, generateAnchorPrompt } from './templates.js';
 import { stopPtyCapture, sendInputDirect } from './output.js';
-import { tryAutoPromoteWorker } from './ralph.js';
+import { generateConsolidationMessage } from '../services/consolidationService.js';
+import { tryAutoPromoteWorker, persistFailureLearning } from './ralph.js';
 import {
   getSystemResources, checkWorkerAges,
   CRITICAL_AVAILABLE_MB, SWAP_CRITICAL_PERCENT,
@@ -38,9 +39,15 @@ import {
 
 const logger = getLogger();
 
-// Colonel max lifetime — colonels that run longer than this without completing
-// get a blocked signal with a scope-too-large warning. Only applies to colonels.
-const COLONEL_MAX_LIFETIME_MS = 75 * 60 * 1000; // 75 minutes (extended from 55 for multi-wave pipelines)
+// Re-exported from templates.js so callers that import from health.js keep working.
+export const isProtectedOrColonel = _isProtectedOrColonelFromTemplates;
+
+// GENERAL/COLONEL lifetime enforcement thresholds.
+// Policy: held/blocked workers are never interrupted — they are intentionally waiting.
+// Enforcement only fires against workers that have gone dark (no Ralph signals).
+const GENERAL_COLONEL_STUCK_WARN_MS  = 4  * 60 * 60 * 1000; // 4h without Ralph signal → warn
+const GENERAL_COLONEL_IDLE_NOTIFY_MS = 24 * 60 * 60 * 1000; // 24h without Ralph signal → blocked notification
+const GENERAL_COLONEL_HARD_CAP_MS    = 48 * 60 * 60 * 1000; // 48h total runtime → hard enforcement
 
 // Completion guard defaults — workers running this long without signaling done get a nudge,
 // then a kill. Type-specific overrides are applied via getCompletionGuard() below.
@@ -52,25 +59,44 @@ const COMPLETION_KILL_MS  = 8 * 60 * 60 * 1000;  // 8 hours (GENERAL default)
  * RESEARCH workers get extra breathing room for silent read-heavy work.
  * All others use the historical 5/10/15 minute defaults.
  */
-function getStallProfile(workerLabel) {
+export function getStallProfile(workerLabel, contextTokens) {
   const { prefix } = detectWorkerTypeForMetrics(workerLabel || '');
+  let profile;
   if (prefix === 'RESEARCH') {
-    return { nudgeMs: 8 * 60 * 1000, warnMs: 15 * 60 * 1000, killMs: 20 * 60 * 1000 };
+    profile = { nudgeMs: 8 * 60 * 1000, warnMs: 15 * 60 * 1000, killMs: 20 * 60 * 1000 };
+  } else if (prefix === 'COLONEL') {
+    // COLONELs have a natural 15-30 min monitoring cycle — IMPL defaults (5/10/15 min) cause false stall kills
+    profile = { nudgeMs: 20 * 60 * 1000, warnMs: 40 * 60 * 1000, killMs: 60 * 60 * 1000 };
+  } else {
+    // Default: IMPL, FIX, TEST, REVIEW, unknown
+    profile = { nudgeMs: 5 * 60 * 1000, warnMs: 10 * 60 * 1000, killMs: 15 * 60 * 1000 };
   }
-  // Default: IMPL, FIX, TEST, REVIEW, COLONEL, unknown
-  return { nudgeMs: 5 * 60 * 1000, warnMs: 10 * 60 * 1000, killMs: 15 * 60 * 1000 };
+  // Scale thresholds for workers near context compaction. contextTokens is in thousands (k);
+  // total context window is ~200k. Workers at 70–95% fill are legitimately slow; >95% are
+  // actively compacting — apply patience multipliers to prevent false-positive stall kills.
+  const contextPct = (contextTokens != null && contextTokens > 0)
+    ? Math.min(100, (contextTokens / 200) * 100)
+    : 0;
+  let multiplier = 1;
+  if (contextPct >= 95) {
+    multiplier = 2;   // >95%: actively compacting — maximum patience
+  } else if (contextPct >= 70) {
+    multiplier = 1.5; // 70–95%: near compaction — legitimately slow
+  }
+  if (multiplier === 1) return profile;
+  return {
+    nudgeMs: profile.nudgeMs * multiplier,
+    warnMs:  profile.warnMs  * multiplier,
+    killMs:  profile.killMs  * multiplier,
+  };
 }
 
 /**
  * Returns type-specific completion guard thresholds (in ms).
- * IMPL/FIX get tighter limits — a 2-hour IMPL worker is almost certainly stuck.
- * GENERALs keep the generous 4h/8h defaults for long-running operations.
+ * All worker types use the safe 4h/8h defaults. The recent-Ralph-signal check
+ * (applied at call site) provides the primary protection against killing active workers.
  */
-function getCompletionGuard(workerLabel) {
-  const { prefix } = detectWorkerTypeForMetrics(workerLabel || '');
-  if (prefix === 'IMPL' || prefix === 'FIX') {
-    return { nudgeMs: 45 * 60 * 1000, killMs: 90 * 60 * 1000 };
-  }
+function getCompletionGuard(_workerLabel) {
   return { nudgeMs: COMPLETION_NUDGE_MS, killMs: COMPLETION_KILL_MS };
 }
 
@@ -150,7 +176,25 @@ function startGlobalHealthMonitor(io) {
   }
 }
 
-async function checkWorkerHealth(workerId, io) {
+/** Returns true if the parent is present in the workers map and not dead. Exported for testing. */
+export function _stallNotifyGuard(worker, workersMap) {
+  return !!(
+    worker.parentWorkerId &&
+    workersMap.has(worker.parentWorkerId) &&
+    workersMap.get(worker.parentWorkerId).health !== 'dead'
+  );
+}
+
+function hasSpawnedSuccessor(worker) {
+  return !!(worker._successorId);
+}
+
+/** Returns true if the worker is held for Commander direction and must be skipped by CompletionGuard. Exported for testing. */
+export function _completionGuardIsExempt(worker) {
+  return worker.ralphStatus === 'held' || worker._missionComplete === true || hasSpawnedSuccessor(worker);
+}
+
+export async function checkWorkerHealth(workerId, io) {
   const worker = workers.get(workerId);
   if (!worker) {
     healthChecks.delete(workerId);
@@ -162,6 +206,7 @@ async function checkWorkerHealth(workerId, io) {
     return;
   }
 
+  // awaiting_review = task done, awaiting dismiss. Covered by startPeriodicCleanup(); revertFromDone() re-arms health state before re-entering running.
   if (worker.status === 'completed' || worker.status === 'stopped' || worker.status === 'awaiting_review') {
     return;
   }
@@ -182,10 +227,10 @@ async function checkWorkerHealth(workerId, io) {
             try {
               const typeInfo = detectWorkerTypeForMetrics(worker.label);
               recordWorkerFalseCrash(worker, typeInfo.prefix || 'unknown');
-            } catch { /* best effort */ }
+            } catch (err) { getLogger().error('[health.monitor] recordWorkerFalseCrash metrics failed', err?.message); }
             break;
           } catch {
-            // has-session failed — session is dead, crash is real
+            getLogger().debug('[health.monitor] has-session failed — session confirmed dead, crash is real');
           }
         }
         logger.error(`[CrashDetect] Worker ${workerId} (${worker.label}): ${pattern.reason}`);
@@ -205,48 +250,69 @@ async function checkWorkerHealth(workerId, io) {
 
   if (!crashDetected) {
     const timeSinceOutput = Date.now() - new Date(worker.lastOutput).getTime();
-    const outputStalled = timeSinceOutput > 5 * 60 * 1000;
+    // Use type-specific nudgeMs as the stall-entry threshold so the health flip and first action
+    // align. RESEARCH workers get 8 min breathing room instead of the global 5 min.
+    // STALL_OUTPUT_MS env var overrides all type-specific thresholds (emergency escape hatch).
+    const stallProfile = getStallProfile(worker.label, worker.contextTokens);
+    const STALL_OUTPUT_MS = Number(process.env.STALL_OUTPUT_MS) || stallProfile.nudgeMs;
+    const outputStalled = timeSinceOutput > STALL_OUTPUT_MS;
 
     // Determine if Ralph is recently active (within 30 min)
     const ralphRecentlyActive = worker.lastRalphSignalAt &&
       (Date.now() - new Date(worker.lastRalphSignalAt).getTime()) < 30 * 60 * 1000;
 
-    // GENERALs with no active children are legitimately idle (awaiting Commander orders).
-    // Exempt them from stall detection entirely — they have nothing to monitor.
-    const isIdleGeneral = isProtectedWorker(worker) && !([...workers.values()].some(
-      w => w.parentWorkerId === workerId && w.status === 'running'
-    ));
+    // GENERALs/COLONELs with active children are legitimately silent (monitoring, waiting for output).
+    // Exempt them from stall detection — silent monitoring is not a stall.
+    // Only fires for orchestrators whose children are all terminal (done/blocked/dismissed).
+    const hasActiveChildren = [...workers.values()].some(
+      w => w.parentWorkerId === workerId &&
+           ['running', 'pending', 'awaiting_review'].includes(w.status)
+    );
+    const isIdleOrchestrator = isProtectedOrColonel(worker) && hasActiveChildren;
 
-    if (!outputStalled || ralphRecentlyActive || isIdleGeneral) {
+    if (!outputStalled || ralphRecentlyActive || isIdleOrchestrator || worker.ralphStatus === 'held' || worker.autoAcceptPaused) {
       worker.health = 'healthy';
       // Reset graduated stall recovery flags when healthy
       worker._stallNudged = false;
       worker._stallWarningNudged = false;
+      worker._stallParentWarned = false;
       worker._stallAutoKilled = false;
       worker._stallCommanderNotified = false;
+      // Clear stall-alert dedup only on genuine output recovery (not just Ralph signal or idle-general
+      // exemption). This prevents the stall toast from re-firing every time a Ralph signal briefly
+      // makes the worker appear healthy before it stalls again.
+      if (!outputStalled) {
+        worker._stallAlertedAt = null;
+      }
     } else {
       // Output stalled AND no recent Ralph signal — truly stalled
       const stalledMinutes = Math.round(timeSinceOutput / 60000);
       if (worker.health !== 'stalled') {
         logger.warn(`[HealthMonitor] Worker ${workerId} (${worker.label}) stalled for ${stalledMinutes}m`);
         worker.health = 'stalled';
-        if (io) {
-          io.emit('worker:stalled', { workerId, label: worker.label, stalledMinutes });
-        }
+      }
+      // Emit the stall toast only once per stall episode. _stallAlertedAt is cleared only when
+      // the worker produces actual output (not just a Ralph signal), so a single episode does not
+      // spam the Commander even if health oscillates between 'stalled' and 'healthy' via Ralph signals.
+      if (io && !worker._stallAlertedAt) {
+        worker._stallAlertedAt = Date.now();
+        io.emit('worker:stalled', { workerId, label: worker.label, stalledMinutes });
       }
 
       // === Graduated stall recovery ===
-      const stallProfile = getStallProfile(worker.label);
       const stallKillMin   = Math.round(stallProfile.killMs / 60000);
       const stallWarnMin   = Math.round(stallProfile.warnMs / 60000);
       const stallNudgeMin  = Math.round(stallProfile.nudgeMs / 60000);
       const timeSinceOutputMs = timeSinceOutput;
 
-      if (timeSinceOutputMs >= stallProfile.killMs && !isProtectedWorker(worker) && !worker._stallAutoKilled) {
-        // Kill threshold (non-GENERAL): auto-kill with parent notification
+      // Extreme stall threshold: 60 min of zero activity is the safety net for truly dead workers
+      const EXTREME_STALL_MS = 60 * 60 * 1000;
+
+      if (timeSinceOutputMs >= EXTREME_STALL_MS && !isProtectedOrColonel(worker) && !_completionGuardIsExempt(worker) && !worker._stallAutoKilled) {
+        // Extreme stall (60+ min): auto-kill as last-resort safety net (held workers are exempt)
         worker._stallAutoKilled = true;
-        logger.error(`[StallRecovery] Auto-killing stalled worker ${workerId} (${worker.label}) after ${stalledMinutes}m`);
-        if (worker.parentWorkerId) {
+        logger.error(`[StallRecovery] Auto-killing stalled worker ${workerId} (${worker.label}) after ${stalledMinutes}m (extreme stall threshold)`);
+        if (_stallNotifyGuard(worker, workers)) {
           const parentNotification = `[STALL AUTO-KILL] Your child worker "${worker.label}" (${workerId}) was automatically terminated after ${stalledMinutes} minutes of inactivity. Consider respawning if the task is still needed.`;
           sendInputDirect(worker.parentWorkerId, parentNotification, 'health:stall_kill_notification').catch(e => {
             logger.warn(`[StallRecovery] Could not notify parent ${worker.parentWorkerId}: ${e.message}`);
@@ -262,6 +328,31 @@ async function checkWorkerHealth(workerId, io) {
             logger.error(`[StallRecovery] Auto-kill failed for ${workerId}: ${err.message}`);
           }
         });
+      } else if (timeSinceOutputMs >= stallProfile.killMs && !isProtectedOrColonel(worker) && !worker._stallParentWarned) {
+        // Stall threshold reached: warn the parent and let them decide — do not kill yet
+        worker._stallParentWarned = true;
+        logger.warn(`[StallRecovery] Stall warning sent to parent of ${workerId} (${worker.label}) after ${stalledMinutes}m`);
+        if (_stallNotifyGuard(worker, workers)) {
+          const parentWarning = `[STALL WARNING] Your child worker "${worker.label}" (${workerId}) has been inactive for ${stalledMinutes} minutes. Consider checking its status or respawning if needed.`;
+          sendInputDirect(worker.parentWorkerId, parentWarning, 'health:stall_parent_warning').catch(e => {
+            logger.warn(`[StallRecovery] Could not send stall warning to parent ${worker.parentWorkerId}: ${e.message}`);
+          });
+        }
+      } else if (timeSinceOutputMs >= stallProfile.killMs && isProtectedOrColonel(worker) && !isProtectedWorker(worker)) {
+        // COLONELs: never auto-kill, but notify Commander UI
+        if (!worker._stallCommanderNotified) {
+          worker._stallCommanderNotified = true;
+          logger.error(`[StallRecovery] COLONEL ${workerId} (${worker.label}) stalled for ${stalledMinutes}m — notifying Commander`);
+          if (io) {
+            io.emit('worker:general:stalled', {
+              workerId,
+              label: worker.label,
+              stalledMinutes,
+              tier: 'COLONEL',
+              message: `COLONEL worker stalled for ${stalledMinutes}m — requires human attention`,
+            });
+          }
+        }
       } else if (timeSinceOutputMs >= stallProfile.killMs && isProtectedWorker(worker)) {
         // GENERALs: never auto-kill, but notify Commander
         if (!worker._stallCommanderNotified) {
@@ -272,6 +363,7 @@ async function checkWorkerHealth(workerId, io) {
               workerId,
               label: worker.label,
               stalledMinutes,
+              tier: 'GENERAL',
               message: `GENERAL worker stalled for ${stalledMinutes}m — requires human attention`,
             });
           }
@@ -280,16 +372,27 @@ async function checkWorkerHealth(workerId, io) {
         // Warning threshold: send warning (idle GENERALs never reach here — exempted above)
         worker._stallWarningNudged = true;
         logger.warn(`[StallRecovery] Sending stall WARNING to ${workerId} (${worker.label}) after ${stalledMinutes}m`);
-        sendInputDirect(workerId, `STALL WARNING: You have been idle for ${stalledMinutes} minutes. Signal your status via Ralph immediately or you will be terminated. If you are working on something that does not produce output, signal in_progress with your current step.`, 'health:stall_warning').catch(e => {
-          logger.warn(`[StallRecovery] Warning nudge failed for ${workerId}: ${e.message}`);
-        });
+        if (worker.waitingAtPrompt) {
+          // Suppress text injection — worker is at an interactive TUI prompt; injecting text corrupts menu state
+          logger.warn(`[StallRecovery] Suppressed stall WARNING for ${workerId} (waitingAtPrompt — would corrupt TUI)`);
+        } else {
+          sendInputDirect(workerId, `STALL WARNING: You have been idle for ${stalledMinutes} minutes. Signal your status via Ralph immediately or you will be terminated. If you are working on something that does not produce output, signal in_progress with your current step.`, 'health:stall_warning').catch(e => {
+            logger.warn(`[StallRecovery] Warning nudge failed for ${workerId}: ${e.message}`);
+          });
+        }
       } else if (timeSinceOutputMs >= stallProfile.nudgeMs && !worker._stallNudged) {
         // Nudge threshold: send nudge (idle GENERALs never reach here — exempted above)
         worker._stallNudged = true;
         logger.warn(`[StallRecovery] Sending stall nudge to ${workerId} (${worker.label}) after ${stalledMinutes}m`);
-        sendInputDirect(workerId, 'You appear to be idle. If you are working on something that does not produce output, signal Ralph with your progress. If you are stuck, signal blocked via Ralph.', 'health:stall_nudge').catch(e => {
-          logger.warn(`[StallRecovery] Nudge failed for ${workerId}: ${e.message}`);
-        });
+        if (worker.waitingAtPrompt) {
+          // Suppress text injection — worker is at an interactive TUI prompt; injecting text corrupts menu state
+          logger.warn(`[StallRecovery] Suppressed stall nudge for ${workerId} (waitingAtPrompt — would corrupt TUI)`);
+        } else {
+          const anchorPrefix = generateAnchorPrompt(worker);
+          sendInputDirect(workerId, `${anchorPrefix}You appear to be idle. If you are working on something that does not produce output, signal Ralph with your progress. If you are stuck, signal blocked via Ralph.`, 'health:stall_nudge').catch(e => {
+            logger.warn(`[StallRecovery] Nudge failed for ${workerId}: ${e.message}`);
+          });
+        }
       }
     }
 
@@ -323,40 +426,96 @@ async function checkWorkerHealth(workerId, io) {
     }
   }
 
-  // === Colonel max-lifetime check ===
-  // If a colonel hasn't completed within COLONEL_MAX_LIFETIME_MS, signal blocked
-  // so its parent knows the scope was too large.
-  if (!worker._colonelMaxLifetimeTriggered && worker.status === 'running') {
+  // === GENERAL/COLONEL lifetime enforcement ===
+  // Policy (updated 2026-04-18): Held and blocked workers are NEVER interrupted — they are
+  // intentionally waiting for Commander direction or already aware of a blockage. Enforcement
+  // only fires against workers that have gone dark (no Ralph signals) for extended periods:
+  //
+  //   held / blocked status    → skip entirely (worker is legitimately paused)
+  //   No signal for 4+ hours   → warn (stuck without progress)
+  //   No signal for 24+ hours  → send blocked notification (idle, may be abandoned)
+  //   48+ hours total runtime  → hard cap enforcement regardless of signal recency
+  if (worker.status === 'running') {
     const upperLabel = (worker.label || '').toUpperCase();
-    const isColonel = upperLabel.startsWith('COLONEL:') || upperLabel.startsWith('COL-') || upperLabel.startsWith('COL:');
-    if (isColonel) {
-      const startTime = worker.createdAt ? new Date(worker.createdAt).getTime() : null;
-      if (startTime && (Date.now() - startTime) > COLONEL_MAX_LIFETIME_MS) {
-        worker._colonelMaxLifetimeTriggered = true;
-        const lifetimeMin = Math.round((Date.now() - startTime) / 60000);
-        logger.error(`[ColonelLifetime] Colonel ${workerId} (${worker.label}) has been running for ${lifetimeMin}m — triggering max-lifetime blocked signal`);
+    const isGeneralOrColonel = isProtectedWorker(worker) ||
+      upperLabel.startsWith('COLONEL:') || upperLabel.startsWith('COL-') || upperLabel.startsWith('COL:');
 
-        // Notify the colonel itself to signal blocked via Ralph
-        const colonelMessage = `COLONEL MAX LIFETIME REACHED: You have been running for ${lifetimeMin} minutes without completing. Your scope may be too large. Signal blocked via Ralph immediately with reason: "Colonel max lifetime reached — scope may be too large. Consider splitting into smaller tasks." Your parent has also been notified.`;
-        sendInputDirect(workerId, colonelMessage, 'health:colonel_max_lifetime').catch(e => {
-          logger.warn(`[ColonelLifetime] Could not notify colonel ${workerId}: ${e.message}`);
-        });
+    if (isGeneralOrColonel) {
+      // Held = waiting for Commander review; blocked = already self-reported a blockage.
+      // Both are intentional waiting states — enforcing lifetime limits here wastes completed work.
+      const isWaiting = worker.ralphStatus === 'held' || worker.ralphStatus === 'blocked';
 
-        // Notify the parent so it can act
-        if (worker.parentWorkerId) {
-          const parentMessage = `[COLONEL MAX LIFETIME] Your colonel worker "${worker.label}" (${workerId}) has been running for ${lifetimeMin} minutes without completing. The scope may be too large. Consider splitting the task into smaller colonels or specialists. The colonel has been instructed to signal blocked.`;
-          sendInputDirect(worker.parentWorkerId, parentMessage, 'health:colonel_max_lifetime_parent').catch(e => {
-            logger.warn(`[ColonelLifetime] Could not notify parent ${worker.parentWorkerId}: ${e.message}`);
-          });
-        }
+      if (!isWaiting) {
+        const startTime = worker.createdAt ? new Date(worker.createdAt).getTime() : null;
+        const totalRunningMs = startTime ? Date.now() - startTime : 0;
+        // Treat "never signaled" as idle since creation so new workers aren't exempt
+        const lastSignalMs = worker.lastRalphSignalAt
+          ? Date.now() - new Date(worker.lastRalphSignalAt).getTime()
+          : totalRunningMs;
 
-        if (io) {
-          io.emit('worker:colonel:max-lifetime', {
-            workerId,
-            label: worker.label,
-            lifetimeMin,
-            message: `Colonel exceeded max lifetime (${lifetimeMin}m) — scope may be too large`,
-          });
+        const workerTypeLabel = isProtectedWorker(worker) ? 'GENERAL' : 'COLONEL';
+
+        if (totalRunningMs >= GENERAL_COLONEL_HARD_CAP_MS && !worker._generalColonelHardCapTriggered) {
+          // Hard cap: 48+ hours total runtime — enforce regardless of recent signals
+          worker._generalColonelHardCapTriggered = true;
+          const lifetimeHours = Math.round(totalRunningMs / 3600000);
+
+          // Recompute here — hasActiveChildren from the crash-detection block is out of scope.
+          const hardCapHasActiveChildren = [...workers.values()].some(
+            w => w.parentWorkerId === workerId &&
+                 ['running', 'pending', 'awaiting_review'].includes(w.status)
+          );
+
+          logger.error(`[LifetimeEnforcement] ${workerTypeLabel} ${workerId} (${worker.label}) reached 48h hard cap (${lifetimeHours}h total runtime) — instructing signal`);
+
+          const hardCapMsg = hardCapHasActiveChildren
+            ? `${workerTypeLabel} LIFETIME NOTICE (${lifetimeHours}h): You have active children still running. When they complete, signal held if awaiting Commander direction or done if your mission is finished. No immediate action required while children are in-flight.`
+            : `${workerTypeLabel} HARD CAP (48h): You have been running for ${lifetimeHours} hours. Signal done if your task is complete, held if waiting for Commander direction, or blocked if stuck.`;
+
+          sendInputDirect(workerId, hardCapMsg, 'health:general_colonel_hard_cap')
+            .catch(e => logger.warn(`[LifetimeEnforcement] Could not notify ${workerId}: ${e.message}`));
+
+          if (_stallNotifyGuard(worker, workers)) {
+            sendInputDirect(worker.parentWorkerId,
+              `[LIFETIME HARD CAP] Your ${workerTypeLabel} worker "${worker.label}" (${workerId}) has been running for ${lifetimeHours} hours. It has been instructed to signal its current status.`,
+              'health:general_colonel_hard_cap_parent'
+            ).catch(e => logger.warn(`[LifetimeEnforcement] Could not notify parent ${worker.parentWorkerId}: ${e.message}`));
+          }
+
+          if (io) {
+            io.emit('worker:general_colonel:hard_cap', { workerId, label: worker.label, lifetimeHours });
+          }
+        } else if (lastSignalMs >= GENERAL_COLONEL_IDLE_NOTIFY_MS && !worker._generalColonelIdleNotified) {
+          // 24+ hours without any Ralph signal — worker may be abandoned
+          worker._generalColonelIdleNotified = true;
+          const idleHours = Math.round(lastSignalMs / 3600000);
+          logger.error(`[LifetimeEnforcement] ${workerTypeLabel} ${workerId} (${worker.label}) idle for ${idleHours}h with no Ralph signals — sending blocked notification`);
+
+          sendInputDirect(workerId,
+            `${workerTypeLabel} IDLE ALERT: You have not sent any Ralph signals for ${idleHours} hours. Signal done if complete, held if awaiting Commander direction, or blocked if stuck. Your parent has been notified.`,
+            'health:general_colonel_idle_notify'
+          ).catch(e => logger.warn(`[LifetimeEnforcement] Could not notify ${workerId}: ${e.message}`));
+
+          if (_stallNotifyGuard(worker, workers)) {
+            sendInputDirect(worker.parentWorkerId,
+              `[IDLE ALERT] Your ${workerTypeLabel} worker "${worker.label}" (${workerId}) has not sent any Ralph signals for ${idleHours} hours. Consider checking its status or respawning.`,
+              'health:general_colonel_idle_parent'
+            ).catch(e => logger.warn(`[LifetimeEnforcement] Could not notify parent ${worker.parentWorkerId}: ${e.message}`));
+          }
+
+          if (io) {
+            io.emit('worker:general_colonel:idle', { workerId, label: worker.label, idleHours });
+          }
+        } else if (lastSignalMs >= GENERAL_COLONEL_STUCK_WARN_MS && !worker._generalColonelStuckWarned) {
+          // 4+ hours without a Ralph signal — warn and prompt for status update
+          worker._generalColonelStuckWarned = true;
+          const stuckHours = Math.round(lastSignalMs / 3600000);
+          logger.warn(`[LifetimeEnforcement] ${workerTypeLabel} ${workerId} (${worker.label}) no Ralph signals for ${stuckHours}h — sending progress check`);
+
+          sendInputDirect(workerId,
+            `PROGRESS CHECK: You have not sent any Ralph signals for ${stuckHours} hours. If working, signal in_progress with your current step. If done, signal done. If waiting for Commander, signal held.`,
+            'health:general_colonel_stuck_warn'
+          ).catch(e => logger.warn(`[LifetimeEnforcement] Could not notify ${workerId}: ${e.message}`));
         }
       }
     }
@@ -364,48 +523,66 @@ async function checkWorkerHealth(workerId, io) {
 
   // === Completion guard (time-based, all worker types) ===
   // Workers that finish but forget to signal done accumulate idle runtime.
-  // Thresholds are type-specific: IMPL/FIX get 45min/90min, others get 4h/8h.
-  if (worker.status === 'running' && worker.ralphStatus !== 'done') {
+  // All types use 4h nudge / 8h kill. Workers with recent Ralph signals (<2h) are always skipped.
+  // Held workers are intentionally paused awaiting Commander direction — exempt regardless of uptime.
+  if (worker.status === 'running' && _completionGuardIsExempt(worker)) {
+    logger.info(`[CompletionGuard] Skipping ${workerId} (${worker.label}) — held for Commander`);
+  } else if (worker.status === 'running' && worker.ralphStatus !== 'done') {
     const startTime = worker.createdAt ? new Date(worker.createdAt).getTime() : null;
     if (startTime) {
       const runningMs = Date.now() - startTime;
       const completionGuard = getCompletionGuard(worker.label);
 
-      // Skip CompletionGuard for generals that are actively reporting in_progress.
-      // A bulldoze-mode general signals every 15-30 min and should never be killed
-      // for running "too long". Only kill if the general has gone dark (>2h silence).
+      // Skip CompletionGuard for ANY worker that has signaled Ralph within the last 2 hours.
+      // An actively signaling worker is alive and working — it should never be auto-killed
+      // regardless of total uptime. Only kill workers that have gone completely dark.
       const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
-      const recentlySilent = !isProtectedWorker(worker) ||
-        !worker.lastRalphSignalAt ||
-        (Date.now() - new Date(worker.lastRalphSignalAt).getTime()) >= TWO_HOURS_MS;
+      const hasRecentRalphSignal = worker.lastRalphSignalAt &&
+        (Date.now() - new Date(worker.lastRalphSignalAt).getTime()) < TWO_HOURS_MS;
+      const recentlySilent = !hasRecentRalphSignal;
 
       if (!recentlySilent) {
         const minutesAgo = Math.round((Date.now() - new Date(worker.lastRalphSignalAt).getTime()) / 60000);
-        logger.info(`[CompletionGuard] Skipping GENERAL ${workerId} (${worker.label}) — recently active (${minutesAgo}m ago)`);
+        logger.info(`[CompletionGuard] Skipping ${workerId} (${worker.label}) — recently active (${minutesAgo}m ago)`);
       } else if (runningMs >= completionGuard.killMs && !worker._completionKilled) {
         worker._completionKilled = true;
         const runningMin = Math.round(runningMs / 60000);
         const runningHours = Math.round(runningMs / 3600000);
         const runningDesc = runningMs < 3600000 ? `${runningMin} minutes` : `${runningHours} hours`;
-        logger.error(`[CompletionGuard] Auto-killing ${workerId} (${worker.label}) after ${runningDesc} without done signal`);
-        if (worker.parentWorkerId) {
-          sendInputDirect(worker.parentWorkerId,
-            `[COMPLETION AUTO-KILL] Your worker "${worker.label}" (${workerId}) was automatically terminated after ${runningDesc} without signaling done via Ralph. Consider respawning if the task is still needed.`,
-            'health:completion_kill_notification'
-          ).catch(e => {
-            logger.warn(`[CompletionGuard] Could not notify parent ${worker.parentWorkerId}: ${e.message}`);
+        const ageMin = runningMin;
+
+        if (isProtectedOrColonel(worker)) {
+          // GENERALs and COLONELs are long-lived by design — skip force-kill, log only.
+          logger.warn(`[CompletionGuard] skipping kill for protected/colonel worker ${workerId} (${worker.template || worker.label}) age=${ageMin}m — notifying only`);
+          if (io) {
+            io.emit('worker:completion-guard:protected-skip', { workerId, label: worker.label, ageMin });
+          }
+        } else {
+          logger.error(`[CompletionGuard] Auto-killing ${workerId} (${worker.label}) after ${runningDesc} without done signal`);
+          if (_stallNotifyGuard(worker, workers)) {
+            sendInputDirect(worker.parentWorkerId,
+              `[COMPLETION AUTO-KILL] Your worker "${worker.label}" (${workerId}) was automatically terminated after ${runningDesc} without signaling done via Ralph. Consider respawning if the task is still needed.`,
+              'health:completion_kill_notification'
+            ).catch(e => {
+              logger.warn(`[CompletionGuard] Could not notify parent ${worker.parentWorkerId}: ${e.message}`);
+            });
+          }
+          try {
+            persistFailureLearning(worker, workerId, 'completion_guard_kill');
+          } catch (err) {
+            logger.warn(`[CompletionGuard] persistFailureLearning failed for ${workerId}: ${err.message}`);
+          }
+          import('./lifecycle.js').then(async ({ killWorker }) => {
+            try {
+              await killWorker(workerId, io, { force: true });
+              if (io) {
+                io.emit('worker:auto-killed:completion', { workerId, label: worker.label, runningHours });
+              }
+            } catch (err) {
+              logger.error(`[CompletionGuard] Auto-kill failed for ${workerId}: ${err.message}`);
+            }
           });
         }
-        import('./lifecycle.js').then(async ({ killWorker }) => {
-          try {
-            await killWorker(workerId, io, { force: true });
-            if (io) {
-              io.emit('worker:auto-killed:completion', { workerId, label: worker.label, runningHours });
-            }
-          } catch (err) {
-            logger.error(`[CompletionGuard] Auto-kill failed for ${workerId}: ${err.message}`);
-          }
-        });
       } else if (runningMs >= completionGuard.nudgeMs && !worker._completionNudged) {
         worker._completionNudged = true;
         const runningMin = Math.round(runningMs / 60000);
@@ -425,6 +602,22 @@ async function checkWorkerHealth(workerId, io) {
     }
   }
 
+  // === Post-compaction re-orientation injection ===
+  // If the PTY capture loop detected a context compaction event, inject a structured
+  // summary so the worker can re-orient without task drift. Clear the flag after
+  // injection to avoid sending it on every health cycle.
+  if (worker._compactionDetected && worker.status === 'running') {
+    worker._compactionDetected = false;
+    const message = await generateConsolidationMessage(worker);
+    logger.info(`[Compaction] Injecting re-orientation message for ${workerId} (${worker.label})`);
+    sendInputDirect(workerId, message, 'health:post_compaction_reorientation').catch(e => {
+      logger.warn(`[Compaction] Re-orientation injection failed for ${workerId}: ${e.message}`);
+    });
+    if (io) {
+      io.emit('worker:compaction:reoriented', { workerId, label: worker.label });
+    }
+  }
+
   // Auto-promotion sweep — delegates to shared function which handles the full
   // done-path: status change, parent delivery, parent aggregation, socket events.
   // (P2/P3 fix: was previously inline and skipped parent delivery)
@@ -435,8 +628,15 @@ async function checkWorkerHealth(workerId, io) {
   if (queue.length > 0 && worker.lastActivity) {
     const msSinceActivity = Date.now() - new Date(worker.lastActivity).getTime();
     if (msSinceActivity > 30000) {
-      logger.warn(`[HealthMonitor] Worker ${workerId} (${worker.label}) has stuck queue: ${queue.length} commands, no activity for ${Math.round(msSinceActivity / 1000)}s`);
+      if (!worker._stuckQueueLogged) {
+        worker._stuckQueueLogged = true;
+        logger.warn(`[HealthMonitor] Worker ${workerId} (${worker.label}) has stuck queue: ${queue.length} commands, no activity for ${Math.round(msSinceActivity / 1000)}s`);
+      }
+    } else {
+      worker._stuckQueueLogged = false;
     }
+  } else {
+    worker._stuckQueueLogged = false;
   }
 
   if (io) {
@@ -446,11 +646,13 @@ async function checkWorkerHealth(workerId, io) {
 
 export function stopHealthMonitor(workerId) {
   healthChecks.delete(workerId);
+  _ageLogLastSeen.delete(workerId);
 }
 
 export function stopAllHealthMonitors() {
   const count = healthChecks.size;
   healthChecks.clear();
+  _ageLogLastSeen.clear();
   if (globalHealthInterval) {
     clearInterval(globalHealthInterval);
     globalHealthInterval = null;
@@ -515,12 +717,12 @@ export async function handleCrashedWorker(workerId, worker, io) {
       }
       if (worker.ralphSignalCount > 0) recordWorkerRalphSignals(worker, worker.ralphSignalCount, template);
       if (worker.delegationMetrics?.roleViolations > 0) recordWorkerRoleViolations(worker, worker.delegationMetrics.roleViolations, template);
-    } catch { /* best effort */ }
+    } catch (err) { getLogger().error('[health.monitor] metrics recording failed for crashed worker', err?.message); }
     // Record failure in learnings DB — worker is truly dead
     try {
       const { persistFailureLearning } = await import('./ralph.js');
       persistFailureLearning(worker, workerId, `crashed: ${worker.crashReason || 'unknown'}`);
-    } catch { /* best effort */ }
+    } catch (err) { getLogger().error('[health.monitor] persistFailureLearning failed', err?.message); }
     try {
       const failedDependents = markWorkerFailed(workerId);
       for (const depId of failedDependents) {
@@ -529,7 +731,7 @@ export async function handleCrashedWorker(workerId, worker, io) {
           pendingWorkers.delete(depId);
         }
       }
-    } catch (e) { /* Worker may not be in dependency graph */ }
+    } catch (e) { getLogger().error('[health.monitor] markWorkerFailed failed (worker may not be in dependency graph)', e?.message); }
     if (io) {
       io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(worker));
     }
@@ -547,27 +749,27 @@ export async function handleCrashedWorker(workerId, worker, io) {
 
   logger.info(`[CrashRecovery] Respawning crashed worker ${workerId} (${worker.label}), attempt ${attempts.count}/${MAX_RESPAWN_ATTEMPTS}`);
 
-  if (isProtectedWorker(worker)) {
-    // Double-check: verify tmux session is actually dead before marking GENERAL as dead
+  if (isProtectedOrColonel(worker)) {
+    // Double-check: verify tmux session is actually dead before marking GENERAL/COLONEL as dead
     if (worker.tmuxSession) {
       try {
         await spawnTmux(['has-session', '-t', worker.tmuxSession]);
         // Session is alive — false positive crash detection
-        logger.warn(`[CrashRecovery] GENERAL ${workerId} (${worker.label}) tmux session is alive — resetting to healthy (false positive crash)`);
+        logger.warn(`[CrashRecovery] ${isProtectedWorker(worker) ? 'GENERAL' : 'COLONEL'} ${workerId} (${worker.label}) tmux session is alive — resetting to healthy (false positive crash)`);
         try {
           const typeInfo = detectWorkerTypeForMetrics(worker.label);
           recordWorkerFalseCrash(worker, typeInfo.prefix || 'unknown');
-        } catch { /* best effort */ }
+        } catch (err) { getLogger().error('[health.monitor] recordWorkerFalseCrash metrics failed', err?.message); }
         worker.health = 'healthy';
         worker.crashReason = null;
         worker.crashedAt = null;
         if (io) io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(worker));
         return;
       } catch {
-        // Session is dead — proceed with marking dead
+        getLogger().debug('[health.monitor] has-session failed — GENERAL session confirmed dead');
       }
     }
-    logger.error(`[CrashRecovery] GENERAL worker ${workerId} (${worker.label}) crashed. NOT respawning (unless auto-respawn registered).`);
+    logger.error(`[CrashRecovery] ${isProtectedWorker(worker) ? 'GENERAL' : 'COLONEL'} worker ${workerId} (${worker.label}) crashed. NOT respawning (unless auto-respawn registered).`);
 
     // Trigger auto-respawn if the worker was registered for it
     if (worker.autoRespawn) {
@@ -575,6 +777,7 @@ export async function handleCrashedWorker(workerId, worker, io) {
         ralphProgress: worker.ralphProgress,
         ralphCurrentStep: worker.ralphCurrentStep,
         ralphLearnings: worker.ralphLearnings,
+        ralphBlockedReason: worker.ralphBlockedReason,
       };
       import('../services/autoRespawnService.js').then(({ handleGeneralDeath }) => {
         handleGeneralDeath(workerId, 'crashed', io, workerSnapshot).catch(e =>
@@ -594,7 +797,7 @@ export async function handleCrashedWorker(workerId, worker, io) {
         if (durationMs > 0) recordWorkerTaskDuration(worker, durationMs, template);
       }
       if (worker.ralphSignalCount > 0) recordWorkerRalphSignals(worker, worker.ralphSignalCount, template);
-    } catch { /* best effort */ }
+    } catch (err) { getLogger().error('[health.monitor] metrics recording failed for GENERAL crash', err?.message); }
     try {
       const failedDependents = markWorkerFailed(workerId);
       for (const depId of failedDependents) {
@@ -602,12 +805,42 @@ export async function handleCrashedWorker(workerId, worker, io) {
           pendingWorkers.delete(depId);
         }
       }
-    } catch (e) { /* Worker may not be in dependency graph */ }
+    } catch (e) { getLogger().error('[health.monitor] markWorkerFailed failed (worker may not be in dependency graph)', e?.message); }
     stopHealthMonitor(workerId);
     clearWorkerContext(workerId);
-    if (io) {
-      io.emit('worker:general:dead', { workerId, label: worker.label, message: 'GENERAL crashed - requires human intervention (crash recovery skipped)' });
+    // Kill the tmux session to free Claude Code process RAM.
+    // workers Map entry is intentionally retained for human inspection.
+    if (worker.tmuxSession) {
+      try {
+        validateSessionName(worker.tmuxSession);
+        await spawnTmux(['kill-session', '-t', worker.tmuxSession]);
+      } catch (e) {
+        getLogger().debug('[health.monitor] tmux kill-session failed on protected crash (session may already be dead)', e?.message);
+      }
     }
+    if (io) {
+      if (isProtectedWorker(worker)) {
+        io.emit('worker:general:dead', { workerId, label: worker.label, message: 'GENERAL crashed - requires human intervention (crash recovery skipped)' });
+      } else {
+        io.emit('worker:colonel:dead', { workerId, label: worker.label, message: 'COLONEL crashed - requires human intervention (crash recovery skipped)' });
+      }
+    }
+    return;
+  }
+
+  // Non-general/colonel workers: use rich handoff if registered for auto-respawn
+  if (worker.autoRespawn) {
+    const workerSnapshot = {
+      ralphProgress: worker.ralphProgress,
+      ralphCurrentStep: worker.ralphCurrentStep,
+      ralphLearnings: worker.ralphLearnings,
+      ralphBlockedReason: worker.ralphBlockedReason,
+    };
+    import('../services/autoRespawnService.js').then(({ handleGeneralDeath }) => {
+      handleGeneralDeath(workerId, 'crashed', io, workerSnapshot).catch(e =>
+        logger.error(`[AutoRespawn] handleGeneralDeath (crash) failed for ${workerId}: ${e.message}`)
+      );
+    }).catch(e => logger.error(`[AutoRespawn] Import failed in crash handler: ${e.message}`));
     return;
   }
 
@@ -615,7 +848,7 @@ export async function handleCrashedWorker(workerId, worker, io) {
     validateSessionName(worker.tmuxSession);
     await spawnTmux(['kill-session', '-t', worker.tmuxSession]);
   } catch (e) {
-    // Session might already be dead
+    getLogger().debug('[health.monitor] tmux kill-session failed (session may already be dead)', e?.message);
   }
 
   try {
@@ -634,20 +867,17 @@ export async function handleCrashedWorker(workerId, worker, io) {
     try {
       const typeInfo = detectWorkerTypeForMetrics(worker.label);
       recordWorkerRespawn(worker, typeInfo.prefix || 'unknown');
-    } catch { /* best effort */ }
+    } catch (err) { getLogger().error('[health.monitor] recordWorkerRespawn metrics failed', err?.message); }
 
     respawnAttempts.set(newWorker.id, { count: attempts.count, lastAttempt: attempts.lastAttempt });
     respawnAttempts.delete(workerId);
 
-    if (worker.ralphMode && worker.parentWorkerId) {
-      const parentWorker = workers.get(worker.parentWorkerId);
-      if (parentWorker) {
-        const msg = `[CrashRecovery] Your child worker "${worker.label}" (${workerId}) crashed and was respawned as ${newWorker.id}. Use GET /api/workers/${newWorker.id} to retrieve updated details.`;
-        try {
-          await sendInputDirect(worker.parentWorkerId, msg, 'health:death_notification');
-        } catch (e) {
-          logger.warn(`[CrashRecovery] Could not notify parent ${worker.parentWorkerId}: ${e.message}`);
-        }
+    if (worker.ralphMode && _stallNotifyGuard(worker, workers)) {
+      const msg = `[CrashRecovery] Your child worker "${worker.label}" (${workerId}) crashed and was respawned as ${newWorker.id}. Use GET /api/workers/${newWorker.id} to retrieve updated details.`;
+      try {
+        await sendInputDirect(worker.parentWorkerId, msg, 'health:death_notification');
+      } catch (e) {
+        logger.warn(`[CrashRecovery] Could not notify parent ${worker.parentWorkerId}: ${e.message}`);
       }
     }
 
@@ -673,7 +903,7 @@ export async function handleCrashedWorker(workerId, worker, io) {
             pendingWorkers.delete(depId);
           }
         }
-      } catch (e) { /* Worker may not be in dependency graph */ }
+      } catch (e) { getLogger().error('[health.monitor] markWorkerFailed failed (worker may not be in dependency graph)', e?.message); }
       if (io) {
         io.to(`worker:${workerId}`).emit('worker:updated', normalizeWorker(worker));
       }
@@ -722,9 +952,13 @@ export function startPeriodicCleanup(io = null) {
     for (const [id, worker] of workers.entries()) {
       if (worker.beingCleanedUp) continue;
 
-      if (isProtectedWorker(worker)) {
+      if (isProtectedOrColonel(worker)) {
         if (worker.status === 'completed') {
-          logger.warn(`[PeriodicCleanup] GENERAL worker ${id} (${worker.label}) is marked completed but will NOT be auto-cleaned.`);
+          if (isProtectedWorker(worker)) {
+            logger.warn(`[PeriodicCleanup] GENERAL worker ${id} (${worker.label}) is marked completed but will NOT be auto-cleaned.`);
+          } else {
+            logger.warn(`[PeriodicCleanup] COLONEL worker ${id} (${worker.label}) is marked completed but will NOT be auto-cleaned.`);
+          }
         }
         continue;
       }
@@ -736,10 +970,10 @@ export function startPeriodicCleanup(io = null) {
         }
       }
 
-      if (worker.status === 'awaiting_review' && worker.awaitingReviewAt && !isProtectedWorker(worker)) {
+      if (worker.status === 'awaiting_review' && worker.awaitingReviewAt && !isProtectedOrColonel(worker)) {
         const reviewAge = now - new Date(worker.awaitingReviewAt).getTime();
         const hasParent = !!worker.parentWorkerId;
-        const timeoutMs = hasParent ? 30 * 60 * 1000 : 15 * 60 * 1000;
+        const timeoutMs = hasParent ? 2 * 60 * 60 * 1000 : 60 * 60 * 1000; // 2h parented / 60min parentless
 
         if (reviewAge > timeoutMs) {
           const activeChildren = (worker.childWorkerIds || []).filter(cid => {
@@ -748,10 +982,17 @@ export function startPeriodicCleanup(io = null) {
           });
           // Don't auto-dismiss workers that had children (they completed work, may be awaiting orders)
           const hadChildren = (worker.childWorkerHistory || []).length > 0;
+          const MAX_HADCHILDREN_AWAITING_MS = 24 * 60 * 60 * 1000; // 24h
           if (activeChildren.length > 0) {
             logger.info(`[PeriodicCleanup] Skipping awaiting_review worker ${id} (${worker.label}) — has ${activeChildren.length} active children`);
           } else if (hadChildren) {
-            logger.info(`[PeriodicCleanup] Skipping awaiting_review worker ${id} (${worker.label}) — has ${worker.childWorkerHistory.length} historical children, awaiting orders`);
+            if (reviewAge > MAX_HADCHILDREN_AWAITING_MS) {
+              logger.info(`[PeriodicCleanup] hadChildren exemption expired for ${id} (${worker.label}) — awaiting_review for ${Math.round(reviewAge / 60000)}m (>${Math.round(MAX_HADCHILDREN_AWAITING_MS / 60000)}m bound)`);
+              try { persistFailureLearning(worker, id, 'hadchildren_timeout'); } catch (e) { logger.warn(`[PeriodicCleanup] persistFailureLearning failed for ${id}: ${e.message}`); }
+              workersToClean.push({ id, reason: 'hadchildren-timeout', label: worker.label });
+            } else {
+              logger.info(`[PeriodicCleanup] Skipping awaiting_review worker ${id} (${worker.label}) — has ${worker.childWorkerHistory.length} historical children, awaiting orders`);
+            }
           } else {
             logger.info(`[PeriodicCleanup] Auto-dismissing worker ${id} (${worker.label}) — awaiting_review for ${Math.round(reviewAge / 60000)}m`);
             workersToClean.push({ id, reason: 'auto-dismissed', label: worker.label });
@@ -823,6 +1064,7 @@ export function startPeriodicCleanup(io = null) {
       const pendingAge = Date.now() - (pending.createdAt || 0);
       if (pendingAge > MAX_PENDING_TIMEOUT_MS) {
         logger.warn(`[PeriodicCleanup] Removing timed-out pending worker ${pendingId} (${pending.label})`);
+        try { persistFailureLearning(pending, pendingId, 'pending_timeout_kill'); } catch (e) { logger.warn(`[PeriodicCleanup] persistFailureLearning failed for ${pendingId}: ${e.message}`); }
         pendingWorkers.delete(pendingId);
         pendingCleaned++;
         continue;
@@ -834,6 +1076,7 @@ export function startPeriodicCleanup(io = null) {
       });
       if (!anyDepActive && deps.length > 0) {
         logger.info(`[PeriodicCleanup] Removing stale pending worker ${pendingId} (${pending.label})`);
+        try { persistFailureLearning(pending, pendingId, 'pending_stale_deps_kill'); } catch (e) { logger.warn(`[PeriodicCleanup] persistFailureLearning failed for ${pendingId}: ${e.message}`); }
         pendingWorkers.delete(pendingId);
         pendingCleaned++;
       }

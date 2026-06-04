@@ -22,6 +22,7 @@ import { createSettingsRoutes } from './routes/settings.js';
 import { createRetestRoutes } from './routes/retest.js';
 import { createMetricsComparisonRoutes } from './routes/metrics-comparison.js';
 import { createResearchRoutes } from './routes/research.js';
+import { createInsightsRoutes } from './routes/insights.js';
 
 export function createRoutes(theaRoot, io, { retestService } = {}) {
   const router = express.Router();
@@ -41,6 +42,9 @@ export function createRoutes(theaRoot, io, { retestService } = {}) {
 
   // Research library index and search
   router.use('/research', createResearchRoutes(theaRoot));
+
+  // Insights routes — token usage and cost analytics
+  router.use('/insights', createInsightsRoutes());
 
   // System routes have no shared prefix — mounted at root
   router.use('/', createSystemRoutes(theaRoot, io));

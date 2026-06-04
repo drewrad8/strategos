@@ -20,8 +20,10 @@ import { generateSummary } from './summaryService.js';
 import { scanProjects } from './projectScanner.js';
 import { sanitizeErrorMessage } from './errorUtils.js';
 import { CONTROL_CHAR_RE_G, MAX_LABEL_LENGTH, MAX_TASK_LENGTH } from './validation.js';
+import { getLogger } from './logger.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const logger = getLogger('[orchestrator.service]');
 
 // Validate OLLAMA_URL — must be localhost/127.0.0.1 with http(s) protocol to prevent SSRF
 const _rawOllamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434';
@@ -29,16 +31,16 @@ const OLLAMA_URL = (() => {
   try {
     const u = new URL(_rawOllamaUrl);
     if (u.protocol !== 'http:' && u.protocol !== 'https:') {
-      console.warn(`[Orchestrator] OLLAMA_URL protocol "${u.protocol}" rejected — only http/https allowed`);
+      logger.warn('OLLAMA_URL protocol rejected — only http/https allowed', { event: 'security.config_rejection', field: 'OLLAMA_URL', reason: 'invalid_protocol', value: u.protocol });
       return 'http://localhost:11434';
     }
     if (!['localhost', '127.0.0.1', '::1'].includes(u.hostname)) {
-      console.warn(`[Orchestrator] OLLAMA_URL hostname "${u.hostname}" is not localhost — rejecting (SSRF prevention)`);
+      logger.warn('OLLAMA_URL hostname rejected (SSRF prevention)', { event: 'security.ssrf_prevention', field: 'OLLAMA_URL', reason: 'non_localhost_hostname', value: u.hostname });
       return 'http://localhost:11434';
     }
     const port = parseInt(u.port || '11434', 10);
     if (port < 1024 || port > 65535) {
-      console.warn(`[Orchestrator] OLLAMA_URL port ${port} rejected — must be 1024-65535 (prevents targeting system services)`);
+      logger.warn('OLLAMA_URL port rejected', { event: 'security.config_rejection', field: 'OLLAMA_URL', reason: 'invalid_port', value: port });
       return 'http://localhost:11434';
     }
     return _rawOllamaUrl;
@@ -47,7 +49,7 @@ const OLLAMA_URL = (() => {
 // Validate model name: alphanumeric, hyphens, colons, dots (e.g. "qwen3:8b", "llama3.1:70b-instruct")
 const _rawOrchestratorModel = process.env.ORCHESTRATOR_MODEL || 'qwen3:8b';
 const ORCHESTRATOR_MODEL = /^[a-zA-Z0-9._:-]+$/.test(_rawOrchestratorModel) ? _rawOrchestratorModel : (() => {
-  console.warn(`[Orchestrator] Invalid ORCHESTRATOR_MODEL format: "${_rawOrchestratorModel}", using default`);
+  logger.warn('Invalid ORCHESTRATOR_MODEL format — using default', { field: 'ORCHESTRATOR_MODEL', value: _rawOrchestratorModel });
   return 'qwen3:8b';
 })();
 
@@ -72,7 +74,7 @@ try {
       }
     }
     if (conversationHistory.length > 0) {
-      console.log(`[Orchestrator] Loaded ${conversationHistory.length} conversation history entries`);
+      logger.info('Loaded conversation history entries', { count: conversationHistory.length });
     }
   }
 } catch {
@@ -88,7 +90,7 @@ function _scheduleHistorySave() {
       await fs.writeFile(tmpFile, JSON.stringify(conversationHistory, null, 2));
       await fs.rename(tmpFile, HISTORY_FILE);
     } catch (err) {
-      console.warn(`[Orchestrator] Failed to persist conversation history: ${err.message}`);
+      logger.warn('Failed to persist conversation history', { error: err.message });
     }
   }, HISTORY_SAVE_DEBOUNCE_MS);
   if (_historySaveTimer.unref) _historySaveTimer.unref();
@@ -325,7 +327,7 @@ CRITICAL RULES (MUST FOLLOW):
 
     return result;
   } catch (error) {
-    console.error('[Orchestrator] Error:', error.message);
+    logger.error('processVoiceCommand error', { error: error.message });
     return {
       success: false,
       action: 'error',
@@ -416,7 +418,7 @@ async function executeAction(decision, theaRoot, io) {
         if (task && typeof task === 'string') {
           const safeTask = task.slice(0, MAX_TASK_LENGTH);
           // Give Claude a moment to start up
-          setTimeout(() => sendInput(worker.id, safeTask, null, { source: 'orchestrator:spawn_task' }).catch(e => console.warn('[Orchestrator] Failed to send initial task:', e.message)), 2000);
+          setTimeout(() => sendInput(worker.id, safeTask, null, { source: 'orchestrator:spawn_task' }).catch(e => logger.warn('Failed to send initial task', { error: e.message })), 2000);
         }
 
         return {
@@ -509,7 +511,7 @@ async function executeAction(decision, theaRoot, io) {
         };
     }
   } catch (error) {
-    console.error(`[Orchestrator] Action ${action} failed:`, error.message);
+    logger.error('Action failed', { action, error: error.message });
     return {
       success: false,
       action,

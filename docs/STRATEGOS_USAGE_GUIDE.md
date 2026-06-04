@@ -62,6 +62,7 @@ Spawn workers from templates to get pre-configured roles with auto-accept and Ra
 | `fix` | FIX | Bug fixing. Fixes only the assigned bug. |
 | `general` | GENERAL | Strategic commander. Delegates to subordinates. Never writes code. |
 | `colonel` | COLONEL | Intermediate commander. Manages a subset of workers. |
+| `captain` | CAPTAIN | Tactical lead. Can execute directly or delegate 2-3 workers. Use for medium-complexity focused tasks. |
 
 ### Spawn Body Format
 ```json
@@ -209,6 +210,18 @@ GENERAL-tier workers cannot be killed without `?force=true`. This prevents accid
 
 ---
 
+## CAPTAIN Pattern
+
+CAPTAINs are tactical leads for focused, medium-complexity tasks. Unlike GENERALs, a CAPTAIN may execute quick work directly rather than always delegating.
+
+- **Team size:** 2–3 specialist workers maximum
+- **When to use:** A task is too complex for a single specialist but does not need the full force structure of a COLONEL (3+ workers, multi-stage sequencing, multi-project coordination).
+- **Authority:** Can spawn and direct child workers, and may perform quick implementation or investigation directly when delegation would be slower.
+- **vs. COLONEL:** COLONELs manage larger batches (3+ tasks) and multi-project coordination. CAPTAINs handle a single focused objective with a small team.
+- **vs. specialist:** Unlike IMPL/FIX, a CAPTAIN can spawn 2–3 sub-workers, synthesize their output, and report a unified result to its parent.
+
+---
+
 ## Bulldoze Mode
 
 Bulldoze mode makes a worker continuously cycle. After completing a task and signaling done, the orchestrator automatically sends a continuation prompt.
@@ -332,7 +345,7 @@ curl -s -X POST http://localhost:38007/api/workers/{id}/input \
 ## Architecture Notes
 
 - **Port 38007**: Express serves both the REST API and the built React client
-- **Workers run in tmux sessions**: Named `thea-worker-{id}`
+- **Workers run in tmux sessions**: Named `strategos-worker-{id}`
 - **Managed by systemd**: `systemctl --user start/stop/restart strategos`
 - **KillMode=process**: Server restarts preserve running tmux worker sessions
 - **Auto-accept**: Workers automatically accept Claude Code permission prompts

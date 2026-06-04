@@ -61,6 +61,19 @@ export function getWorker(workerId) {
 /**
  * Get raw worker with internal fields (ralphToken etc.) — for server-side use only.
  * NEVER send this to clients.
+ *
+ * ⚠️  MUTATION TRAP: Returns a SHALLOW COPY via object spread ({ ...worker }).
+ * Direct property assignment on the returned object does NOT update the workers Map.
+ *
+ *   const w = getWorkerInternal(id);
+ *   w.ralphToken = newToken;  // ← SILENT NO-OP — Map entry unchanged
+ *
+ * To mutate, use one of these patterns instead:
+ *   (a) const w = workers.get(id); w.field = value;  // direct Map reference
+ *   (b) workers.set(id, { ...workers.get(id), field: value });
+ *
+ * The only safe use of this function is READ-ONLY access to internal fields
+ * (e.g., reading ralphToken for signal validation in ralph.js).
  */
 export function getWorkerInternal(workerId) {
   const worker = workers.get(workerId);

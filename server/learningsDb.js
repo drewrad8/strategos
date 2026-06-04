@@ -9,11 +9,35 @@
  */
 
 import Database from 'better-sqlite3';
+import { createHash } from 'crypto';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { DB_JOURNAL_SIZE_LIMIT, DB_BUSY_TIMEOUT } from './validation.js';
 import { detectWorkerType } from './workers/templates.js';
+import { getLogger } from './logger.js';
+
+const logger = getLogger('learnings.db');
+
+// Regex for fixture/canary label prefixes — matches labels that start with these patterns.
+// isFixtureOrShutdown() is the JS-level equivalent for row-by-row filtering;
+// SQL queries must replicate this as LIKE conditions (SQLite has no JS function call).
+const FIXTURE_LABEL_RE = /^(CANARY|E2E[-_]FIXTURE|TEST[-_]SPAWN|FIXTURE:|auto-bulldoze)/i;
+
+// Garbage learnings patterns — reject short or known-bad phrases that pollute the feedback loop.
+// Matched in addLearning() to null out the learnings field before DB insert.
+const GARBAGE_LEARNINGS_PATTERNS = [
+  /^completed?\s+successfully\.?$/i,
+  /^done\.?$/i,
+  /^works\.?$/i,
+  /^learned\s+a\s+lot\.?$/i,
+  /^task\s+complete[d]?\.?$/i,
+  /^finished\.?$/i,
+  /^no\s+issues\.?$/i,
+  /^success\.?$/i,
+  /^all\s+good\.?$/i,
+  /^everything\s+works\.?$/i,
+];
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -30,6 +54,45 @@ function getDb() {
   return db;
 }
 
+/**
+ * Tag long-running null-learnings GENERAL/COLONEL rows as server_shutdown_inferred.
+ * Heuristic: uptime > 4h, learnings IS NULL, no prior terminalReason → likely lost to server restart.
+ * Called on startup to backfill existing rows. Exported for test verification.
+ * @param {import('better-sqlite3').Database} d
+ */
+export function backfillServerShutdownInferred(d) {
+  d.prepare(`
+    UPDATE learnings SET terminalReason = 'server_shutdown_inferred'
+    WHERE learnings IS NULL
+      AND terminalReason IS NULL
+      AND (templateType = 'general' OR templateType = 'colonel')
+      AND uptime > 14400000
+  `).run();
+}
+
+/**
+ * Backfill terminalReason for historical failure rows via [auto-captured on <reason>] substrings.
+ * Covers: killed, session_died, stall_kill, completion_guard_kill, server_shutdown (guard re-run).
+ * Any success=0 row that still has no match gets terminalReason='unknown' so it is distinguishable
+ * from rows that were written after the column existed (which have an explicit value or NULL=success).
+ * Exported for unit-test verification. Idempotent — all UPDATEs guard on terminalReason IS NULL.
+ * @param {import('better-sqlite3').Database} d
+ */
+export function backfillTerminalReasonPatterns(d) {
+  const patterns = ['killed', 'session_died', 'stall_kill', 'completion_guard_kill', 'server_shutdown'];
+  for (const reason of patterns) {
+    d.prepare(`
+      UPDATE learnings SET terminalReason = ?
+      WHERE terminalReason IS NULL AND learnings LIKE ?
+    `).run(reason, `%[auto-captured on ${reason}]%`);
+  }
+  // Fallback: success=0 rows with no matching pattern → 'unknown'
+  d.prepare(`
+    UPDATE learnings SET terminalReason = 'unknown'
+    WHERE terminalReason IS NULL AND success = 0
+  `).run();
+}
+
 function _initDatabase() {
   const dbPath = path.join(__dirname, 'learnings.db');
   db = new Database(dbPath);
@@ -37,6 +100,20 @@ function _initDatabase() {
   db.pragma('journal_mode = WAL');
   db.pragma(`journal_size_limit = ${DB_JOURNAL_SIZE_LIMIT}`);
   db.pragma(`busy_timeout = ${DB_BUSY_TIMEOUT}`);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      id INTEGER PRIMARY KEY,
+      name TEXT UNIQUE NOT NULL,
+      applied_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  function runMigration(db, name, fn) {
+    if (db.prepare('SELECT id FROM schema_migrations WHERE name = ?').get(name)) return;
+    fn();
+    db.prepare('INSERT INTO schema_migrations (name) VALUES (?)').run(name);
+  }
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS learnings (
@@ -87,25 +164,106 @@ function _initDatabase() {
     );
 
     CREATE INDEX IF NOT EXISTS idx_review_workerId ON review_results(workerId);
+
+    CREATE TABLE IF NOT EXISTS compliance_violations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      workerId TEXT NOT NULL,
+      workerLabel TEXT,
+      templateType TEXT,
+      violationType TEXT NOT NULL,
+      description TEXT NOT NULL,
+      severity TEXT DEFAULT 'warning',
+      timestamp TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_compliance_workerId ON compliance_violations(workerId);
+    CREATE INDEX IF NOT EXISTS idx_compliance_violationType ON compliance_violations(violationType);
   `);
 
-  // Migration: add parentWorkerId column if it doesn't exist (added 2026-04-04)
-  try {
-    db.prepare('ALTER TABLE learnings ADD COLUMN parentWorkerId TEXT').run();
-  } catch {
-    // Column already exists — expected on subsequent starts
-  }
+  // Migration: add parentWorkerId column (added 2026-04-04)
+  runMigration(db, 'add_parentWorkerId_to_learnings', () => {
+    try { db.prepare('ALTER TABLE learnings ADD COLUMN parentWorkerId TEXT').run(); } catch { /* column exists */ }
+  });
 
-  // Migration: add taskQualityScore column if it doesn't exist (added 2026-04-05)
-  // Tracks spawn-time quality score so we can correlate task structure with success rate over time.
+  // Migration: add taskQualityScore column (added 2026-04-05)
+  runMigration(db, 'add_taskQualityScore_to_learnings', () => {
+    try { db.prepare('ALTER TABLE learnings ADD COLUMN taskQualityScore INTEGER').run(); } catch { /* column exists */ }
+  });
+
+  // Migration: add completionScore column to review_results (added 2026-04-13)
+  runMigration(db, 'add_completionScore_to_review_results', () => {
+    try { db.prepare('ALTER TABLE review_results ADD COLUMN completionScore INTEGER').run(); } catch { /* column exists */ }
+  });
+
+  // Migration: add content_hash column for dedup (added 2026-04-19)
+  runMigration(db, 'add_content_hash_to_learnings', () => {
+    try { db.prepare('ALTER TABLE learnings ADD COLUMN content_hash TEXT').run(); } catch { /* column exists */ }
+  });
+
+  // Migration: add terminalReason column (added 2026-04-21)
+  runMigration(db, 'add_terminalReason_to_learnings', () => {
+    try { db.prepare('ALTER TABLE learnings ADD COLUMN terminalReason TEXT').run(); } catch { /* column exists */ }
+  });
+
+  // Backfill: tag existing server_shutdown auto-capture records so SQL filters can use the column
   try {
-    db.prepare('ALTER TABLE learnings ADD COLUMN taskQualityScore INTEGER').run();
-  } catch {
-    // Column already exists — expected on subsequent starts
-  }
+    db.prepare(`
+      UPDATE learnings SET terminalReason = 'server_shutdown'
+      WHERE learnings LIKE '%[auto-captured on server_shutdown]%' AND terminalReason IS NULL
+    `).run();
+  } catch { /* non-fatal */ }
+
+  // Backfill: tag remaining auto-captured termination patterns (RC-1, 2026-04-21)
+  // Covers killed, session_died, stall_kill, completion_guard_kill — plus a fallback
+  // 'unknown' for success=0 rows with no matching pattern, to distinguish from un-migrated records.
+  try {
+    backfillTerminalReasonPatterns(db);
+  } catch { /* non-fatal */ }
+
+  // Backfill: tag long-running null-learnings GENERAL/COLONEL as server_shutdown_inferred (Class A1)
+  try {
+    backfillServerShutdownInferred(db);
+  } catch { /* non-fatal */ }
+
+  // Migration: dedup existing rows, keeping oldest per (workerId, learnings) pair
+  try {
+    db.prepare(`
+      DELETE FROM learnings
+      WHERE id NOT IN (
+        SELECT MIN(id) FROM learnings GROUP BY workerId, COALESCE(learnings, '')
+      )
+    `).run();
+  } catch { /* non-fatal */ }
+
+  // Migration: partial unique index — enforces dedup only for rows with content_hash set
+  try {
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_learnings_dedup ON learnings(workerId, content_hash) WHERE content_hash IS NOT NULL`);
+  } catch { /* non-fatal — may already exist */ }
 
   // Auto-cleanup: delete entries older than 90 days
   db.prepare(`DELETE FROM learnings WHERE timestamp < datetime('now', '-90 days')`).run();
+}
+
+// ============================================
+// FIXTURE / SHUTDOWN FILTER
+// ============================================
+
+/**
+ * Returns true if a learnings row should be excluded from aggregate metrics.
+ * Excludes: test fixture workers (CANARY, E2E_FIXTURE, TEST-SPAWN, FIXTURE: prefixes)
+ * and server_shutdown auto-capture records (collateral from restarts, not real failures).
+ *
+ * SQL queries replicate this logic as LIKE/terminalReason conditions since SQLite
+ * cannot call JS functions. Keep this helper in sync with those WHERE clauses.
+ *
+ * @param {{ label?: string, terminalReason?: string }} row
+ * @returns {boolean}
+ */
+export function isFixtureOrShutdown(row) {
+  if (FIXTURE_LABEL_RE.test(row.label ?? '')) return true;
+  if (row.terminalReason === 'server_shutdown') return true;
+  if (row.terminalReason === 'server_shutdown_inferred') return true;
+  return false;
 }
 
 // ============================================
@@ -119,9 +277,24 @@ function _initDatabase() {
 export function addLearning(data) {
   const d = getDb();
   const stmt = d.prepare(`
-    INSERT INTO learnings (workerId, label, templateType, templateHash, learnings, outputs, artifacts, taskDescription, parentWorkerId, effortLevel, success, uptime, taskQualityScore)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT OR IGNORE INTO learnings (workerId, label, templateType, templateHash, learnings, outputs, artifacts, taskDescription, parentWorkerId, effortLevel, success, uptime, taskQualityScore, content_hash, terminalReason)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
+
+  // Quality gate: reject garbage learnings (too short or known-bad phrases).
+  // Null out the learnings field but still store the record for success/failure tracking.
+  let learningsValue = data.learnings || null;
+  if (learningsValue) {
+    const text = learningsValue.trim();
+    const tooShort = text.length < 50;
+    const isGarbage = GARBAGE_LEARNINGS_PATTERNS.some(p => p.test(text));
+    if (tooShort || isGarbage) {
+      try {
+        getLogger().warn(`[LearningsDB] Rejected low-quality learnings for ${data.workerId} (${data.label}): "${text.slice(0, 80)}" — ${tooShort ? 'too short' : 'garbage pattern matched'}`);
+      } catch { /* non-fatal */ }
+      learningsValue = null;
+    }
+  }
 
   const outputs = data.outputs != null
     ? (typeof data.outputs === 'string' ? data.outputs : JSON.stringify(data.outputs))
@@ -130,12 +303,19 @@ export function addLearning(data) {
     ? (Array.isArray(data.artifacts) ? data.artifacts.join(', ') : String(data.artifacts))
     : null;
 
+  // Dedup guard: hash the learnings text so the UNIQUE(workerId, content_hash) index
+  // can reject duplicate done-signal rows from the same worker. Null learnings are
+  // excluded from dedup (the partial index only covers non-null content_hash rows).
+  const contentHash = learningsValue
+    ? createHash('sha256').update(learningsValue).digest('hex').slice(0, 32)
+    : null;
+
   stmt.run(
     data.workerId || null,
     data.label || null,
     data.templateType || null,
     data.templateHash || null,
-    data.learnings || null,
+    learningsValue,
     outputs,
     artifacts,
     data.taskDescription || null,
@@ -144,6 +324,8 @@ export function addLearning(data) {
     data.success != null ? (data.success ? 1 : 0) : null,
     data.uptime || null,
     data.taskQualityScore != null ? Number(data.taskQualityScore) : null,
+    contentHash,
+    data.terminalReason || null,
   );
 }
 
@@ -175,10 +357,10 @@ export function getLearnings(type, days = 30) {
 
 /**
  * Get recent failures (success = 0) within the given time window.
- * @param {number} [days=7] - How many days back to look
+ * @param {number} [hours=6] - How many hours back to look
  * @returns {Array} Failed learning entries
  */
-export function getRecentFailures(days = 7) {
+export function getRecentFailures(hours = 6) {
   const d = getDb();
   // Exclude test scaffold workers (e.g. "IMPL: TEST: ...") — deliberately killed
   // during system validation, not real task failures.
@@ -186,33 +368,35 @@ export function getRecentFailures(days = 7) {
   // or killed in under 120s before Claude could start working (test harness cleanup).
   return d.prepare(`
     SELECT * FROM learnings
-    WHERE success = 0 AND timestamp > datetime('now', '-' || ? || ' days')
+    WHERE success = 0 AND timestamp > datetime('now', '-' || ? || ' hours')
       AND label NOT LIKE '%: TEST: %'
+      AND label NOT LIKE '%E2E_FIXTURE:%'
       AND taskDescription IS NOT NULL
       AND (uptime IS NULL OR uptime >= 120000)
     ORDER BY timestamp DESC
-  `).all(days);
+  `).all(hours);
 }
 
 /**
  * Get recent failures for a specific template type.
  * @param {string} type - Template type (e.g. 'impl', 'fix')
- * @param {number} [days=30] - How many days back to look
+ * @param {number} [hours=6] - How many hours back to look
  * @returns {Array} Failed learning entries for this type
  */
-export function getRecentFailuresByType(type, days = 30) {
+export function getRecentFailuresByType(type, hours = 6) {
   const d = getDb();
   // Exclude test scaffold workers (e.g. "IMPL: TEST: ...") — deliberately killed
   // during system validation, not real task failures.
   // Exclude ephemeral fixtures: workers with no task description or killed in under 120s.
   return d.prepare(`
     SELECT * FROM learnings
-    WHERE success = 0 AND templateType = ? AND timestamp > datetime('now', '-' || ? || ' days')
+    WHERE success = 0 AND templateType = ? AND timestamp > datetime('now', '-' || ? || ' hours')
       AND label NOT LIKE '%: TEST: %'
+      AND label NOT LIKE '%E2E_FIXTURE:%'
       AND taskDescription IS NOT NULL
       AND (uptime IS NULL OR uptime >= 120000)
     ORDER BY timestamp DESC
-  `).all(type, days);
+  `).all(type, hours);
 }
 
 /**
@@ -235,6 +419,13 @@ export function getSuccessRate(type, days = 30) {
       FROM learnings
       WHERE templateType = ? AND timestamp > datetime('now', '-' || ? || ' days')
         AND label NOT LIKE '%: TEST: %'
+        AND label NOT LIKE '%E2E_FIXTURE:%'
+        AND label NOT LIKE 'auto-bulldoze%'
+        AND label NOT LIKE 'CANARY%'
+        AND label NOT LIKE 'E2E-FIXTURE%'
+        AND label NOT LIKE 'TEST-SPAWN%'
+        AND label NOT LIKE 'FIXTURE:%'
+        AND (terminalReason IS NULL OR (terminalReason != 'server_shutdown' AND terminalReason != 'server_shutdown_inferred'))
         AND taskDescription IS NOT NULL
         AND (uptime IS NULL OR uptime >= 120000)
     `).get(type, days);
@@ -247,6 +438,13 @@ export function getSuccessRate(type, days = 30) {
       FROM learnings
       WHERE timestamp > datetime('now', '-' || ? || ' days')
         AND label NOT LIKE '%: TEST: %'
+        AND label NOT LIKE '%E2E_FIXTURE:%'
+        AND label NOT LIKE 'auto-bulldoze%'
+        AND label NOT LIKE 'CANARY%'
+        AND label NOT LIKE 'E2E-FIXTURE%'
+        AND label NOT LIKE 'TEST-SPAWN%'
+        AND label NOT LIKE 'FIXTURE:%'
+        AND (terminalReason IS NULL OR (terminalReason != 'server_shutdown' AND terminalReason != 'server_shutdown_inferred'))
         AND taskDescription IS NOT NULL
         AND (uptime IS NULL OR uptime >= 120000)
     `).get(days);
@@ -261,17 +459,18 @@ export function getSuccessRate(type, days = 30) {
 }
 
 /**
- * Get summary statistics across all template types.
+ * Internal: Get summary statistics, accepting a database parameter for testing.
+ * @param {import('better-sqlite3').Database} [d] - Database to query (uses global if not provided)
  * @returns {Array}
  */
-export function getSummaryStats() {
-  const d = getDb();
+export function _getSummaryStatsInternal(d) {
+  const db = d || getDb();
   // Exclude test scaffold workers (e.g. "IMPL: TEST: ...") — deliberately killed
   // during system validation, would inflate failure rates.
   // Exclude ephemeral fixtures: workers with no task description (pure API scaffolding)
   // or killed in under 120s before Claude could start working (test harness cleanup).
   // These are never real task failures and must not affect reported success rates.
-  return d.prepare(`
+  return db.prepare(`
     SELECT
       templateType,
       COUNT(DISTINCT workerId) as total,
@@ -281,11 +480,29 @@ export function getSummaryStats() {
       ROUND(AVG(uptime)) as avgUptime
     FROM learnings
     WHERE label NOT LIKE '%: TEST: %'
+      AND label NOT LIKE '%E2E_FIXTURE:%'
+      AND label NOT LIKE 'auto-bulldoze%'
+      AND label NOT LIKE 'CANARY%'
+      AND label NOT LIKE 'E2E-FIXTURE%'
+      AND label NOT LIKE 'TEST-SPAWN%'
+      AND label NOT LIKE 'FIXTURE:%'
+      AND label NOT LIKE 'TEST:%'
+      AND (terminalReason IS NULL OR (terminalReason != 'server_shutdown' AND terminalReason != 'server_shutdown_inferred'))
+      AND (learnings IS NULL OR learnings NOT LIKE '%[auto-captured on server_shutdown]%')
       AND taskDescription IS NOT NULL
+      AND taskDescription NOT LIKE 'TEST:%'
       AND (uptime IS NULL OR uptime >= 120000)
     GROUP BY templateType
     ORDER BY total DESC
   `).all();
+}
+
+/**
+ * Get summary statistics across all template types.
+ * @returns {Array}
+ */
+export function getSummaryStats() {
+  return _getSummaryStatsInternal();
 }
 
 /**
@@ -310,6 +527,7 @@ export function getRecentSuccessesByType(type, limit = 3, days = 30) {
       AND learnings != ''
       AND LENGTH(learnings) >= 100
       AND label NOT LIKE '%: TEST: %'
+      AND label NOT LIKE '%E2E_FIXTURE:%'
       AND timestamp > datetime('now', '-' || ? || ' days')
     GROUP BY workerId
     ORDER BY MAX(timestamp) DESC
@@ -356,6 +574,21 @@ export function getRecentReflectionsByType(type, limit = 3) {
   `).all(type, limit);
 }
 
+/**
+ * Get failure reflections for a given template type within a lookback window.
+ * @param {string} type - Template type (e.g. 'fix', 'colonel')
+ * @param {number} [days=14] - How many days back to look
+ * @returns {Array}
+ */
+export function getReflectionsByType(type, days = 14) {
+  const d = getDb();
+  return d.prepare(`
+    SELECT * FROM failure_reflections
+    WHERE templateType = ? AND generatedAt > datetime('now', '-' || ? || ' days')
+    ORDER BY generatedAt DESC
+  `).all(type, days);
+}
+
 // ============================================
 // REVIEW GATE RESULTS
 // ============================================
@@ -370,8 +603,8 @@ export function addReviewResult(data) {
   d.prepare(`
     INSERT OR REPLACE INTO review_results
       (workerId, stage1Flags, stage2Decision, stage2Verdict, stage2Raw,
-       finalDecision, deliveredWithAnnotation, durationMs)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       finalDecision, deliveredWithAnnotation, durationMs, completionScore)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     data.workerId,
     data.stage1Flags || null,
@@ -381,6 +614,7 @@ export function addReviewResult(data) {
     data.finalDecision,
     data.deliveredWithAnnotation || 0,
     data.durationMs || null,
+    data.completionScore != null ? Number(data.completionScore) : null,
   );
 }
 
@@ -407,6 +641,55 @@ export function getReviewStats(days = 30) {
     FROM review_results
     WHERE timestamp > ?
     GROUP BY finalDecision
+  `).all(since);
+}
+
+// ============================================
+// COMPLIANCE VIOLATIONS
+// ============================================
+
+/**
+ * Store a compliance violation detected during done-signal handling.
+ * Records role violations: generals making git commits, researchers editing non-report files, etc.
+ * @param {Object} data
+ */
+export function addComplianceViolation(data) {
+  const d = getDb();
+  d.prepare(`
+    INSERT INTO compliance_violations (workerId, workerLabel, templateType, violationType, description, severity)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(
+    data.workerId,
+    data.workerLabel || null,
+    data.templateType || null,
+    data.violationType,
+    data.description,
+    data.severity || 'warning',
+  );
+}
+
+/**
+ * Get compliance violations for a specific worker.
+ * @param {string} workerId
+ * @returns {Array}
+ */
+export function getComplianceViolations(workerId) {
+  const d = getDb();
+  return d.prepare('SELECT * FROM compliance_violations WHERE workerId = ? ORDER BY timestamp DESC').all(workerId);
+}
+
+/**
+ * Get recent compliance violations across all workers.
+ * @param {number} [days=30]
+ * @returns {Array}
+ */
+export function getRecentComplianceViolations(days = 30) {
+  const d = getDb();
+  const since = new Date(Date.now() - days * 86400000).toISOString();
+  return d.prepare(`
+    SELECT * FROM compliance_violations
+    WHERE timestamp > ?
+    ORDER BY timestamp DESC
   `).all(since);
 }
 
@@ -465,7 +748,7 @@ export function seedFromCheckpoints() {
     }
   }
 
-  console.log(`[LearningsDB] Seeded ${seeded} entries from checkpoints`);
+  logger.info('[learnings.db] Seeded entries from checkpoints', { seeded });
   return seeded;
 }
 

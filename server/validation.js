@@ -51,3 +51,122 @@ export const DB_BUSY_TIMEOUT = 5000; // 5s wait for locks
 export function isValidSessionId(value) {
   return Number.isFinite(value) && value > 0 && Number.isInteger(value) && value < MAX_SESSION_ID;
 }
+
+// ============================================================================
+// SHARED WORKER-SPAWN INPUT VALIDATION
+// ----------------------------------------------------------------------------
+// Single source of truth for the spawn-request validation that the REST POST
+// /api/workers and the socket worker:spawn previously duplicated (hand-synced
+// via match-routes.js comments — and DIVERGED: dependsOn used VALID_WORKER_ID in
+// REST but a loose /^[a-zA-Z0-9-]{1,36}$/ in socket). These helpers cover ONLY
+// the parts that are byte-identical across both paths plus the now-unified
+// dependsOn check. Path-specific bits (task object-vs-string validation, model
+// regex, backend inheritance, allowDuplicate, effortLevel error-vs-strip) stay
+// in each caller — collapsing them would change observable behavior on the
+// socket path beyond the sanctioned dependsOn unification.
+// ============================================================================
+
+const ONCOMPLETE_TYPES = ['spawn', 'webhook', 'emit'];
+const MAX_ONCOMPLETE_SIZE = 10000; // 10KB — cap nested-config memory abuse
+
+/**
+ * Validate a `dependsOn` array. Unified on VALID_WORKER_ID across both spawn
+ * paths (8-char hex worker IDs). `undefined` is allowed (no dependencies).
+ *
+ * @param {*} dependsOn
+ * @returns {{ ok: true } | { ok: false, error: string }}
+ */
+export function validateDependsOn(dependsOn) {
+  if (dependsOn === undefined) return { ok: true };
+  if (!Array.isArray(dependsOn) || dependsOn.length > 50) {
+    return { ok: false, error: 'dependsOn must be an array with at most 50 entries' };
+  }
+  if (!dependsOn.every(id => typeof id === 'string' && VALID_WORKER_ID.test(id))) {
+    return { ok: false, error: 'dependsOn entries must be valid worker IDs' };
+  }
+  return { ok: true };
+}
+
+/**
+ * Validate an `onComplete` action (defense-in-depth: returns undefined on any
+ * invalid shape rather than rejecting). Type must be a known action; total JSON
+ * size is capped. Identical logic to the previous inline REST/socket copies.
+ *
+ * @param {*} onComplete
+ * @returns {{type: string, config: object} | undefined}
+ */
+export function validateOnComplete(onComplete) {
+  if (onComplete === undefined || onComplete === null) return undefined;
+  if (typeof onComplete !== 'object' || Array.isArray(onComplete)) return undefined;
+  if (typeof onComplete.type !== 'string' || !ONCOMPLETE_TYPES.includes(onComplete.type)) return undefined;
+  try {
+    if (JSON.stringify(onComplete).length > MAX_ONCOMPLETE_SIZE) return undefined;
+  } catch { return undefined; }
+  return { type: onComplete.type, config: onComplete.config || {} };
+}
+
+/**
+ * Validate the spawn sub-fields that are validated IDENTICALLY (strip-don't-
+ * reject, no early-return / ordering effect) across both spawn paths:
+ * onComplete, workflowId, taskId, parentWorkerId, parentLabel. Each invalid
+ * field becomes undefined.
+ *
+ * Excludes label/initialInput (different error messages + early returns at
+ * different positions per path) and dependsOn (own early-return helper above).
+ *
+ * @param {object} body - the raw spawn request body
+ * @returns {{onComplete, workflowId, taskId, parentWorkerId, parentLabel}}
+ */
+export function validateSpawnInput(body = {}) {
+  const { onComplete, workflowId, taskId, parentWorkerId, parentLabel } = body;
+  return {
+    onComplete: validateOnComplete(onComplete),
+    workflowId: (workflowId !== undefined && workflowId !== null)
+      ? (typeof workflowId === 'string' && workflowId.length <= 100 && VALID_SIMPLE_ID.test(workflowId) ? workflowId : undefined)
+      : undefined,
+    taskId: (taskId !== undefined && taskId !== null)
+      ? (typeof taskId === 'string' && taskId.length <= 100 && VALID_SIMPLE_ID.test(taskId) ? taskId : undefined)
+      : undefined,
+    parentWorkerId: (parentWorkerId !== undefined && parentWorkerId !== null)
+      ? (typeof parentWorkerId === 'string' && VALID_WORKER_ID.test(parentWorkerId) ? parentWorkerId : undefined)
+      : undefined,
+    parentLabel: (parentLabel !== undefined && parentLabel !== null)
+      ? (typeof parentLabel === 'string' && parentLabel.length <= MAX_LABEL_LENGTH && !CONTROL_CHAR_RE.test(parentLabel) ? parentLabel : undefined)
+      : undefined,
+  };
+}
+
+/**
+ * Assemble the spawn `options` object from the validated shared fields. This is
+ * the option-assembly block that was byte-identical across both paths. Callers
+ * layer their path-specific options (backend, model, allowDuplicate,
+ * effortLevel) on top of the returned object.
+ *
+ * @param {object} v
+ * @param {string[]} [v.dependsOn] - raw validated dependsOn array
+ * @param {object}   [v.onComplete]
+ * @param {string}   [v.workflowId]
+ * @param {string}   [v.taskId]
+ * @param {string|object} [v.task] - the caller's already-validated task value
+ * @param {string}   [v.parentWorkerId]
+ * @param {string}   [v.parentLabel]
+ * @param {string}   [v.initialInput]
+ * @param {*}        [v.autoAccept] - defaults to true unless explicitly false
+ * @param {*}        [v.ralphMode]  - defaults to true unless explicitly false
+ * @returns {object} options
+ */
+export function buildSpawnOptions(v = {}) {
+  const options = {};
+  if (v.dependsOn) options.dependsOn = v.dependsOn;
+  if (v.onComplete) options.onComplete = v.onComplete;
+  if (v.workflowId) options.workflowId = v.workflowId;
+  if (v.taskId) options.taskId = v.taskId;
+  if (v.task) options.task = v.task;
+  if (v.parentWorkerId) options.parentWorkerId = v.parentWorkerId;
+  if (v.parentLabel) options.parentLabel = v.parentLabel;
+  if (v.initialInput) options.initialInput = v.initialInput;
+  // Default autoAccept and ralphMode to TRUE for all spawns.
+  options.autoAccept = v.autoAccept !== false;
+  options.ralphMode = v.ralphMode !== false;
+  return options;
+}

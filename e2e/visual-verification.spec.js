@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import path from 'path';
 
 /**
  * Comprehensive Visual Verification Test Suite
@@ -11,7 +12,7 @@ import { test, expect } from '@playwright/test';
 const STRATEGOS_API = 'http://localhost:38007';
 
 // Helper to create screenshot directory
-const screenshotDir = new URL('./screenshots', import.meta.url).pathname;
+const screenshotDir = path.resolve(process.cwd(), 'e2e/screenshots');
 
 test.describe('Header Component Visual Verification', () => {
   test.beforeEach(async ({ page }) => {

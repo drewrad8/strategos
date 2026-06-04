@@ -2,6 +2,17 @@ import { defineConfig, devices } from '@playwright/test';
 
 export default defineConfig({
   testDir: './e2e',
+  // Exclude standalone node scripts that are not Playwright tests
+  // These use #!/usr/bin/env node and run standalone via `node e2e/script.test.js`
+  testIgnore: [
+    '**/general-enforcement.test.js',
+    '**/review-gate.test.js',
+    '**/api-verification.test.js',
+    '**/ralph-signal.test.js',
+    '**/reflexion-features.test.js',
+    '**/blackboard.test.js',
+    '**/improvement-wave-features.test.js',
+  ],
   fullyParallel: false,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
