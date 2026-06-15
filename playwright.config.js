@@ -12,6 +12,13 @@ export default defineConfig({
     '**/reflexion-features.test.js',
     '**/blackboard.test.js',
     '**/improvement-wave-features.test.js',
+    // Standalone node scripts (self-execute / hit the live API at import time).
+    // deny-list-api-integration.test.js in particular calls the live API during
+    // import, so Playwright *collection* alone could spawn/affect real workers.
+    '**/deny-list-api-integration.test.js',
+    '**/deny-list-unit.test.js',
+    '**/adrs-logging-migration.test.js',
+    '**/drift-monitoring-context.test.js',
   ],
   fullyParallel: false,
   forbidOnly: !!process.env.CI,

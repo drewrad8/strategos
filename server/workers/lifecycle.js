@@ -201,7 +201,6 @@ export function buildBackendLaunchArgs({ backend, id, sessionName, workingDir, l
     '-s', sessionName,
     '-x', String(DEFAULT_COLS),
     '-y', String(DEFAULT_ROWS),
-    '-e', `CLAUDE_CODE_EFFORT_LEVEL=${getEffortLevel(label, effortLevel)}`,
     '-e', 'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=65',
     '-c', workingDir,
     'claude', '--dangerously-skip-permissions', ...modelArgs, ...toolArgs, ...effortArgs

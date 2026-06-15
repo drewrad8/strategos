@@ -262,7 +262,7 @@ async function runComplianceCheck(worker, workerId, templateType, io) {
             getLogger().warn(`[ComplianceCheck] Research worker edited non-report files: ${nonReportFiles.slice(0, 3).join(', ')}`, { workerId });
             interruptWorker(
               workerId,
-              'ROLE VIOLATION: You are a RESEARCH worker. You are not authorized to edit files outside of /tmp/ or report/findings .md files. Stop editing files. Write your findings to a report file in your project tmp/ or shared/reports/ directory instead.',
+              'ROLE VIOLATION: You are a RESEARCH worker. You are not authorized to edit files outside of /tmp/ or report/findings .md files. Stop editing files. Write your findings to a report file in /home/user/thea/tmp/ or /home/user/thea/shared/reports/ instead.',
               io
             ).catch(() => { /* non-fatal */ });
           }
